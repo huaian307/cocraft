@@ -178,6 +178,10 @@ def bootstrap() -> dict:
         ensure_opencode_agent()        # 顺手补「子命令式 ACP」（本机装了 OpenCode 才有）
     except Exception:  # noqa: BLE001
         pass
+    try:
+        ensure_bundled_opencode_agent()   # 顺手补「随包 OpenCode（node 版）」（随包文件在才有）
+    except Exception:  # noqa: BLE001
+        pass
     return load_registry()             # 重新读，让调用方看到自愈后的结果
 
 
@@ -240,12 +244,13 @@ def _slug(label: str) -> str:
 # ⚠ 这类命令**文件名里没有 acp**、也不是 node 包，所以老的两条识别规则（`*acp*.exe` /
 #   node 包 bin 名含 acp）永远扫不到 —— 这就是"OpenCode 明明在本机、ACP 却找不到它"的原因。
 _SUBCOMMAND_ACP = [
-    {"id": "opencode-acp", "label": "OpenCode · ACP（子命令）",
+    {"id": "opencode-acp", "label": "OpenCode 客户端",
      "exe_names": ("opencode-cli.exe", "opencode.exe", "opencode"),
      "args": ["acp"],
-     "mode": "plan",                 # OpenCode 的只读模式（见 docs/ACP.md 第 8 节）
-     "note": "OpenCode 自带 ACP server（`opencode-cli.exe acp`）：模型清单很全，"
-             "支持 session list/resume/close/delete/fork"},
+     # ⚠ 这里**不再写死 mode**：默认模式跟随"用户最后一次在面板里选过的模式"
+     #   （见 service.remember_mode / _acp_mode.json）；没选过就用 agent 自己的默认。
+     "note": "本机安装的 OpenCode 客户端（桌面端自带 CLI 的 `opencode-cli.exe acp`）："
+             "模型清单很全，支持 session list/resume/close/delete/fork"},
 ]
 
 
@@ -266,24 +271,32 @@ def ensure_opencode_agent() -> str:
     spec = _spec_for_command(cmd) or {}
     reg = load_registry()
     key = " ".join(str(x) for x in cmd).lower().strip()
+    legacy_label = "OpenCode · ACP（子命令）"
     for a in (reg.get("agents") or []):
         same = " ".join(str(x) for x in (a.get("command") or [])).lower().strip() == key
         if same or (spec and str(a.get("id")) == str(spec.get("id"))):
-            return ""                                  # 已经有它了，什么都不做
-    new = add_agent(str(spec.get("label") or "OpenCode · ACP（子命令）"), list(cmd), "",
-                    {}, str(spec.get("note") or "OpenCode 自带 ACP server"), "")
-    aid = str(new.get("id") or "")
-    if not aid:
-        return ""
-    reg = load_registry()                              # ⚠ add_agent 已经落盘 → 重新读，别拿旧 dict 覆盖
-    a = find_agent(reg, aid)
-    if a:
-        a["builtin"] = True                            # 内置的不给删
-        if spec.get("mode"):
-            a["mode"] = str(spec["mode"])
-        if not a.get("provider"):
-            a["provider"] = guess_provider(a)
-        save_registry(reg)
+            # 已有它 → 什么都不加。⚠ 但顺手把**旧名字**迁移成新名字（老注册表里叫
+            #   「OpenCode · ACP（子命令）」，现在统一叫「OpenCode 客户端」）。
+            if spec and str(a.get("label") or "") == legacy_label:
+                a["label"] = str(spec.get("label") or "OpenCode 客户端")
+                save_registry(reg)
+            return ""
+    # ⚠ 用规格里的**显式 id**（`opencode-acp`），不能靠 add_agent 从 label 生成 slug ——
+    #   改名成「OpenCode 客户端」后 slug 会变（`opencode`），id 一飘，老注册表就对不上了。
+    aid = str(spec.get("id") or "opencode-acp")
+    entry = {
+        "id": aid,
+        "label": str(spec.get("label") or "OpenCode 客户端"),
+        "builtin": True,                               # 内置的不给删
+        "command": list(cmd),
+        "cwd": "",
+        "env": {},
+        "note": str(spec.get("note") or "OpenCode 客户端自带 ACP server"),
+        "mode": str(spec.get("mode") or ""),
+    }
+    entry["provider"] = guess_provider(entry)
+    reg.setdefault("agents", []).append(entry)
+    save_registry(reg)
     return aid
 
 
@@ -300,8 +313,11 @@ def find_subcommand_acp(dirs=None, limit: int = 6) -> list:
         for name in spec["exe_names"]:
             p = shutil.which(name) or ""
             if not p:
-                p = _walk_find([b for b in bases if b], (name,), max_depth=4)
-            if p and os.path.isfile(p):
+                # ⚠ 跳过**随包**的那份（`<app>\agents\opencode`）：它由 find_bundled_opencode()
+                #   单独登记成 `opencode-node`，不能被当成"本机客户端"，否则两者会互相抢占。
+                p = _walk_find([b for b in bases if b], (name,), max_depth=4,
+                               skip_roots=[BUNDLED_OPENCODE_DIR])
+            if p and os.path.isfile(p) and not _is_bundled_opencode_path(p):
                 return [os.path.realpath(p)] + list(spec["args"])
     return []
 
@@ -312,10 +328,108 @@ def _spec_for_command(cmd):
         return None
     exe = os.path.basename(str(cmd[0])).lower()
     tail = [str(x).lower() for x in (cmd[1:] or [])]
+    # ⚠ 先判随包那份：它也是「CLI + acp 子命令」的形态，但它是**另一个** agent，
+    #   不能被当成"本机客户端"（否则两者会互相抢占）。
+    if tail == list(_BUNDLED_OPENCODE["args"]) and _is_bundled_opencode_path(cmd[0]):
+        return _BUNDLED_OPENCODE
     for spec in _SUBCOMMAND_ACP:
         if exe in tuple(str(n).lower() for n in spec["exe_names"]) and tail == list(spec["args"]):
             return spec
     return None
+
+
+# ---------------- 随包 OpenCode（Node / npm 分发）----------------
+#
+# 与上面的 `_SUBCOMMAND_ACP`（**本机客户端**自带 `acp` 子命令）**故意分开**：
+#   这里指安装包**自带**的那份 OpenCode（npm 包 `opencode-ai` 解到 `<app>\agents\opencode\`），
+#   两者是不同的 agent（id / label 都不同），互不覆盖。
+#
+# 布局允许几种常见形态，按顺序取第一个存在的（打包时按实际摆放对齐即可）：
+#   agents\opencode\opencode.exe
+#   agents\opencode\bin\opencode.exe
+#   agents\opencode\node_modules\opencode-ai\bin\opencode.exe
+#   agents\opencode\node_modules\.bin\opencode.exe
+#   若入口是 JS 脚本 → 用随包 node 跑：agents\node\node.exe <js> acp
+_BUNDLED_OPENCODE = {
+    "id": "opencode-node",
+    "label": "OpenCode（随包 Node 版）",
+    "args": ["acp"],
+    "mode": "plan",                 # OpenCode 的只读模式（与客户端那条同一个语义）
+    "note": "安装包自带的 OpenCode（npm / Node 分发）：模型清单很全，"
+            "支持 session list/resume/close/delete/fork",
+}
+
+BUNDLED_OPENCODE_DIR = os.path.join(ROOT_DIR, "agents", "opencode")
+
+
+def _is_bundled_opencode_path(p) -> bool:
+    """这个路径是不是「随包 OpenCode」目录里的（用来把它和"本机客户端"区分开）。"""
+    try:
+        root = os.path.realpath(BUNDLED_OPENCODE_DIR)
+        q = os.path.realpath(str(p))
+        return q == root or q.startswith(root + os.sep)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def find_bundled_opencode() -> list:
+    """随包 OpenCode 的启动命令 `[<exe>, "acp"]`；没随包 / 没装就回 `[]`。"""
+    root = BUNDLED_OPENCODE_DIR
+    if not os.path.isdir(root):
+        return []
+    exe_cands = [
+        os.path.join(root, "opencode.exe"),
+        os.path.join(root, "bin", "opencode.exe"),
+        os.path.join(root, "node_modules", "opencode-ai", "bin", "opencode.exe"),
+        os.path.join(root, "node_modules", ".bin", "opencode.exe"),
+    ]
+    for p in exe_cands:
+        if os.path.isfile(p):
+            return [os.path.realpath(p), "acp"]
+    # 入口是 JS 脚本的形态：用随包 node 跑
+    node = _glob_node_exe()
+    js_cands = [
+        os.path.join(root, "node_modules", "opencode-ai", "bin", "opencode"),
+        os.path.join(root, "node_modules", "opencode-ai", "bin", "opencode.js"),
+        os.path.join(root, "opencode.js"),
+    ]
+    for p in js_cands:
+        if os.path.isfile(p) and node:
+            return [node, os.path.realpath(p), "acp"]
+    return []
+
+
+def ensure_bundled_opencode_agent() -> str:
+    """注册表里还没有「随包 OpenCode」就补一个；返回新增的 id，没动就回 ""。
+
+    与 `ensure_opencode_agent()` 同款自愈：随包文件在就登记，不在就什么都不做。
+    """
+    try:
+        cmd = find_bundled_opencode()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not cmd:
+        return ""
+    reg = load_registry()
+    key = " ".join(str(x) for x in cmd).lower().strip()
+    for a in (reg.get("agents") or []):
+        same = " ".join(str(x) for x in (a.get("command") or [])).lower().strip() == key
+        if same or str(a.get("id")) == str(_BUNDLED_OPENCODE["id"]):
+            return ""                              # 已经有它了
+    entry = {
+        "id": _BUNDLED_OPENCODE["id"],
+        "label": _BUNDLED_OPENCODE["label"],
+        "builtin": True,
+        "command": list(cmd),
+        "cwd": "",
+        "env": {},
+        "note": _BUNDLED_OPENCODE["note"],
+        "mode": _BUNDLED_OPENCODE["mode"],
+    }
+    entry["provider"] = guess_provider(entry)
+    reg.setdefault("agents", []).append(entry)
+    save_registry(reg)
+    return str(entry["id"])
 
 
 # ---------------- provider 推断（只用于模型图标 / 分组，认不出就留空）----------------
@@ -443,6 +557,11 @@ def infer_from_dir(d: str) -> tuple:
     if not d or not os.path.isdir(d):
         return None, ""
     node = _node_exe()
+    # ⓪ 随包 OpenCode 目录：单独识别（和"本机客户端"区分）
+    if _is_bundled_opencode_path(d):
+        b = find_bundled_opencode()
+        if b:
+            return b, "随包 OpenCode（node 版）"
     # ③ 已知的子命令式 ACP（先判，免得被下面的 node 包规则盖掉）
     hit = find_subcommand_acp([d])
     if hit:
@@ -568,6 +687,194 @@ def scan_candidates(limit: int = 12) -> list:
         push("Claude Code · 本机客户端", [det["claudeAcpExe"]],
              os.path.dirname(det["claudeAcpExe"]), "PATH 上找到")
     return out[:limit]
+
+
+# ---------------- 扫描本机有哪些 agent（「扫描本机」按钮用）----------------
+#
+# 与 scan_candidates 的区别：这不是"只列没登记的候选"，而是一份**本机发现报告** ——
+# 找到什么、在哪、能不能直接当 ACP agent 用、是不是已经登记过；也把"只装了客户端但缺适配器"点出来。
+# 扫描位置比原来更全：PATH / npm / agentlist / 子命令式 / 本地适配器，外加
+# `%LOCALAPPDATA%\Programs`、`%ProgramFiles%\<agent>`、`~/.codex\bin`、`~/.claude\bin`、随包 `agents\`。
+
+_SCAN_KIND = {
+    "codex": ("Codex CLI（客户端本体，需 ACP 适配器）", "client"),
+    "codex-acp": ("Codex ACP 适配器", "adapter"),
+    "claude": ("Claude Code（客户端本体，需 ACP 适配器）", "client"),
+    "claude-code-acp": ("Claude Code ACP 适配器", "adapter"),
+    "opencode": ("OpenCode（自带 acp 子命令）", "subcommand"),
+    "opencode-cli": ("OpenCode CLI（自带 acp 子命令）", "subcommand"),
+    "dsh": ("DeepSeek Harness（客户端）", "client"),
+    "dsh-acp": ("DeepSeek Harness ACP", "adapter"),
+    "gemini": ("Gemini CLI", "client"),
+    "goose": ("Goose", "client"),
+    "crush": ("Crush", "client"),
+    "amp-acp": ("Amp ACP", "adapter"),
+    "iflow": ("iFlow", "client"),
+    "aider": ("Aider", "client"),
+}
+# 目录名里有这些词才值得进去推断（避免在 Program Files 里把每个目录都翻一遍）
+_AGENTISH_DIR = ("codex", "claude", "opencode", "dsh", "acp", "goose", "crush", "gemini")
+# 明确不探的目录（用户要求：不碰 VS Code 的缓存）
+_SCAN_SKIP_DIR = ("visual studio code", "vscode", "microsoft vs code", "cursor", "windsurf")
+
+
+def _cmd_key(cmd) -> str:
+    """命令去重键：绝对路径按 realpath 归一化（junction 不会出两条）。"""
+    norm = []
+    for x in (cmd or []):
+        sx = str(x)
+        if os.path.isabs(sx) or ("\\" in sx) or ("/" in sx):
+            norm.append(os.path.realpath(sx).lower())
+        else:
+            norm.append(sx.lower())
+    return " ".join(norm).strip()
+
+
+def _scan_roots() -> list:
+    """扫描本机该去哪些目录找 agent。"""
+    home = os.path.expanduser("~")
+    la = os.environ.get("LOCALAPPDATA", "")
+    ad = os.environ.get("APPDATA", "")
+    pf = os.environ.get("ProgramFiles", "")
+    pf86 = os.environ.get("ProgramFiles(x86)", "")
+    cands = [
+        os.path.join(ad, "npm"),
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, ".codex", "bin"),
+        os.path.join(home, ".claude", "bin"),
+        os.path.join(la, "Programs"),
+        os.path.join(local_root(), "agentlist"),
+        os.path.join(ROOT_DIR, "agents"),
+        pf, pf86,
+    ]
+    out = []
+    for d in cands:
+        if d and os.path.isdir(d) and d not in out:
+            out.append(d)
+    return out
+
+
+def deep_scan(limit: int = 80, budget: float = 20.0) -> dict:
+    """扫描本机有哪些 agent，返回「发现报告」（同步；带 20s 时间预算，别把请求拖死）。
+
+    返回 `{found:[...], summary:{...}, hints:[...], detected:{...}}`。
+    `found` 每一项：id/label/command/dir/source/kind/note/available/missing/registered/provider。
+    `kind`：adapter（可直接当 ACP agent）/ subcommand / client（只是客户端，需适配器）/ registered。
+    """
+    deadline = time.time() + max(3.0, budget)
+    det = detect_all_cached()          # 用 15s 缓存，避免和 scan_candidates 各扫一遍（实测能省一半时间）
+    reg = load_registry()
+    reg_key = {}
+    for a in (reg.get("agents") or []):
+        if a.get("command"):
+            reg_key[_cmd_key(a["command"])] = str(a.get("id"))
+    found = []
+    seen = set()
+
+    def push(label, cmd, where, source, kind, note=""):
+        if not cmd:
+            return
+        key = _cmd_key(cmd)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        st = status_of({"id": _slug(label), "command": cmd})
+        found.append({
+            "id": _slug(label), "label": label, "command": [str(x) for x in cmd],
+            "dir": where or "", "source": source, "kind": kind, "note": note,
+            "available": st["available"], "missing": st["missing"],
+            "registered": key in reg_key, "registeredAs": reg_key.get(key, ""),
+            "provider": guess_provider({"id": _slug(label), "label": label,
+                                        "command": cmd, "note": note, "env": {}}),
+        })
+
+    # ① 现有候选扫描（PATH / agentlist / npm / 子命令式 / 本地 Claude 适配器）
+    try:
+        for c in scan_candidates(limit=40):
+            spec = _spec_for_command(c.get("command"))
+            push(c["label"], c.get("command"), c.get("dir"),
+                 "自动发现", "subcommand" if spec else "adapter", c.get("note") or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ② 更广的目录：已知 CLI 名 + *acp*.exe + agent 目录里的 node 包
+    for root in _scan_roots():
+        if time.time() > deadline:
+            break
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        rbase = os.path.basename(root.rstrip("\\/")).lower()
+        for n in names:
+            if time.time() > deadline:
+                break
+            low = n.lower()
+            if any(k in low for k in _SCAN_SKIP_DIR):
+                continue
+            p = os.path.join(root, n)
+            stem = os.path.splitext(low)[0]
+            if os.path.isfile(p):
+                if low.endswith((".exe", ".cmd", ".bat")):
+                    if stem in _SCAN_KIND:
+                        lab, kind = _SCAN_KIND[stem]
+                        push(lab, [p], root, "在 %s 找到" % root, kind)
+                    elif "acp" in low and low.endswith((".exe", ".cmd")):
+                        push(n, [p], root, "在 %s 找到" % root, "adapter")
+            elif os.path.isdir(p):
+                # ⚠ 只对"名字像 agent"的目录做推断：Programs 下什么都试一遍会沿 junction
+                #   走进 OpenCode 之类的大目录，扫描要十几秒（实测 2.7s → 19s）。
+                if rbase not in ("agentlist", "agents") \
+                        and not any(k in low for k in _AGENTISH_DIR):
+                    continue
+                try:
+                    cmd, note = infer_from_dir(p)
+                except Exception:  # noqa: BLE001
+                    cmd, note = None, ""
+                if cmd:
+                    spec = _spec_for_command(cmd)
+                    if spec:
+                        push(spec["label"], cmd, p, "在 %s 找到" % root, "subcommand",
+                             spec.get("note") or note)
+                    else:
+                        push(n, cmd, p, "在 %s 找到" % root, "adapter", note)
+
+    # ③ 本机检测到的适配器 / 包裹
+    if det.get("node") and det.get("codexAdapter"):
+        push("Codex · 本地 ACP 适配器", [det["node"], det["codexAdapter"]],
+             os.path.dirname(det["codexAdapter"]), "本机 npm", "adapter")
+    if det.get("node") and det.get("claudeAdapter"):
+        push("Claude · 本地 ACP 适配器", [det["node"], det["claudeAdapter"]],
+             os.path.dirname(det["claudeAdapter"]), "本机 npm", "adapter")
+    if det.get("node") and det.get("dsh"):
+        push("DeepSeek Harness", [det["node"], det["dsh"]],
+             os.path.dirname(det["dsh"]), "本机 npm", "adapter")
+
+    # ④ 已登记但上面没扫到的（保证报告里能看到全部）
+    for a in (reg.get("agents") or []):
+        cmd = a.get("command")
+        if cmd and _cmd_key(cmd) not in seen:
+            push(a.get("label") or a.get("id") or "agent", cmd, a.get("cwd") or "",
+                 "已登记", "registered", a.get("note") or "")
+
+    hints = []
+    if det.get("codex") and not (det.get("codexAcp") or det.get("codexAcpExe") or det.get("codexAdapter")):
+        hints.append("装了 Codex CLI，但没找到 ACP 适配器 —— 需要 @agentclientprotocol/codex-acp")
+    if det.get("claude") and not (det.get("claudeAcp") or det.get("claudeAcpExe") or det.get("claudeAdapter")):
+        hints.append("装了 Claude Code，但没找到 ACP 适配器 —— 需要 @zed-industries/claude-code-acp")
+    usable = [f for f in found if f["available"] and f["kind"] != "client"]
+    return {
+        "found": found[:limit],
+        "summary": {
+            "total": len(found),
+            "usable": len(usable),
+            "newUsable": len([f for f in usable if not f["registered"]]),
+            "registered": len([f for f in found if f["registered"]]),
+            "clients": len([f for f in found if f["kind"] == "client"]),
+        },
+        "hints": hints,
+        "detected": det,
+    }
 
 
 def add_agent(label: str, command, cwd: str = "", env: dict = None, note: str = "",
@@ -715,15 +1022,25 @@ def local_root() -> str:
     return root
 
 
-def _walk_find(dirs, names, max_depth=3, limit=4000) -> str:
-    """在若干目录里（限定深度）找匹配某个文件名的可执行文件。"""
+def _walk_find(dirs, names, max_depth=3, limit=4000, skip_roots=()) -> str:
+    """在若干目录里（限定深度）找匹配某个文件名的可执行文件。
+
+    `skip_roots`：整个跳过的目录（连子孙一起）——用来把**随包**的那份 OpenCode 从
+    「本机客户端」的探测里排除掉，免得两者互相抢占。
+    """
     want = {n.lower() for n in names}
+    skips = [os.path.realpath(s).lower().rstrip("\\/") for s in (skip_roots or []) if s]
     seen = 0
     for base in dirs:
         if not base or not os.path.isdir(base):
             continue
         d0 = base.rstrip("\\/").count(os.sep)
         for root, subdirs, files in os.walk(base):
+            if skips:
+                rl = os.path.realpath(root).lower().rstrip("\\/")
+                if any(rl == s or rl.startswith(s + os.sep) for s in skips):
+                    subdirs[:] = []
+                    continue
             if root.count(os.sep) - d0 >= max_depth:
                 subdirs[:] = []
             for f in files:

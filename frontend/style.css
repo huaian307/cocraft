@@ -176,7 +176,22 @@ body::before {
   font-size: 13.5px;
 }
 .session.active .t { font-weight: 600; }
-.session .s { display: block; color: var(--ink-faint); font-size: 11px; margin-top: 3px; }
+.session .s-row { display: flex; align-items: baseline; gap: 8px; margin-top: 3px; }
+.session .s {
+  display: block; flex: 1 1 auto; min-width: 0;
+  color: var(--ink-faint); font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 所属项目：右下角的小标签（只显示目录名；完整路径仍在「详细信息」里） */
+.session .proj {
+  flex: none; max-width: 46%;
+  border: 1px solid var(--line-soft); border-radius: 999px;
+  padding: 0 6px; line-height: 15px;
+  background: color-mix(in srgb, var(--paper) 55%, transparent);
+  color: var(--ink-faint); font-size: 10.5px; letter-spacing: .02em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.session.active .proj { color: var(--ink-dim); border-color: var(--line); }
 
 /* 删除按钮：平时淡着（看得见、但不抢眼），悬停到这一项时才变红 —— 兼顾"找得到"和"别误点" */
 .session .del {
@@ -232,6 +247,8 @@ body::before {
   font-size: 11.5px; color: var(--ink-faint);
 }
 #upstream { margin-left: auto; font-family: var(--mono); font-size: 10.5px; }
+/* 有新版本：侧栏版本号标红（只提示，不自动刷新） */
+#ui-ver.stale { color: var(--hi); }
 
 .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
 .dot.online  { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
@@ -246,6 +263,11 @@ body::before {
   display: flex; align-items: center; gap: 12px;
   padding: 12px 18px; border-bottom: 1px solid var(--line);
   background: var(--paper-2);
+  position: relative;
+  /* ⚠ 主题里的 backdrop-filter 会让 #topbar 成为层叠上下文 —— 不给它层级，
+     弹出的「打开」菜单（z-index:60，但只在顶栏内部有效）会被下方消息区盖住。
+     15 高于消息区/侧栏，低于各弹窗（20+），保证弹窗仍能盖住菜单。 */
+  z-index: 15;
 }
 .title-wrap { min-width: 0; }
 h1#session-title {
@@ -255,6 +277,28 @@ h1#session-title {
 }
 #session-meta { font-size: 11px; font-family: var(--mono); color: var(--ink-faint); }
 .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+/* 「打开」按钮的弹出菜单：在外部程序（终端 / VS Code / 资源管理器）里打开当前会话目录 */
+.open-menu {
+  position: absolute; top: calc(100% + 2px); right: 18px; z-index: 60;
+  min-width: 220px; padding: 8px;
+  display: flex; flex-direction: column; gap: 4px;
+  background: var(--paper); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: 0 12px 34px rgba(0, 0, 0, .22);
+}
+.open-menu[hidden] { display: none; }
+.open-menu .om-dir {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+  padding: 3px 6px 8px; margin-bottom: 4px; border-bottom: 1px solid var(--line);
+  max-width: 340px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  direction: rtl; text-align: left; unicode-bidi: plaintext;
+}
+.open-menu button {
+  width: 100%; height: auto; min-width: 0; padding: 8px 10px;
+  text-align: left; font-size: 13px; letter-spacing: .02em;
+}
+.open-menu button:hover:not(:disabled) { background: color-mix(in srgb, var(--ink) 7%, transparent); }
+
 
 /* 主体区外壳：包含消息区、播放条、收起时横条。左右真频谱挂在 #chat-stage 里，
    底部 = 音乐条（#player）顶部，往上到顶部设置栏。 */
@@ -275,6 +319,20 @@ h1#session-title {
   border: 1px solid var(--line); border-radius: 999px;
   padding: 0 7px; font-size: 10px; font-family: var(--mono); color: var(--ink-faint);
 }
+/* 每条回答的「复制」：停在行的最右，平时淡、悬停亮 */
+.msg .who .copy-btn {
+  margin-left: auto; flex: none; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 999px; background: transparent;
+  color: var(--ink-faint); font-family: var(--serif); letter-spacing: .08em;
+  font-size: 10.5px; padding: 0 8px; line-height: 17px;
+  opacity: .6; transition: opacity .15s ease, color .15s ease, border-color .15s ease;
+}
+.msg .who .copy-btn:hover {
+  opacity: 1; color: var(--hi);
+  border-color: color-mix(in srgb, var(--hi) 40%, transparent);
+}
+.msg .who .copy-btn.copied { opacity: 1; color: var(--hi); border-color: var(--hi); }
+.msg .who .copy-btn.copy-fail { opacity: 1; color: var(--hi); border-color: var(--hi); }
 
 .msg .bubble {
   background: var(--paper); border: 1px solid var(--line);
@@ -302,6 +360,22 @@ h1#session-title {
   border-radius: var(--radius); padding: 11px 13px; overflow-x: auto;
   font-family: var(--mono); font-size: 12.5px; line-height: 1.6; margin: 9px 0;
 }
+
+/* 代码块右上角的「复制」（悬停时更明显；文本原样取 <pre> 的 textContent） */
+.msg .code-wrap { position: relative; }
+.msg .code-wrap > pre { margin: 9px 0; }
+.msg .code-wrap .copy-code {
+  position: absolute; top: 7px; right: 8px; z-index: 1; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 4px;
+  background: color-mix(in srgb, var(--paper) 92%, transparent);
+  color: var(--ink-faint); font-family: var(--serif);
+  font-size: 10.5px; padding: 1px 7px; line-height: 16px;
+  opacity: .45; transition: opacity .15s ease, color .15s ease, border-color .15s ease;
+}
+.msg .code-wrap:hover .copy-code { opacity: .9; }
+.msg .code-wrap .copy-code:hover { opacity: 1; color: var(--hi); }
+.msg .code-wrap .copy-code.copied,
+.msg .code-wrap .copy-code.copy-fail { opacity: 1; color: var(--hi); border-color: var(--hi); }
 
 /* Markdown 块级元素（表格 / 列表 / 标题 / 引用 / 分割线 / 段落） */
 .msg .bubble .md-p { margin: .4em 0; white-space: pre-wrap; word-break: break-word; }
@@ -391,6 +465,8 @@ details.part .body {
   background: var(--gold); animation: breathe 1.4s ease-in-out infinite;
 }
 .banner[hidden] { display: none; }
+.banner.clickable { cursor: pointer; }
+.banner.clickable:hover { background: color-mix(in srgb, var(--gold) 26%, var(--paper-2)); }
 
 /* ---------- 附件（粘贴 / 拖拽 / 选择文件）---------- */
 
@@ -954,7 +1030,12 @@ body.no-petals #petals { display: none; }
 
 /* ---------- 侧栏收起 / 展开 + 歌词栏 ---------- */
 
-#app { transition: grid-template-columns .18s ease; }
+#app { transition: grid-template-columns .18s ease, padding-right .22s ease, padding-bottom .22s ease; }
+
+/* 群聊抽屉：**分屏**（把面板内容整体推开），而不是盖在上面。
+   抽屉是 fixed 在右边；给 #app 让出同样宽度的 padding，内容就整体缩小而不是被遮住。 */
+html.cc-open #app { padding-right: var(--cc-w, 520px); }
+html.cc-resizing #app { transition: none; }          /* 拖动调宽时别走过渡，跟手 */
 
 html[data-sidebar="closed"] { --col-side: 0px; }
 html[data-sidebar="closed"] #sidebar { display: none; }
@@ -972,7 +1053,6 @@ html[data-sidebar="closed"] .vis-bar { margin-top: auto; }
 
 /* 收起时就显示歌词浮层（没有歌词时里面会显示一行提示，免得一片空白） */
 html.collapsed-focus .lyrics-overlay { display: flex; }
-html.lyrics-on .lyrics-overlay { display: flex; }
 
 /* ---------- QQ音乐播放条（QQ音乐在跑 / 有歌 / 手动打开时才出现）---------- */
 
@@ -986,6 +1066,9 @@ html.lyrics-on .lyrics-overlay { display: flex; }
   background: url("/assets/night.jpg") center 30% / cover no-repeat;
   opacity: .32;
 }
+/* 用户自定义了音乐条背景 → 抬高一点，别被纸色蒙层压得看不见 */
+.player.has-pbg .p-bg { opacity: .62; }
+[data-theme="yoru"] .player.has-pbg .p-bg { opacity: .55; }
 .player::after {                         /* 压一层纸色，保证文字可读 */
   content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(90deg,
@@ -1027,13 +1110,28 @@ html.lyrics-on .lyrics-overlay { display: flex; }
 .p-info i { font-style: normal; color: var(--ink-faint);
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* 展开会话时的歌词：占「歌名」那一格，太长就横向滚动（收起侧栏时改用画面中央浮层） */
+.p-lyric { display: none; flex: 1; min-width: 0; overflow: hidden; position: relative; }
+html.lyrics-on #p-title { display: none; }
+html.lyrics-on #p-lyric { display: block; }
+#p-lyric-inner {
+  display: inline-block; white-space: nowrap; color: var(--hi); font-weight: 500;
+  will-change: transform;
+}
+#p-lyric-inner .zh { color: var(--ink-faint); font-size: 11px; margin-left: 10px; }
+#p-lyric.scroll #p-lyric-inner { animation: lyrMarquee var(--lyr-dur, 12s) linear infinite; }
+@keyframes lyrMarquee {
+  0%, 12% { transform: translateX(0); }
+  88%, 100% { transform: translateX(var(--lyr-shift, -60%)); }
+}
+
 .p-ctrl { display: flex; gap: 6px; align-items: center; }
 #p-prev, #p-next, #p-toggle, #p-shuffle, #p-loop, #p-lyric-btn, #p-search-btn, #p-q-go, #p-home {
   width: 30px; height: 30px; min-width: 30px; padding: 0;
   display: grid; place-items: center; font-size: 14px; line-height: 1;
 }
-#p-shuffle, #p-loop { color: var(--ink-faint); }
-#p-shuffle.on, #p-loop.on {
+#p-shuffle, #p-loop, #p-lyric-btn { color: var(--ink-faint); }
+#p-shuffle.on, #p-loop.on, #p-lyric-btn.on {
   color: var(--hi);
   border-color: color-mix(in srgb, var(--hi) 55%, var(--line));
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--hi) 22%, transparent) inset;
@@ -1264,6 +1362,19 @@ html.lyrics-on .lyrics-overlay { display: flex; }
 .agents-row .dot.ok { background: var(--gold); }
 .agents-row .ad { margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); word-break: break-all; }
 .agents-row .ab { margin-top: 3px; font-size: 11px; color: var(--ink-faint); line-height: 1.6; }
+
+/* 模式弹窗：**紧凑小圆片** —— 只显示模式名；id / 说明放进 `title`（悬停才显现，且不占版面）。
+   之前用整行 `.agents-row`（两行高、还带一大堆小字），太占地方。 */
+#mode-list { display: flex; flex-wrap: wrap; gap: 8px; align-content: flex-start; }
+#mode-list .mode-chip {
+  padding: 6px 14px; font-size: 12.5px; line-height: 1.25;
+  border-radius: 999px; border: 1px solid var(--line);
+  background: var(--paper); color: var(--ink); cursor: pointer;
+  transition: background .15s ease, border-color .15s ease, color .15s ease;
+}
+#mode-list .mode-chip:hover { border-color: var(--hi); color: var(--hi); }
+#mode-list .mode-chip.on { background: var(--hi); color: #fff; border-color: var(--hi); }
+#mode-list .mode-chip.local { box-shadow: inset 0 0 0 1px var(--gold); }
 /* 卡片上的 provider 徽章 + 「改」按钮（编辑名称/命令/目录/provider） */
 .agents-row .badge {
   flex: none; font-size: 10px; line-height: 1.5; padding: 1px 6px; border-radius: 999px;
@@ -1499,7 +1610,8 @@ button.danger:hover:not(:disabled) { border-color: var(--err); }
   font-size: 15px; color: color-mix(in srgb, currentColor 58%, transparent);
 }
 .ly-scroll p.cur .zh { font-size: 17px; color: color-mix(in srgb, var(--gold) 60%, currentColor); }
-body.no-lyrics-zh .ly-scroll .zh { display: none; }
+body.no-lyrics-zh .ly-scroll .zh,
+body.no-lyrics-zh .p-lyric .zh { display: none; }
 
 /* ---------- 壁纸选择器：三列网格下的卡片布局（放在最后 = 覆盖前面的旧规则）---------- */
 .wp-list { grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
@@ -1576,6 +1688,56 @@ body.no-lyrics-zh .ly-scroll .zh { display: none; }
   display: none; align-items: center; justify-content: center; overflow: hidden;
 }
 
+/* 收起会话时的歌词「气泡球」：不碰时贴边缩成小箭头，悬停/拖动时是圆球，点击开关歌词 */
+.lyric-ball {
+  position: fixed; z-index: 6; display: none;
+  align-items: center; justify-content: center;
+  width: 48px; height: 48px; border-radius: 50%;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--paper) 84%, transparent);
+  border: 1px solid color-mix(in srgb, var(--gold) 55%, transparent);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .22);
+  cursor: pointer; touch-action: none; user-select: none;
+  transform: translateY(-50%);
+  transition: width .22s ease, height .22s ease, border-radius .22s ease,
+              right .22s ease, left .22s ease, background .22s ease, opacity .22s ease;
+}
+html[data-sidebar="closed"] .lyric-ball { display: flex; }
+.lyric-ball .lb-ico { display: block; font-size: 18px; line-height: 1; }
+.lyric-ball .lb-ico img { display: block; width: 30px; height: 30px; border-radius: 50%; object-fit: cover; }
+.lyric-ball .lb-arrow { display: none; }
+/* ⚠ 定位**只用 left/top**（由 app.js 的 applyLyricBall 给），贴边/空闲才有过渡可走：
+   以前用 .left{left:12px}/.right{right:12px}，松手从内联 left 切到 CSS right 时
+   `left→auto`、`right→12px` 都**不可过渡** → 球会"瞬移"到边上（用户实测报的）。 */
+.lyric-ball.left, .lyric-ball.right { right: auto; }
+
+/* 空闲：贴到最近的一边，缩成小箭头（半圆片），点击展开歌词 */
+.lyric-ball.idle {
+  width: 24px; height: 42px; border-radius: 7px;
+  background: color-mix(in srgb, var(--paper) 72%, transparent);
+  opacity: .72;
+}
+.lyric-ball.idle .lb-ico { display: none; }
+.lyric-ball.idle .lb-arrow { display: block; font-size: 17px; line-height: 1; color: var(--hi); }
+.lyric-ball.idle.left .lb-arrow::before { content: "\203A"; }    /* › 指向屏内 */
+.lyric-ball.idle.right .lb-arrow::before { content: "\2039"; }   /* ‹ 指向屏内 */
+
+/* 拖动中：立刻切成圆球 + **关掉过渡**（否则 left/width 的 .22s 过渡会让它跟手发黏、一跳一跳） */
+.lyric-ball.dragging {
+  transition: none;
+  width: 48px; height: 48px; border-radius: 50%;
+  opacity: 1; cursor: grabbing;
+}
+.lyric-ball.dragging .lb-ico { display: block; }
+.lyric-ball.dragging .lb-arrow { display: none; }
+
+/* 歌词开着：气泡球高亮（一眼看出点它可收起） */
+.lyric-ball.on {
+  color: #fff; background: var(--hi);
+  border-color: color-mix(in srgb, var(--gold) 70%, var(--hi));
+}
+.lyric-ball.on .lb-arrow { color: #fff; }
+
 .ly-scroll { width: min(940px, 88vw); text-align: center; }
 .ly-scroll p {
   margin: 0 0 14px; font-family: var(--serif); letter-spacing: .06em;
@@ -1588,9 +1750,197 @@ body.no-lyrics-zh .ly-scroll .zh { display: none; }
 .ly-scroll p.cur  { font-size: 32px; font-weight: 600; opacity: .97; color: var(--hi); }
 .ly-scroll p.noly { font-family: var(--sans); font-size: 15px; opacity: .5; }
 
+/* ---------- 群聊（cocraft）：右边透明触发带 + 右侧抽屉（**面板内自建 UI**，非 iframe） ---------- */
+
+/* 触发带：贴右边整条，平时几乎透明，悬停才亮、并显现竖排「群聊」 */
+#chat-strip {
+  position: fixed; top: 0; bottom: 0; right: 0; width: 12px; z-index: 11;
+  margin: 0; padding: 0; border: 0; cursor: pointer;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--hi) 7%, transparent));
+  color: var(--ink-faint);
+  transition: width .16s ease, color .16s ease, background .16s ease;
+}
+#chat-strip::before {
+  content: ""; position: absolute; top: 12%; bottom: 12%; right: 0; width: 2px;
+  background: var(--gold-soft); opacity: .35; border-radius: 2px;
+  transition: opacity .16s ease, background .16s ease;
+}
+#chat-strip:hover {
+  width: 22px; color: var(--hi);
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--hi) 18%, transparent));
+}
+#chat-strip:hover::before { opacity: .9; background: var(--hi); }
+#chat-strip .cs-label {
+  position: absolute; top: 50%; right: 4px; transform: translateY(-50%);
+  writing-mode: vertical-rl; letter-spacing: .22em;
+  font-family: var(--serif); font-size: 11px; opacity: .55;
+  transition: opacity .16s ease;
+}
+#chat-strip:hover .cs-label { opacity: 1; }
+
+/* 抽屉：从右侧滑入；**左边缘可拖动改宽度**（--cc-w）；z-index 低于弹窗（20+） */
+.cocraft {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: var(--cc-w, 520px); min-width: 300px; max-width: 96vw; z-index: 12;
+  display: flex; flex-direction: column;
+  background: var(--paper); border-left: 1px solid var(--line);
+  box-shadow: -14px 0 34px rgba(0, 0, 0, .24);
+  transform: translateX(102%); visibility: hidden;
+  transition: transform .22s ease, visibility .22s ease;
+}
+.cocraft.open { transform: translateX(0); visibility: visible; }
+.cocraft.resizing { transition: none; }        /* 拖动中别走过渡，跟手 */
+
+/* 左边缘拖拽手柄 */
+.cc-resize {
+  position: absolute; left: -3px; top: 0; bottom: 0; width: 7px;
+  cursor: col-resize; z-index: 2; touch-action: none;
+}
+.cc-resize::after {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 1px;
+  background: var(--gold-soft); opacity: 0; transition: opacity .15s ease;
+}
+.cc-resize:hover::after, .cocraft.resizing .cc-resize::after { opacity: .85; background: var(--hi); }
+
+.cc-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--paper) 92%, transparent);
+}
+.cc-head .cc-title { font-family: var(--serif); font-weight: 600; letter-spacing: .06em; }
+.cc-head .cc-cap { font-size: 10px; color: var(--ink-faint); font-family: var(--mono); letter-spacing: .1em; }
+.cc-head .cc-spacer { flex: 1; }
+.cc-head .cc-who {
+  font-size: 11px; color: var(--ink-faint); max-width: 130px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cc-head button {
+  width: 26px; height: 26px; min-width: 26px; padding: 0;
+  display: grid; place-items: center; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 6px; background: transparent;
+  color: var(--ink-dim); font-size: 14px; line-height: 1;
+}
+.cc-head button:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.cc-head .cc-x:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.cc-note {
+  padding: 6px 10px; font-size: 11.5px; color: var(--ink-dim);
+  background: color-mix(in srgb, var(--gold-soft) 35%, transparent);
+  border-bottom: 1px solid var(--line-soft);
+}
+/* ⚠ 作者样式里的 display（flex 等）会盖掉 UA 的 [hidden]；抽屉内统一兜底 */
+.cocraft [hidden] { display: none !important; }
+
+/* 刷新中：图标转起来（顶栏 / 抽屉共用） */
+@keyframes ui-spin { to { transform: rotate(360deg); } }
+button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
+
+/* ---- 登录 / 注册 ---- */
+.cc-auth { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.cc-tabs { display: flex; gap: 6px; }
+.cc-tab {
+  flex: 1; padding: 6px 0; cursor: pointer; font-family: var(--serif); font-size: 13px;
+  border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink-dim);
+}
+.cc-tab.on { color: #fff; background: var(--hi); border-color: var(--hi); }
+.cc-form { display: flex; flex-direction: column; gap: 8px; }
+.cc-form input, .cc-inline input, .cc-send textarea {
+  width: 100%; box-sizing: border-box; padding: 7px 10px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--paper-2); color: var(--ink); font-size: 13px; font-family: inherit;
+}
+.cc-inline { display: flex; gap: 6px; }
+.cc-inline input { flex: 1; }
+.cc-inline button {
+  flex: none; padding: 0 10px; cursor: pointer; border-radius: 8px;
+  border: 1px solid var(--line); background: transparent; color: var(--ink-dim);
+}
+.cc-msg { min-height: 16px; font-size: 12px; color: var(--ink-faint); }
+.cc-msg.err { color: var(--err); }
+
+/* ---- 主区：左＝会话列表，右＝聊天 ---- */
+.cc-main { flex: 1; min-height: 0; display: flex; }
+.cc-side {
+  width: 180px; flex: none; min-height: 0; display: flex; flex-direction: column;
+  border-right: 1px solid var(--line);
+}
+.cc-side-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px; font-size: 11px; color: var(--ink-faint); letter-spacing: .1em;
+  border-bottom: 1px solid var(--line-soft);
+}
+.cc-side-head button {
+  width: 22px; height: 22px; cursor: pointer; border-radius: 6px;
+  border: 1px solid var(--line); background: transparent; color: var(--ink-dim); font-size: 14px; line-height: 1;
+}
+.cc-side-head button:hover { color: var(--hi); }
+.cc-chats { flex: 1; overflow-y: auto; }
+.cc-chats .cc-chat {
+  padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--line-soft);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.cc-chats .cc-chat:hover { background: var(--paper-2); }
+.cc-chats .cc-chat.on { background: var(--hi-wash); border-left: 2px solid var(--hi); }
+.cc-chats .cc-chat b { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cc-chats .cc-chat i { font-size: 10.5px; color: var(--ink-faint); font-style: normal; }
+
+.cc-room { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.cc-room-head {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  font-family: var(--serif); font-size: 13px; border-bottom: 1px solid var(--line-soft);
+}
+.cc-room-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cc-room-title .muted { font-size: 10.5px; font-family: var(--sans); }
+.cc-menu-btn {
+  flex: none; width: 26px; height: 26px; padding: 0; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 6px; background: transparent;
+  color: var(--ink-dim); font-size: 14px; line-height: 1;
+}
+.cc-menu-btn:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.cc-menu-pop {
+  position: absolute; right: 8px; top: 40px; z-index: 5; width: min(300px, 92%);
+  padding: 9px; display: flex; flex-direction: column; gap: 9px;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 9px;
+  box-shadow: var(--shadow);
+}
+.cc-menu-row > span { display: block; font-size: 11px; color: var(--ink-faint); margin-bottom: 5px; }
+.cc-menu-row > span i { font-style: normal; opacity: .8; }
+.cc-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.cc-msgs .cc-empty { color: var(--ink-faint); font-size: 12px; text-align: center; margin: auto; }
+.cc-m { max-width: 82%; display: flex; flex-direction: column; gap: 3px; }
+.cc-m .cc-mt { font-size: 10.5px; color: var(--ink-faint); }
+.cc-m .cc-mb {
+  padding: 7px 10px; border-radius: 10px; font-size: 13px;
+  white-space: pre-wrap; word-break: break-word;
+  background: var(--paper-2); border: 1px solid var(--line);
+}
+.cc-m.me { align-self: flex-end; align-items: flex-end; }
+.cc-m.me .cc-mb { background: var(--hi-wash); border-color: color-mix(in srgb, var(--hi) 30%, transparent); }
+.cc-send { flex: none; display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid var(--line); }
+.cc-send textarea { flex: 1; resize: none; max-height: 120px; }
+.cc-send button { flex: none; padding: 0 14px; cursor: pointer; border-radius: 8px; }
+.cc-send #cc-attach { padding: 0 10px; font-size: 15px; }
+/* 文件消息：链接 + 图片内联预览 */
+.cc-mb .cc-file {
+  display: inline-block; color: var(--hi); text-decoration: none;
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; font-size: 12.5px;
+}
+.cc-mb .cc-file:hover { background: color-mix(in srgb, var(--hi) 10%, transparent); }
+.cc-mb img.cc-img {
+  display: block; max-width: 240px; max-height: 240px; border-radius: 8px;
+  margin-bottom: 6px; border: 1px solid var(--line); cursor: zoom-in;
+}
+.cc-mb .cc-file.cc-file-img { cursor: zoom-in; }
+
+@media (max-width: 720px) {
+  .cocraft { width: 100% !important; min-width: 0; }
+  html.cc-open #app { padding-right: 0; }            /* 窄屏：抽屉占满，退回覆盖式 */
+  .cc-side { width: 140px; }
+}
+
 /* ---- 顶栏「设置」改成齿轮图标 ---- */
 #topbar .actions #btn-cfg { display: inline-flex; align-items: center; justify-content: center; }
 .ico-gear { width: 17px; height: 17px; display: block; }
+.ico-open { width: 17px; height: 17px; display: block; }
 
 /* ---- 播放条：可折叠（像会话列表那样收起 / 展开）---- */
 #p-fold { padding: 0 7px; font-size: 11px; line-height: 1; transition: transform .18s ease; }
@@ -1600,3 +1950,265 @@ body.no-lyrics-zh .ly-scroll .zh { display: none; }
 .player.folded #p-search, .player.folded #p-results { display: none !important; }
 .player.folded .p-bg { opacity: .12; }
 .player.folded #p-fold { transform: rotate(180deg); }
+
+/* ================= 面板内终端（ConPTY） =================
+   从**底部上滑**的抽屉（类似群聊的右侧抽屉）：fixed 贴底，`.open` 才滑入；
+   打开时给 #app 让出底部（padding-bottom）→ 输入框被顶到抽屉之上，抽屉正好在**文本框下面**。
+   配色全部走主题变量（纸色 / 青铜边 / 校徽 / 金色光标）。 */
+#topbar .actions #btn-tools { display: inline-flex; align-items: center; justify-content: center; }
+.ico-wrench { width: 17px; height: 17px; display: block; }
+#topbar .actions #btn-tools.on {
+  color: var(--gold);
+  border-color: color-mix(in srgb, var(--gold) 45%, transparent);
+}
+.open-menu button.on {
+  color: var(--gold);
+  border-color: color-mix(in srgb, var(--gold) 45%, transparent);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+.open-menu button.on::after { content: " · 开"; font-size: 10px; color: var(--gold); opacity: .85; }
+
+:root { --term-h: 42vh; }
+
+/* ANSI 16 色按主题取色（light 用深色系、dark 用经典亮色系）。渲染层写 var(--tN) 即可随主题切换。 */
+:root, [data-theme="hiru"] {
+  --t0: #3b3733; --t1: #c0392b; --t2: #1e8449; --t3: #8a6d0b;
+  --t4: #2471a3; --t5: #8e44ad; --t6: #0e7490; --t7: #6f6a64;
+  --t8: #8a847c; --t9: #d9534f; --t10: #27ae60; --t11: #b7950b;
+  --t12: #3498db; --t13: #a569bd; --t14: #17a2b8; --t15: #2c2825;
+}
+[data-theme="yoru"] {
+  --t0: #000000; --t1: #cd3131; --t2: #0dbc79; --t3: #e5e510;
+  --t4: #2472c8; --t5: #bc3fbc; --t6: #11a8cd; --t7: #e5e5e5;
+  --t8: #666666; --t9: #f14c4c; --t10: #23d18b; --t11: #f5f543;
+  --t12: #3b8eea; --t13: #d670d6; --t14: #29b8db; --t15: #ffffff;
+}
+
+.term {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  height: var(--term-h); min-height: 140px; max-height: 86vh;
+  z-index: 12; display: flex; flex-direction: column;
+  background: var(--paper); border-top: 1px solid var(--line);
+  box-shadow: 0 -14px 34px rgba(0, 0, 0, .24);
+  transform: translateY(102%); visibility: hidden;
+  transition: transform .22s ease, visibility .22s ease;
+}
+.term.open { transform: translateY(0); visibility: visible; }
+.term.resizing { transition: none; }                 /* 拖动改高度时别走过渡，跟手 */
+html.term-open #app { padding-bottom: var(--term-h); }   /* 分屏：面板整体上移 */
+html.term-resizing #app { transition: none; }
+html.cc-open .term:not(.embedded) { right: var(--cc-w, 520px); }    /* 群聊也开着时让出右侧，别互相压 */
+html.code-open .term:not(.embedded) { right: var(--code-w, 760px); } /* 编码模式也开着时让出右侧（嵌入式的除外） */
+
+/* 顶边缘拖拽手柄 */
+.term-resize {
+  position: absolute; left: 0; right: 0; top: -3px; height: 7px;
+  cursor: row-resize; z-index: 3; touch-action: none;
+}
+.term-resize::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 3px; height: 1px;
+  background: var(--gold-soft); opacity: 0; transition: opacity .15s ease;
+}
+.term-resize:hover::after, .term.resizing .term-resize::after { opacity: .85; background: var(--hi); }
+
+.term-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--paper) 92%, transparent);
+  font-size: 12px; color: var(--ink);
+}
+.term-head .mk { width: 18px; height: 18px; }
+.term-head .wp-kind { font-size: 10px; color: var(--ink-faint); letter-spacing: .1em; }
+.term-head b { font-family: var(--serif); font-weight: 600; letter-spacing: .06em; }
+.term-meta {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+  max-width: 40%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  direction: rtl; text-align: left; unicode-bidi: plaintext;
+}
+.term-spacer { flex: 1; }
+.term-head button {
+  width: auto; min-width: 0; height: auto; padding: 3px 10px; font-size: 11px;
+  border-radius: 6px; letter-spacing: .04em; cursor: pointer;
+}
+.term-head .term-x { font-size: 15px; line-height: 1; padding: 2px 8px; }
+
+.term-wrap {
+  position: relative; flex: 1; min-height: 0; overflow: auto; outline: none;
+  background: var(--paper-2);
+}
+.term-wrap:focus { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--gold) 32%, transparent); }
+.term-screen {
+  margin: 0; padding: 6px 12px; min-height: 100%;
+  font-family: var(--mono); font-size: 12.5px; line-height: 16px;
+  color: var(--ink); background: transparent;
+  white-space: pre; tab-size: 8;
+}
+.term-caret {
+  position: absolute; width: 8px; height: 16px; background: var(--gold); opacity: .8;
+  pointer-events: none; animation: term-blink 1.05s steps(1) infinite;
+}
+@keyframes term-blink { 50% { opacity: .12; } }
+.term-measure {
+  position: absolute; visibility: hidden; white-space: pre; pointer-events: none;
+  font-family: var(--mono); font-size: 12.5px; line-height: 16px;
+}
+@media (max-width: 720px) {
+  :root { --term-h: 56vh; }
+  html.cc-open .term:not(.embedded) { right: 0; }
+  html.code-open .term:not(.embedded) { right: 0; }
+}
+
+/* ================= 编码模式（仿 VS Code 的简便版） =================
+   **从右侧滑出的抽屉**（跟群聊一样分屏：html.code-open 时给 #app 让出右侧 → 面板内容整体左移），
+   左边缘可拖动改宽度（--code-w）；左边文件树、右边编辑器。 */
+.code {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: var(--code-w, 760px); min-width: 300px; max-width: 96vw; z-index: 12;
+  display: flex; flex-direction: column;
+  background: var(--paper); border-left: 1px solid var(--line);
+  box-shadow: -14px 0 34px rgba(0, 0, 0, .24);
+  transform: translateX(102%); visibility: hidden;
+  transition: transform .22s ease, visibility .22s ease;
+}
+.code.open { transform: translateX(0); visibility: visible; }
+.code.resizing { transition: none; }                 /* 拖动中别走过渡，跟手 */
+html.code-open #app { padding-right: var(--code-w, 760px); }   /* 分屏：面板让位 */
+html.code-resizing #app { transition: none; }
+
+/* 左边缘拖拽手柄 */
+.code-resize {
+  position: absolute; left: -3px; top: 0; bottom: 0; width: 7px;
+  cursor: col-resize; z-index: 2; touch-action: none;
+}
+.code-resize::after {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 1px;
+  background: var(--gold-soft); opacity: 0; transition: opacity .15s ease;
+}
+.code-resize:hover::after, .code.resizing .code-resize::after { opacity: .85; background: var(--hi); }
+
+/* 「菜单」按钮：内嵌终端开着时点亮 */
+.code-head #code-menu.on {
+  color: var(--gold);
+  border-color: color-mix(in srgb, var(--gold) 45%, transparent);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+/* 「运行」按钮：一眼可见（绯红描边 + 加粗） */
+.code-head #code-exec {
+  color: var(--hi); font-weight: 600;
+  border-color: color-mix(in srgb, var(--hi) 42%, transparent);
+}
+.code-head #code-exec:hover { background: color-mix(in srgb, var(--hi) 12%, transparent); }
+/* 终端槽：宽度 = 编码抽屉宽度；嵌入式终端高度可拖（--code-term-h） */
+.code-term-slot { flex: none; display: flex; }
+.code-term-slot[hidden] { display: none; }
+.term.embedded {
+  position: relative; left: auto; right: auto; bottom: auto; top: auto;
+  width: 100%; height: var(--code-term-h, 240px);
+  transform: none; visibility: visible;
+  border-left: 0; border-top: 1px solid var(--line);
+  box-shadow: none; z-index: auto;
+}
+
+/* 头部：**固定大小** —— 除路径外一律 flex:0 0 auto + nowrap，抽屉拉伸/收窄都不变形 */
+.code-head {
+  position: relative;
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; border-bottom: 1px solid var(--line-soft);
+}
+.code-head > * { flex: 0 0 auto; min-width: 0; }
+.code-head .mk { width: 18px; height: 18px; }
+.code-head .wp-kind { font-size: 10px; color: var(--ink-faint); letter-spacing: .1em; white-space: nowrap; }
+.code-head b { font-family: var(--serif); font-size: 15px; letter-spacing: .06em; white-space: nowrap; }
+.code-head .mk-cap { white-space: nowrap; }
+.code-root {                               /* 唯一可伸缩的：长路径用省略号截断 */
+  flex: 1 1 auto; min-width: 0; max-width: none;
+  font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  direction: rtl; text-align: left; unicode-bidi: plaintext;
+}
+.code-status { font-size: 11px; color: var(--ink-faint); font-family: var(--mono); white-space: nowrap; }
+.code-status.dirty { color: var(--hi); }
+.code-head button {
+  flex: 0 0 auto; white-space: nowrap;
+  width: auto; min-width: 0; height: 26px; padding: 0 10px; font-size: 11px;
+  border-radius: 6px; cursor: pointer;
+}
+.code-head .code-x { font-size: 15px; line-height: 1; height: 26px; padding: 0 8px; }
+/* 合并菜单（打开文件夹 / 新建终端 / VS Code）：挂在头部右下 */
+.code-head .code-menu { top: calc(100% + 2px); right: 10px; min-width: 180px; }
+
+.code-body { flex: 1; min-height: 0; display: flex; }
+.code-tree {
+  width: 264px; min-width: 160px; flex: none; overflow: auto; padding: 6px 4px;
+  border-right: 1px solid var(--line-soft);
+  font-family: var(--mono); font-size: 12px;
+}
+.code-tree .tn {
+  display: flex; align-items: center; gap: 5px;
+  padding: 3px 6px; border-radius: 5px; cursor: pointer;
+  white-space: nowrap; overflow: hidden;
+}
+.code-tree .tn:hover { background: color-mix(in srgb, var(--hi) 10%, transparent); }
+.code-tree .tn.on { background: var(--hi); color: #fff; }
+.code-tree .tn .tw { width: 11px; flex: none; text-align: center; opacity: .75; }
+.code-tree .tn .nm { overflow: hidden; text-overflow: ellipsis; }
+.code-tree .tn.dirty .nm::after { content: " ●"; color: var(--gold); }
+.code-tree .tn.on.dirty .nm::after { color: #ffe; }
+.code-tree .empty { color: var(--ink-faint); padding: 6px 8px; }
+
+.code-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.code-path {
+  flex: none; padding: 6px 12px; border-bottom: 1px solid var(--line-soft);
+  font-family: var(--mono); font-size: 11px; color: var(--ink-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  direction: rtl; text-align: left; unicode-bidi: plaintext;
+}
+.code-edit-wrap { position: relative; flex: 1; min-height: 0; }
+.code-highlight,
+.code-editor {
+  position: absolute; inset: 0; margin: 0;
+  padding: 10px 14px; border: 0; outline: none;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.55; letter-spacing: 0;
+  white-space: pre; tab-size: 4; overflow: auto;
+}
+.code-highlight { background: var(--paper-2); color: var(--ink); pointer-events: none; }
+.code-editor {
+  resize: none; background: transparent; color: transparent; caret-color: var(--ink);
+}
+.code-editor::selection { background: color-mix(in srgb, var(--hi) 32%, transparent); }
+.code-editor:disabled { opacity: .6; }
+.code-edit-wrap.disabled .code-highlight { opacity: .6; }
+
+/* VS Code 风格 token 配色（昼=Light+，夜=Dark+） */
+:root, [data-theme="hiru"] {
+  --c-comment: #008000; --c-string: #a31515; --c-number: #098658;
+  --c-keyword: #0000ff; --c-control: #af00db; --c-func: #795e26;
+  --c-type: #267f99; --c-var: #001080; --c-const: #0070c1;
+  --c-tag: #800000; --c-attr: #e50000; --c-op: #000000; --c-meta: #af00db;
+}
+[data-theme="yoru"] {
+  --c-comment: #6a9955; --c-string: #ce9178; --c-number: #b5cea8;
+  --c-keyword: #569cd6; --c-control: #c586c0; --c-func: #dcdcaa;
+  --c-type: #4ec9b0; --c-var: #9cdcfe; --c-const: #4fc1ff;
+  --c-tag: #569cd6; --c-attr: #9cdcfe; --c-op: #d4d4d4; --c-meta: #c586c0;
+}
+.tk-comment { color: var(--c-comment); font-style: italic; }
+.tk-string { color: var(--c-string); }
+.tk-number { color: var(--c-number); }
+.tk-keyword { color: var(--c-keyword); }
+.tk-control { color: var(--c-control); }
+.tk-func { color: var(--c-func); }
+.tk-type { color: var(--c-type); }
+.tk-var { color: var(--c-var); }
+.tk-const { color: var(--c-const); }
+.tk-tag { color: var(--c-tag); }
+.tk-attr { color: var(--c-attr); }
+.tk-op { color: var(--c-op); }
+.tk-meta { color: var(--c-meta); }
+@media (max-width: 720px) {
+  .code { width: 100% !important; min-width: 0; }
+  html.code-open #app { padding-right: 0; }          /* 窄屏：抽屉占满，退回覆盖式 */
+  .code-tree { width: 160px; }
+}
+
+

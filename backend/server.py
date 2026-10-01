@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""opencode-ui —— 零依赖本地代理 + 静态服务器
+r"""cocraft —— 零依赖本地代理 + 静态服务器
 
 它做三件事：
   1. 托管 frontend/ 下的静态前端；
@@ -40,13 +40,29 @@ from urllib.parse import urlsplit, parse_qs, quote
 #   **不会**像普通 python 那样把脚本目录加进 sys.path，于是 `import cleanup` 直接
 #   ModuleNotFoundError（实测踩到）。这一行让两种装法都一样能跑。
 HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+# ⚠ 必须**放在 sys.path 最前**：安装版用嵌入式 Python 的 `._pth` 隔离模式，它会把 `..\backend`
+#   追加在**标准库 zip 之后**；若只写"不在列表里才插入"，`import pty` 会命中**标准库的 Unix pty**
+#   → 它去 import `termios`（Windows 没有）→ 面板服务起不来（安装版实测：装了打不开、17887 不监听）。
+if HERE in sys.path:
+    sys.path.remove(HERE)
+sys.path.insert(0, HERE)
 
 import cleanup
 import engines
+import external
+import fsview
+import procutils
+import pty as pty_term
+import updater
 from engines.base import HOP_BY_HOP
 from engines.acp import agents as acp_agents
+
+# 抑制「应用程序无法正常启动 (0xc0000142)」这类硬错误模态框：本进程 + 所有子进程
+# （音乐/频谱/QQ SMTC/外部打开/更新器/pick 对话框…… 都会继承）。
+try:
+    procutils.set_error_mode()
+except Exception:  # noqa: BLE001
+    pass
 
 ROOT = os.path.dirname(HERE)
 FRONTEND_DIR = os.path.join(ROOT, "frontend")
@@ -129,6 +145,7 @@ _spectrum_lock = threading.Lock()
 MUSIC = {"state": {}, "updated": 0.0}
 _music_proc = None
 _music_lock = threading.Lock()
+_qq_cached = {"v": None}          # 本机是否装了 QQ音乐客户端（决定要不要起 SMTC 采集进程）
 
 # 网易云音乐服务（非官方接口，仅供个人自用）。**可选组件**：
 # 装它是 runtime/venvs/music（开发机）或 runtime/site-packages/music（安装包）；
@@ -137,6 +154,9 @@ MUSIC_SVC_PY, MUSIC_SVC_SITE = _component_python("music")
 MUSIC_SVC_PORT = 8790
 _musicsvc_proc = None
 _musicsvc_lock = threading.Lock()
+
+# cocraft（Chatser）群聊后端：前端走 /cocraft/* 代理（避开跨域）；WS 由浏览器直连 wss://。
+COCRAFT_BASE = "https://www.animaker.cc.cd"
 
 QQ_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
          "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
@@ -469,6 +489,45 @@ def write_taskbar_pref(enabled: bool) -> bool:
         return False
 
 
+# ---- 面板窗口形态（原生 WebView2 / 浏览器 Edge --app）----
+PANEL_WINDOW_FILE = os.path.join(STATE_DIR, "_panel_window.json")
+
+
+def panel_native_available() -> bool:
+    """原生窗口（WebView2）这个可选组件装没装。"""
+    if not os.path.isfile(os.path.join(HERE, "panel_window.py")):
+        return False
+    if os.path.isfile(os.path.join(VENVS_DIR, "panel", "Scripts", "pythonw.exe")):
+        return True
+    if os.path.isdir(os.path.join(SITE_PACKAGES_DIR, "panel")):
+        return True
+    return False
+
+
+def read_panel_window_pref() -> str:
+    """窗口模式：`native`（原生）/ `browser`（Edge --app）/ `auto`（默认，装了原生就用原生）。"""
+    try:
+        with open(PANEL_WINDOW_FILE, "r", encoding="utf-8") as fh:
+            v = str(json.load(fh).get("mode") or "").strip().lower()
+            return v if v in ("native", "browser") else "auto"
+    except Exception:  # noqa: BLE001
+        return "auto"
+
+
+def write_panel_window_pref(mode: str) -> bool:
+    mode = str(mode or "auto").strip().lower()
+    if mode not in ("native", "browser", "auto"):
+        mode = "auto"
+    try:
+        tmp = PANEL_WINDOW_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"mode": mode}, fh, ensure_ascii=False)
+        os.replace(tmp, PANEL_WINDOW_FILE)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _read_music_file() -> dict:
     try:
         with open(MUSIC_FILE, "r", encoding="utf-8") as fh:
@@ -499,6 +558,11 @@ def qq_search(kw: str, limit: int = 10) -> dict:
 
 
 def _qq_pids() -> set:
+    # 首选纯 ctypes（不起子进程 → 不会在关机/异常时弹 tasklist 的 0xc0000142 框）
+    try:
+        return set(procutils.pids_named("QQMusic.exe"))
+    except Exception:  # noqa: BLE001
+        pass
     try:
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq QQMusic.exe", "/FO", "CSV", "/NH"],
@@ -574,6 +638,27 @@ def start_qqmusic() -> tuple:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def _qqmusic_installed() -> bool:
+    """本机装没装 QQ音乐客户端（装了才需要 SMTC 采集进程；**没装就别起 powershell**——
+    VM 里 powershell 坏了会弹 0xc0000142 模态框，还会拖慢启动）。结果缓存。"""
+    if _qq_cached["v"] is not None:
+        return _qq_cached["v"]
+    cands = [
+        QQ_EXE,
+        r"C:\Program Files\Tencent\QQMusic\QQMusic.exe",
+        r"C:\Program Files (x86)\Tencent\QQMusic\QQMusic.exe",
+    ]
+    try:
+        import shutil as _sh
+        if _sh.which("QQMusic.exe"):
+            _qq_cached["v"] = True
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    _qq_cached["v"] = any(os.path.isfile(p) for p in cands)
+    return _qq_cached["v"]
+
+
 def start_music_daemon(force: bool = False) -> None:
     """拉起常驻的 SMTC 采集进程（幂等）。它把状态写进 _music.json。
 
@@ -581,8 +666,11 @@ def start_music_daemon(force: bool = False) -> None:
       ① 状态文件还新鲜（< 10s）说明已经有采集进程在写 → 不再拉新的；
          （服务重启不会带走已脱离的采集进程，这一步避免每次重启都堆一个）
       ② 采集脚本内部用命名互斥量做单实例 → 万一并发，第二个会立刻退出。
+    ⚠ 没装 QQ音乐客户端时**直接跳过**（这条链要起 powershell）。
     """
     global _music_proc
+    if not force and not _qqmusic_installed():
+        return
     if not force:
         try:
             if (time.time() - os.path.getmtime(MUSIC_FILE)) < 10:
@@ -702,7 +790,7 @@ def write_wallpaper_root_override(path: str) -> tuple:
 # 文案（空会话那几行）放前端 localStorage，跟「左上角名字」一致。
 # ⚠ `key` 是固定枚举：界面上的 data-img 值必须在这里，写别的会被 400 顶回来。
 APPEARANCE_FILE = os.path.join(STATE_DIR, "_appearance.json")
-APPEARANCE_KEYS = ("brand", "avatar", "hero", "sticker1", "sticker2")
+APPEARANCE_KEYS = ("brand", "avatar", "hero", "sticker1", "sticker2", "lyricball", "playerbg")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif")
 IMAGE_MAX_BYTES = 32 * 1024 * 1024
 
@@ -1106,7 +1194,7 @@ def stop_music_daemon() -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "opencode-ui"
+    server_version = "cocraft"
     protocol_version = "HTTP/1.1"
 
     # ---------- 基础工具 ----------
@@ -1154,6 +1242,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._alive()
             elif path == "/panel/taskbar":
                 self._panel_taskbar(method)
+            elif path == "/panel/window":
+                self._panel_window(method)
             elif path == "/engine/status":
                 self._engine_status()
             elif path == "/engine":
@@ -1177,6 +1267,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 eng.set_baseline_env(patch)
                 self._send_json(200, {"ok": True, "data": eng.baseline_view()})
+            elif path == "/engine/acp/log":
+                # 最近几行 ACP / agent 日志（随包 codex 起不来 / 网络不通 / 缺 Key 时看这个）
+                eng = engines.get_engine("acp")
+                q = parse_qs(urlsplit(self.path).query)
+                try:
+                    n = int((q.get("tail") or ["200"])[0])
+                except Exception:  # noqa: BLE001
+                    n = 200
+                self._send_json(200, {"ok": True, "tail": eng.log_tail(n),
+                                      "path": acp_agents.ROOT_DIR})
             elif path == "/engine/acp/agents":
                 self._acp_agents(method)
             elif path == "/qq/state":
@@ -1197,6 +1297,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._live_root_pick(method)
             elif path == "/pick/image":
                 self._pick_image(method)
+            elif path == "/pick/folder":
+                self._pick_folder(method)
+            elif path == "/open/dir":
+                # 在外部程序里打开目录：终端 / VS Code / 资源管理器（与引擎无关）
+                self._open_dir(method)
+            elif path == "/pty/component":
+                self._pty_component()
+            elif path == "/pty" or path.startswith("/pty/"):
+                # 面板内终端（ConPTY，跑在可选组件里；与引擎无关）
+                self._pty_route(method, path)
+            elif path == "/fs/list":
+                self._fs_list()
+            elif path == "/fs/read":
+                self._fs_read()
+            elif path == "/fs/write":
+                self._fs_write(method)
+            elif path == "/update/check":
+                self._update_check()
+            elif path == "/update/apply":
+                self._update_apply(method)
             elif path == "/appearance":
                 self._appearance(method)
             elif path == "/appearance/img":
@@ -1218,6 +1338,13 @@ class Handler(BaseHTTPRequestHandler):
                                       "music": music_component()})
             elif path.startswith("/music/"):
                 self._music_proxy(method, path)
+            elif path == "/cocraft/_url":
+                # 前端拿后端/WS 地址（WS 由浏览器直连，不经我们的 HTTP 代理）
+                _base = (os.environ.get("OPENCODE_UI_COCRAFT_BASE") or COCRAFT_BASE).rstrip("/")
+                _ws = _base.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
+                self._send_json(200, {"base": _base, "ws": _ws})
+            elif path.startswith("/cocraft/"):
+                self._cocraft_proxy(method, path)
             elif path.startswith("/api/"):
                 self._proxy(method)
             else:
@@ -1265,6 +1392,8 @@ class Handler(BaseHTTPRequestHandler):
             "closed": bool(closed),
             "beats": LAST_BEAT["count"],
             "taskbar": read_taskbar_pref(),   # 守护进程据此决定要不要隐藏任务栏
+            "panelWindow": read_panel_window_pref(),   # native / browser / auto
+            "panelNative": panel_native_available(),
         })
 
     def _panel_taskbar(self, method: str):
@@ -1279,6 +1408,23 @@ class Handler(BaseHTTPRequestHandler):
         enabled = bool(body.get("enabled", True))
         ok = write_taskbar_pref(enabled)
         self._send_json(200 if ok else 500, {"ok": ok, "enabled": enabled})
+
+    def _panel_window(self, method: str):
+        """面板窗口形态：native（WebView2 原生窗口）/ browser（Edge --app）/ auto。"""
+        if method == "GET":
+            self._send_json(200, {"mode": read_panel_window_pref(),
+                                  "nativeAvailable": panel_native_available()})
+            return
+        if method != "POST":
+            self._send_json(405, {"error": "GET or POST only"})
+            return
+        body = self._read_json_body() or {}
+        ok = write_panel_window_pref(body.get("mode") or "auto")
+        self._send_json(200 if ok else 500, {
+            "ok": ok, "mode": read_panel_window_pref(),
+            "nativeAvailable": panel_native_available(),
+            "note": "下次开窗生效；已开着的窗口关掉重开才会换",
+        })
 
     # ---------- 引擎（跟哪个 agent 对话）----------
 
@@ -1311,6 +1457,15 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=engines.get_engine("acp").prewarm, daemon=True).start()
             except Exception:  # noqa: BLE001
                 pass
+        if ok and eid == "opencode":
+            # ★ 切到 opencode：它没在跑就把**桌面端**拉起来 —— 否则面板反代不到上游，
+            #   界面会一直报 `502 无法连接 OpenCode 服务`（用户实测）。
+            try:
+                import engines.opencode as _oc
+                if _oc.launch_desktop():
+                    print("[i] 已拉起 OpenCode 桌面端（引擎切到 opencode）")
+            except Exception:  # noqa: BLE001
+                pass
         self._send_json(200 if ok else 500, {"ok": ok, "active": engines.active_engine_id()})
 
     def _acp_agents(self, method: str):
@@ -1336,6 +1491,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if act == "candidates":
             self._send_json(200, {"ok": True, "candidates": acp_agents.scan_candidates()})
+            return
+        if act == "scan":
+            # 「扫描本机」：本机发现报告（含已登记、可用性、客户端缺适配器提示）
+            self._send_json(200, {"ok": True, **acp_agents.deep_scan()})
             return
         if act == "guess-provider":
             # 编辑弹窗的「自动」按钮：只**猜**不写（用户点了保存才落盘）
@@ -1522,7 +1681,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": "缺少 tools/%s" % script_name})
             return
         out = os.path.join(tempfile.gettempdir(),
-                           "opencode-ui-%s-%d-%d.txt" % (tag, os.getpid(), int(time.time() * 1000)))
+                           "cocraft-%s-%d-%d.txt" % (tag, os.getpid(), int(time.time() * 1000)))
         proc = None
         try:
             proc = subprocess.run(
@@ -1565,6 +1724,165 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(405, {"error": "POST only"})
             return
         self._pick_path("pick_image.ps1", "pickimg", "选择图片")
+
+    def _pick_folder(self, method: str):
+        """弹一个原生「选文件夹」框（新会话选工作目录用）。"""
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        self._pick_path("pick_folder.ps1", "pickdir", "选择文件夹")
+
+    def _open_dir(self, method: str):
+        """在外部程序里打开目录：{what:"terminal"|"editor"|"explorer", dir}。"""
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        b = self._read_json_body() or {}
+        what = str(b.get("what") or "terminal").strip().lower()
+        directory = str(b.get("dir") or "")
+        res = external.open_in(what, directory)
+        self._send_json(200 if res.get("ok") else 400, res)
+
+    # ---------- 面板内终端（ConPTY） ----------
+
+    def _pty_component(self):
+        """永远 200：告诉前端终端组件装没装（没装就禁用入口并说明）。"""
+        self._send_json(200, {"ok": True, "component": pty_term.component_info()})
+
+    def _pty_route(self, method: str, path: str):
+        if not pty_term.terminal_available():
+            self._send_json(503, {"ok": False, "installed": False,
+                                  "error": pty_term.component_info()["error"]})
+            return
+        parts = [p for p in path[len("/pty"):].split("/") if p]
+        if not parts:                                   # /pty
+            if method == "GET":
+                self._send_json(200, {"ok": True, "data": pty_term.list_all()})
+                return
+            if method == "POST":
+                b = self._read_json_body() or {}
+                try:
+                    s = pty_term.create(str(b.get("cwd") or ""),
+                                        int(b.get("cols") or 100), int(b.get("rows") or 30))
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+                    return
+                self._send_json(200, {"ok": True, "data": s.info()})
+                return
+            self._send_json(405, {"error": "GET or POST only"})
+            return
+
+        sid = parts[0]
+        if len(parts) == 1:                             # /pty/{id}
+            if method == "DELETE":
+                ok = pty_term.remove(sid)
+                self._send_json(200 if ok else 404, {"ok": ok})
+                return
+            if method == "GET":
+                s = pty_term.get(sid)
+                if not s:
+                    self._send_json(404, {"ok": False, "error": "终端不存在（可能已关闭）"})
+                    return
+                self._send_json(200, {"ok": True, "data": s.info()})
+                return
+            self._send_json(405, {"error": "GET or DELETE only"})
+            return
+
+        action = parts[1]
+        s = pty_term.get(sid)
+        if not s:
+            self._send_json(404, {"ok": False, "error": "终端不存在（可能已关闭）"})
+            return
+        if action == "stream" and method == "GET":
+            self._pty_stream(s)
+            return
+        if action == "input" and method == "POST":
+            b = self._read_json_body() or {}
+            ok = s.write(str(b.get("data") or ""))
+            self._send_json(200 if ok else 409, {"ok": ok})
+            return
+        if action == "resize" and method == "POST":
+            b = self._read_json_body() or {}
+            ok = s.resize(int(b.get("cols") or s.cols), int(b.get("rows") or s.rows))
+            self._send_json(200 if ok else 409, {"ok": ok})
+            return
+        self._send_json(404, {"ok": False, "error": "未知操作"})
+
+    def _pty_stream(self, s):
+        """把终端输出以 SSE 流给前端（我们不支持 WebSocket）。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+
+        def emit(obj: dict):
+            self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+
+        emit({"t": "ready", "info": s.info()})
+        try:
+            while True:
+                chunk = s.read(timeout=15)
+                if chunk is None:
+                    emit({"t": "exit", "code": s.exit_code})
+                    break
+                if chunk == "":
+                    self.wfile.write(b": ping\n\n")     # 保活，别让中间层掐断
+                    self.wfile.flush()
+                    continue
+                emit({"t": "out", "d": chunk})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # ---------- 编码模式：列目录 / 读文件 / 写文件（引擎无关） ----------
+
+    def _fs_q(self):
+        q = parse_qs(urlsplit(self.path).query)
+        return (q.get("root") or [""])[0], (q.get("path") or [""])[0]
+
+    def _fs_list(self):
+        root, path = self._fs_q()
+        try:
+            self._send_json(200, {"ok": True, "data": fsview.list_dir(root, path)})
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+
+    def _fs_read(self):
+        root, path = self._fs_q()
+        try:
+            self._send_json(200, {"ok": True, "data": fsview.read_file(root, path)})
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+
+    def _fs_write(self, method: str):
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        b = self._read_json_body() or {}
+        text = b.get("text")
+        try:
+            data = fsview.write_file(str(b.get("root") or ""), str(b.get("path") or ""),
+                                     "" if text is None else str(text))
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._send_json(200, {"ok": True, "data": data})
+
+    # ---------- 软件更新（查 GitHub Releases 最新版 / 一键静默更新） ----------
+
+    def _update_check(self):
+        q = parse_qs(urlsplit(self.path).query)
+        force = (q.get("force") or ["0"])[0] in ("1", "true", "yes")
+        self._send_json(200, {"ok": True, "data": updater.check(force=force)})
+
+    def _update_apply(self, method: str):
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        res = updater.apply_update()
+        self._send_json(200 if res.get("ok") else 400, res)
 
     def _appearance(self, method: str):
         """自定义外观（头像 / 空会话素材）：GET 读当前，POST 设置或清除。"""
@@ -1809,6 +2127,49 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def _cocraft_proxy(self, method: str, path: str):
+        """把 `/cocraft/*` 代理到 cocraft（Chatser）后端 —— 顺带避开浏览器跨域。
+
+        例：前端 `GET /cocraft/api/info`  →  `https://www.animaker.cc.cd/api/info`
+        `Authorization`（Bearer token）原样透传（token 由前端保管）；支持 GET/POST/DELETE/PATCH。
+        地址可被环境变量 `OPENCODE_UI_COCRAFT_BASE` 覆盖（比如本地跑 `http://127.0.0.1:5000`）。
+        """
+        base = (os.environ.get("OPENCODE_UI_COCRAFT_BASE") or COCRAFT_BASE).rstrip("/")
+        target = base + path[len("/cocraft"):]
+        query = urlsplit(self.path).query
+        if query:
+            target += "?" + query
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        headers = {"Accept": "application/json", "User-Agent": "cocraft"}
+        auth = self.headers.get("Authorization")
+        if auth:
+            headers["Authorization"] = auth
+        ctype = self.headers.get("Content-Type")
+        if ctype:
+            headers["Content-Type"] = ctype
+        req = urllib.request.Request(target, data=body, headers=headers, method=method)
+        try:
+            upstream = urllib.request.urlopen(req, timeout=60)
+        except urllib.error.HTTPError as exc:
+            upstream = exc
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(502, {"ok": False, "error": "cocraft 不可达：%s: %s"
+                                  % (type(exc).__name__, exc)})
+            return
+        with upstream:
+            data = upstream.read()
+            self.send_response(upstream.status)
+            self.send_header("Content-Type", upstream.headers.get(
+                "Content-Type", "application/json; charset=utf-8"))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
@@ -1844,7 +2205,15 @@ def main() -> int:
         # 由前端「首次设置」向导引导选引擎 / agent。缺上游只是代理暂时不可用。
         print(f"[!] 引擎 {eng.id} 未就绪：找不到 {getattr(eng, 'service_state', '')}", file=sys.stderr)
         if eng.id == "opencode":
-            print("    （可先在 http://127.0.0.1:8787 的首次设置里换成 ACP，或启动 OpenCode）",
+            # ★ 引擎 = opencode 但桌面端没在跑 → 主动拉起来（否则面板一直 502）。
+            try:
+                import engines.opencode as _oc
+                if _oc.launch_desktop():
+                    print("[i] OpenCode 没在跑 → 已拉起桌面端（等它就绪后页面会自动重连）",
+                          file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
+            print("    （若仍不行：在 http://127.0.0.1:8787 的首次设置里换成 ACP，或手动启动 OpenCode）",
                   file=sys.stderr)
     except NotImplementedError:
         pass                       # 该引擎不需要上游地址（例如 ACP 自己拉起 agent 子进程）
@@ -1860,6 +2229,13 @@ def main() -> int:
             print(f"[i] 已自动补上 ACP agent：{added}")
     except Exception as exc:  # noqa: BLE001
         print(f"[!] 自动补 ACP agent 失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+    # 自愈：把「随包 OpenCode（node 版）」补进注册表（与上面的本机客户端是两条，互不覆盖）。
+    try:
+        added = acp_agents.ensure_bundled_opencode_agent()
+        if added:
+            print(f"[i] 已自动补上 ACP agent：{added}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[!] 自动补随包 OpenCode 失败：{type(exc).__name__}: {exc}", file=sys.stderr)
 
     httpd = None
     try:
@@ -1869,14 +2245,17 @@ def main() -> int:
         print(f"[i] 端口 {args.host}:{args.port} 已在监听，视为已在运行（{exc}）")
         return 0
 
-    # 启动前先清掉上次遗留的辅助进程：它们脱离了父进程，又因 SO_REUSEADDR 能占住
-    # 同一个端口，不主动清就会越积越多。
-    try:
-        _n = cleanup.kill_stale(exclude=[os.getpid()])
-        if _n:
-            print(f"[i] 已清理 {_n} 个遗留辅助进程")
-    except Exception:  # noqa: BLE001
-        pass
+    # 启动前先清掉上次遗留的辅助进程（脱离父进程 + SO_REUSEADDR 会越积越多）。
+    # ⚠ 它内部要起 powershell —— 在"powershell 起不来"的机器上会**弹 0xc0000142 模态框并卡住**，
+    #   所以放**后台线程**：面板服务该起就起，别被这一步拖死（VM 白屏事故就是这么来的）。
+    def _cleanup_stale_bg():
+        try:
+            _n = cleanup.kill_stale(exclude=[os.getpid()])
+            if _n:
+                print(f"[i] 已清理 {_n} 个遗留辅助进程")
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=_cleanup_stale_bg, daemon=True).start()
 
     start_music_daemon()                      # 拉起 SMTC 采集进程（QQ音乐联动）
     threading.Thread(target=music_keeper, daemon=True).start()
@@ -1884,6 +2263,7 @@ def main() -> int:
     threading.Thread(target=spectrum_keeper, daemon=True).start()
     start_music_service()                     # 拉起网易云音乐服务（面板内搜歌/放歌）
     threading.Thread(target=music_service_keeper, daemon=True).start()
+    threading.Thread(target=pty_term.warmup, daemon=True).start()   # 预热面板内终端（可选组件，别让首次点开卡探测）
 
     # ACP 引擎：启动就预热当前 agent 的子进程（第一次提问不用等 node 冷启动）
     if eng.id == "acp":
@@ -1892,7 +2272,7 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
 
-    print("opencode-ui 已启动")
+    print("cocraft 已启动")
     print(f"  界面    http://{args.host}:{args.port}")
     print(f"  引擎    {eng.id}")
     if url:
@@ -1908,6 +2288,10 @@ def main() -> int:
         stop_music_service()
         try:                                     # 收起所有 ACP agent 子进程
             engines.get_engine("acp").shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:                                     # 关掉面板内终端（含其宿主子进程）
+            pty_term.close_all()
         except Exception:  # noqa: BLE001
             pass
         try:

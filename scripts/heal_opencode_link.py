@@ -9,9 +9,17 @@ ASCII only on purpose (the project keeps launcher scripts ASCII).
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import sys
+
+# 抑制「应用程序无法正常启动 (0xc0000142)」硬错误框：本脚本要起 powershell，
+# 在某些机器/时刻它会初始化失败 → 不弹模态框（子进程继承该 error mode）。
+try:
+    ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+except Exception:  # noqa: BLE001
+    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PS1 = os.path.join(HERE, "heal-opencode-link.ps1")

@@ -51,7 +51,7 @@ class AcpClient:
         self._pending = {}
         self._lock = threading.Lock()
         self._closed = False
-        self.client_info = client_info or {"name": "opencode-ui", "title": "opencode-ui", "version": "0.1.0"}
+        self.client_info = client_info or {"name": "cocraft", "title": "cocraft", "version": "0.1.0"}
         self.init_result = None
         self.agent_capabilities = {}
         self.protocol_version = None

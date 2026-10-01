@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""Fast project-local grep for opencode-ui.
+r"""Fast project-local grep for cocraft.
 
 Why: the generic recursive search walks runtime/browser-profile (thousands of
 Edge cache files) and runtime/venvs, so it times out. This tool skips those by

@@ -1,4 +1,6 @@
-# opencode-ui
+# cocraft
+
+> 曾用名 **opencode-ui**（仓库已改名为 `cocraft`，旧链接 GitHub 会自动重定向）。
 
 一个**自建的 OpenCode 前端**：不修改官方桌面版，独立运行、外观完全自控，并配套一个守护进程实现
 「**启动 OpenCode → 拉起面板**」「**关掉面板 → 关掉 OpenCode**」的联动。
@@ -19,11 +21,11 @@
 > **不需要**目标机预装 Python/Node；面板窗口用系统自带的 **Edge**（`--app` 独立窗口）。
 > 目前**只发布 Windows x64 一份**，没有 macOS / Linux 版本。
 
-**现成的安装包**：见 [Releases](https://github.com/huaian307/opencode-ui/releases)（资产名形如
-`opencode-ui-setup-<版本>-windows-x64.exe`）。或自己编一份：
+**现成的安装包**：见 [Releases](https://github.com/huaian307/cocraft/releases)（资产名形如
+`cocraft-setup-<版本>-windows-x64.exe`）。或自己编一份：
 
 ```bat
-python packaging\build.py            :: 产出 dist\opencode-ui-setup-<版本>.exe
+python packaging\build.py            :: 产出 dist\cocraft-setup-<版本>.exe
 ```
 
 - **核心必装**：面板 + 后端 + 嵌入式 Python（不用系统装 Python）。
@@ -32,13 +34,15 @@ python packaging\build.py            :: 产出 dist\opencode-ui-setup-<版本>.e
   会明确显示「未安装（可选组件）」，其余功能不受影响。
 - **不带 OpenCode、不带任何密钥**：引擎默认 `acp`（面板独立运行）；装了 OpenCode 的机器上
   「设置 → 对话引擎」里也能切到 `opencode`，agentlist 里会自动出现 `opencode-acp`。
+- **可一键更新**：装的是带更新功能的版本后，**设置 →「软件更新」→ 检查更新 / 立即更新**即可升到最新
+  GitHub Release（静默安装，装完面板自动重启）。⚠ 更早的版本没有这个入口，需要**手工装一次**新版。
 - **模型 API Key 由你自己给**（三条路任选）：
   ① 首次设置向导里的「模型 API Key」直接粘；② 设置 → **模型 API Key**（值留空 = 清除，界面只显示掩码）；
   ③ 设系统环境变量，例如 `DEEPSEEK_API_KEY`。没填时 agent 会明确回
   `Missing environment variable: DEEPSEEK_API_KEY.`
 - 换 provider：改 `<安装目录>\agents\codex\codex-home\config.toml` 的
   `model` / `base_url` / `env_key` 三行即可。
-- 装到 `%LOCALAPPDATA%\Programs\opencode-ui`（**per-user，不弹 UAC**），开始菜单有「打开面板 / 自检 / 卸载」；
+- 装到 `%LOCALAPPDATA%\Programs\cocraft`（**per-user，不弹 UAC**），开始菜单有「打开面板 / 自检 / 卸载」；
   「设置 → 应用 → 已安装的应用」里也能看到并卸载。
 
 ## 1. 它是什么 / 为什么

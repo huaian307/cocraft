@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""清理本项目遗留的辅助进程（音乐服务 / 频谱 / SMTC / ACP agent 子进程）。
+"""清理本项目遗留的辅助进程（音乐服务 / 频谱 / SMTC / ACP agent / 终端宿主）。
 
 为什么需要：这些进程是“脱离式”启动的，服务器被 stop.bat 强杀时跑不到自己的退出钩子，
 而 Windows 的 SO_REUSEADDR 又允许旧进程继续占着同一个端口，于是会越积越多。
@@ -12,8 +12,21 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+
+# 抑制「应用程序无法正常启动 (0xc0000142)」硬错误框：本模块要起 powershell/taskkill，
+# 关机收尾时它们可能初始化失败 → 不弹模态框（子进程继承该 error mode）。
+try:
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here in sys.path:
+        sys.path.remove(_here)
+    sys.path.insert(0, _here)
+    import procutils as _proc
+    _proc.set_error_mode()
+except Exception:  # noqa: BLE001
+    _proc = None
 
 NO_WINDOW = 0x08000000
 
@@ -23,6 +36,7 @@ PATTERNS = [
     r"opencode-ui[\\/]tools[\\/]music_service\.py",
     r"opencode-ui[\\/]tools[\\/]spectrum\.py",
     r"opencode-ui[\\/]tools[\\/]smtc-daemon\.ps1",
+    r"opencode-ui[\\/]backend[\\/]pty_host\.py",
     r"agentlist[\\/]codex[\\/]node_modules[\\/]@agentclientprotocol[\\/]codex-acp",
     r"agentlist[\\/]deepseekharness[\\/]adapter[\\/]node_modules[\\/]dsh-acp",
 ]

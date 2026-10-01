@@ -312,8 +312,117 @@ def qq_search(q: str, limit: int, offset: int) -> list:
 QQ_QUALITY = [("M800", ".mp3", "320k"), ("F000", ".flac", "无损"),
               ("M500", ".mp3", "128k"), ("C400", ".m4a", "AAC")]
 
+# ---- QQ 登录自动续期 ----
+# 实测：musickey（qm_keyst/qqmusic_key）**约 3 天过期**（refresh 回执 keyExpiresIn=259200），
+# 过期后付费歌全 104003（免费歌不受影响）；但 Cookie 里的 psrf_* 令牌（access/refresh token）
+# 有效期长得多（expiresAt 约 60 天），可以用 music.login.LoginServer/Login(loginMode=2) 换新密钥。
+# ⚠ 关键坑：param.musicid 必须是 **int**，传字符串会回 code=10006（参数错误）。
+QQ_REFRESH_AFTER = 2 * 86400        # 密钥用了 2 天就先换（留 1 天余量）
+QQ_REFRESH_COOLDOWN = 600           # 失败/强刷的冷却：10 分钟内不重复刷
+_qq_refresh_lock = threading.Lock()
+_qq_last_refresh = 0.0
+
+
+def _qq_cookie_dict() -> dict:
+    return _parse_cookie(read_cookies()["qq"])
+
+
+def _qq_apply_refresh(c: dict, d: dict) -> None:
+    """把刷新回执写回 Cookie 串（新密钥 + 滚动后的 psrf_* 令牌），落盘。"""
+    mk = d.get("musickey") or d.get("musicKey") or ""
+    if not mk:
+        return
+    c["qm_keyst"] = mk
+    c["qqmusic_key"] = mk
+    for src, dst in (("access_token", "psrf_qqaccess_token"),
+                     ("refresh_token", "psrf_qqrefresh_token"),
+                     ("openid", "psrf_qqopenid"), ("unionid", "psrf_qqunionid")):
+        if d.get(src):
+            c[dst] = str(d[src])
+    if d.get("expired_at"):
+        c["psrf_access_token_expiresAt"] = str(d["expired_at"])
+    if d.get("musickeyCreateTime"):
+        c["psrf_musickey_createtime"] = str(d["musickeyCreateTime"])
+    if d.get("refresh_key"):
+        c["refresh_key"] = str(d["refresh_key"])
+    write_cookie("qq", "; ".join("%s=%s" % (k, v) for k, v in c.items() if v != ""))
+
+
+def qq_refresh_login() -> dict:
+    """用 psrf_* 令牌换一份新 musickey。返回 {ok, refreshed, ...}（不含密钥明文）。"""
+    c = _qq_cookie_dict()
+    uin = (c.get("uin") or c.get("qqmusic_uin") or "").lstrip("0")
+    if not uin:
+        return {"ok": False, "error": "QQ音乐未登录"}
+    access = c.get("psrf_qqaccess_token") or ""
+    refresh = c.get("psrf_qqrefresh_token") or ""
+    openid = c.get("psrf_qqopenid") or ""
+    if not (access and refresh and openid):
+        return {"ok": False, "error": "缺少 psrf_* 令牌，无法自动续期（需重新登录一次）"}
+    param = {
+        "openid": openid,
+        "access_token": access,
+        "refresh_token": refresh,
+        "expired_in": int(c.get("psrf_access_token_expiresAt") or 0),
+        "musicid": int(uin),                       # ⚠ 必须 int，字符串 → 10006
+        "musickey": c.get("qm_keyst") or c.get("qqmusic_key") or "",
+        "refresh_key": c.get("refresh_key") or "",
+        "loginMode": 2,
+    }
+    payload = {"comm": {"uin": uin, "format": "json", "ct": 24, "cv": 0, "tmeLoginType": 2},
+               "req": {"module": "music.login.LoginServer", "method": "Login", "param": param}}
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    headers = {"User-Agent": UA, "Content-Type": "application/json",
+               "Content-Length": str(len(body)), **QQ_H, "Cookie": read_cookies()["qq"]}
+    js = _http_json("https://u.y.qq.com/cgi-bin/musicu.fcg", body, headers)
+    req = js.get("req") or {}
+    data = req.get("data") or {}
+    if req.get("code") != 0 or not (data.get("musickey") or data.get("musicKey")):
+        return {"ok": False, "code": req.get("code"), "error": "续期失败（code=%s）" % req.get("code")}
+    _qq_apply_refresh(c, data)
+    return {"ok": True, "refreshed": True, "code": 0,
+            "keyExpiresIn": data.get("keyExpiresIn"),
+            "musickeyCreateTime": data.get("musickeyCreateTime")}
+
+
+def qq_musickey_age() -> int:
+    """当前密钥用了多少秒；读不到 createtime 回 -1。"""
+    ts = _qq_cookie_dict().get("psrf_musickey_createtime") or ""
+    try:
+        t = int(ts)
+    except (TypeError, ValueError):
+        return -1
+    return max(0, int(time.time()) - t) if t > 0 else -1
+
+
+def qq_ensure_fresh(force: bool = False) -> dict:
+    """密钥快到期（或 force）就续期一次；带锁 + 冷却，失败不影响播放。"""
+    global _qq_last_refresh
+    now = time.time()
+    age = qq_musickey_age()
+    if not force and not (age >= 0 and age >= QQ_REFRESH_AFTER):
+        return {"ok": True, "skipped": True, "age": age}
+    with _qq_refresh_lock:
+        if time.time() - _qq_last_refresh < QQ_REFRESH_COOLDOWN:
+            return {"ok": True, "skipped": True, "reason": "cooldown", "age": age}
+        _qq_last_refresh = time.time()
+    try:
+        return qq_refresh_login()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+
 
 def qq_url(mid: str, media_mid: str = "") -> dict:
+    """取播放地址：先确保密钥新鲜；若因 104003 失败则强刷一次再试。"""
+    qq_ensure_fresh()
+    r = _qq_url_once(mid, media_mid)
+    if not r.get("ok") and "104003" in str(r.get("error") or ""):
+        if qq_ensure_fresh(force=True).get("refreshed"):
+            r = _qq_url_once(mid, media_mid)
+    return r
+
+
+def _qq_url_once(mid: str, media_mid: str = "") -> dict:
     mid = str(mid or "").strip()
     if not mid:
         return {"ok": False, "error": "missing mid"}
@@ -362,7 +471,9 @@ def qq_url(mid: str, media_mid: str = "") -> dict:
     elif last is not None:
         code = last.get("result") or last.get("code")
         if str(code) == "104003":
-            reason = "该曲目需要 QQ音乐会员（VIP 曲目）；免费歌曲可正常播放"
+            reason = ("无播放授权（104003）。两种可能：①这份 QQ Cookie 的音乐密钥已过期"
+                      "（qm_keyst 大约 3 天就过期）——重新登录 y.qq.com 后重贴【完整】Cookie 即可；"
+                      "②该曲目需购买数字专辑/单曲（会员不覆盖），只能单独购买。")
         else:
             reason = "有 vkey 但音频文件取不到（可能该音质无文件），换一首试试"
     else:
@@ -427,9 +538,43 @@ def qq_playlist_songs(pid, limit: int = 300) -> list:
     return [_qq_track(it) for it in (data.get("songlist") or [])]
 
 
+# QQ 推荐歌单：实测该接口会**忽略 sin 偏移**，sortId 大多也不生效 —— 只有换
+# categoryId、或 sortId=2 才会换一批（2026-09-26 逐项探测确认）。
+# 用一个游标轮流取不同的「分类 × 排序」，保证连续两次调用（点「换一批」）必定不同。
+QQ_RECO_PAIRS = [(c, s)
+                 for c in ("10000000", "222", "6", "8", "11", "13", "14", "15", "16", "17", "18")
+                 for s in ("5", "2")]
+_qq_reco_i = 0
+
+
 def qq_recommend(limit: int = 12) -> list:
-    """QQ 推荐歌单（公开 fcg，无需登录）。"""
-    q = {"picmid": "1", "rnd": str(int(time.time())), "g_tk": "5381",
+    """QQ 推荐歌单（公开 fcg，无需登录）。每次调用轮换一批，供前端「换一批」。"""
+    global _qq_reco_i
+    cat, sort = QQ_RECO_PAIRS[_qq_reco_i % len(QQ_RECO_PAIRS)]
+    _qq_reco_i += 1
+    q = {"picmid": "1", "rnd": str(int(time.time() * 1000)), "g_tk": "5381",
+         "loginUin": "0", "hostUin": "0", "format": "json",
+         "inCharset": "utf8", "outCharset": "utf-8", "notice": "0",
+         "platform": "yqq.json", "needNewCode": "0",
+         "categoryId": cat, "sortId": sort, "sin": "0", "ein": str(max(1, limit))}
+    url = ("https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_by_tag.fcg?"
+           + urllib.parse.urlencode(q))
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://y.qq.com/"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        js = json.loads(r.read().decode("utf-8", "replace"))
+    lst = ((js.get("data") or {}).get("list")) or []
+    out = [{"id": it.get("dissid"), "name": it.get("dissname") or "",
+            "count": it.get("listennum") or 0,
+            "cover": it.get("imgurl") or it.get("disscover") or "",
+            "creator": ""} for it in lst]
+    if not out:                      # 个别分类偶尔空 → 退回归一化「全部」
+        return qq_recommend_all(limit)
+    return out
+
+
+def qq_recommend_all(limit: int = 12) -> list:
+    """兜底：categoryId=10000000（全部）最热。"""
+    q = {"picmid": "1", "rnd": str(int(time.time() * 1000)), "g_tk": "5381",
          "loginUin": "0", "hostUin": "0", "format": "json",
          "inCharset": "utf8", "outCharset": "utf-8", "notice": "0",
          "platform": "yqq.json", "needNewCode": "0",
@@ -606,9 +751,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/status":
                 cks = read_cookies()
+                qk_age = qq_musickey_age()
                 self._json(200, {"ok": True, "providers": {
                     "netease": {"loggedIn": bool(cks["netease"]), "cookieTail": cks["netease"][-12:]},
-                    "qq": {"loggedIn": bool(cks["qq"]), "cookieTail": cks["qq"][-12:]}}})
+                    "qq": {"loggedIn": bool(cks["qq"]), "cookieTail": cks["qq"][-12:],
+                           "keyAgeSeconds": qk_age,
+                           "keyExpiresIn": 259200,
+                           "canAutoRefresh": bool(
+                               _parse_cookie(cks["qq"]).get("psrf_qqaccess_token")
+                               and _parse_cookie(cks["qq"]).get("psrf_qqrefresh_token"))}}})
+            elif u.path == "/refresh":
+                # 手动强制续期（QQ）：用 psrf_* 令牌换新 musickey
+                self._json(200, qq_refresh_login() if p == "qq" else {"ok": False, "error": "only qq"})
             elif u.path == "/search":
                 kw = (q.get("q") or [""])[0].strip()
                 if not kw:

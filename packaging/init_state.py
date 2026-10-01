@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""安装后初始化 opencode-ui 的运行时状态（由安装包调用，也可手工跑）。
+r"""安装后初始化 cocraft 的运行时状态（由安装包调用，也可手工跑）。
 
 它只做三件事，且**只在文件不存在时写**（重装不会覆盖用户数据）：
   1. `runtime/state/_engine.json`     → 默认引擎（装了随包 agent 就用 acp，否则 opencode 自动判定）
@@ -104,9 +104,17 @@ def fix_pth(app: str) -> None:
     ensure("..")
     ensure("..\\backend")
     # 可选组件：装了哪个就把哪个加进来（._pth 是"隔离模式"下唯一有效的 sys.path 来源）
-    for comp in ("music", "audio"):
-        if os.path.isdir(os.path.join(app, "runtime", "site-packages", comp)):
-            ensure("..\\runtime\\site-packages\\" + comp)
+    # ⚠ 不要写死组件名：直接扫 `runtime\site-packages\*` 的全部子目录。
+    #   （实测漏过：写死 ("music","audio") 时，新增的 terminal/panel 没进 ._pth → 嵌入式 Python 忽略 PYTHONPATH
+    #    → 终端组件 import winpty 失败、原生窗口也用不上。）
+    comp_root = os.path.join(app, "runtime", "site-packages")
+    try:
+        comps = sorted(d for d in os.listdir(comp_root)
+                       if os.path.isdir(os.path.join(comp_root, d)))
+    except OSError:
+        comps = []
+    for comp in comps:
+        ensure("..\\runtime\\site-packages\\" + comp)
     if changed:
         with open(pth, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")
@@ -124,7 +132,9 @@ def find_opencode() -> list:
     ② 探测器用不了（后端 import 失败）再回落固定路径。
     """
     try:
-        if HERE_BACKEND and HERE_BACKEND not in sys.path:
+        if HERE_BACKEND and HERE_BACKEND in sys.path:
+            sys.path.remove(HERE_BACKEND)
+        if HERE_BACKEND:
             sys.path.insert(0, HERE_BACKEND)
         from engines.acp import agents as ag          # noqa: PLC0415
         cmd = ag.find_subcommand_acp()
@@ -143,8 +153,28 @@ def find_opencode() -> list:
     return []
 
 
+def find_bundled_opencode() -> list:
+    """随包 OpenCode（npm / Node 分发）的启动命令 `[<exe>, "acp"]`；没随包就回 `[]`。
+
+    与 `find_opencode()`（本机客户端）**是两条**：随包那份在 `<app>\\agents\\opencode\\`，
+    注册成 `opencode-node`，不和用户的客户端混在一起。布局由后端探测器决定。
+    """
+    try:
+        if HERE_BACKEND and HERE_BACKEND in sys.path:
+            sys.path.remove(HERE_BACKEND)
+        if HERE_BACKEND:
+            sys.path.insert(0, HERE_BACKEND)
+        from engines.acp import agents as ag          # noqa: PLC0415
+        cmd = ag.find_bundled_opencode()
+        if cmd:
+            return [str(x) for x in cmd]
+    except Exception as exc:  # noqa: BLE001
+        log("[i] 随包 OpenCode 探测器不可用（%s）" % type(exc).__name__)
+    return []
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="初始化 opencode-ui 运行时状态")
+    ap = argparse.ArgumentParser(description="初始化 cocraft 运行时状态")
     ap.add_argument("--app-dir", required=True, help="安装目录（含 backend/frontend/...）")
     ap.add_argument("--workspace", default="", help="共享工作区目录（默认 <app>/runtime/workspace）")
     args = ap.parse_args()
@@ -160,8 +190,9 @@ def main() -> int:
     # 端口：安装版用自己的一组（17887/17888/17990），避免和「开发目录里的副本」抢
     # （实测：开发副本占着 8788 时，安装版的守护进程会"已有守护进程在运行"直接退出、窗口不开）
     try:
-        if HERE_BACKEND not in sys.path:
-            sys.path.insert(0, HERE_BACKEND)
+        if HERE_BACKEND in sys.path:
+            sys.path.remove(HERE_BACKEND)
+        sys.path.insert(0, HERE_BACKEND)
         from panel_port import write_ports, read_ports
         wrote = write_ports({"port": 17887, "lock": 17888, "music": 17990})
         ports = read_ports()
@@ -229,19 +260,36 @@ def main() -> int:
     if oc:
         agents.append({
             "id": "opencode-acp",
-            "label": "OpenCode · ACP（子命令）",
+            "label": "OpenCode 客户端",
             "builtin": True,
             "command": oc,
             "cwd": "",
             "env": {},
-            "note": "本机 OpenCode 自带的 ACP server",
+            "note": "本机安装的 OpenCode 客户端自带的 ACP server",
             "provider": "",
-            "mode": "plan",
+            "mode": "",     # 不写死模式：默认跟随用户在面板里最后一次选择
         })
         log("[OK] 已加入 opencode-acp（%s）" % oc[0])
     else:
         # ⚠ 这一刻探测不到不代表没有：面板每次启动还会补一次（agents.ensure_opencode_agent）
         log("[i] 本次没探测到本机 OpenCode；面板启动时会再补一次，也可以在 agentlist 里手动加")
+
+    # 随包 OpenCode（npm / Node 分发）—— 与上面的本机客户端是**两条**，互不覆盖。
+    # 装上把 `agents\opencode\` 铺进去后这里就会命中；没铺就什么也不做。
+    bo = find_bundled_opencode()
+    if bo:
+        agents.append({
+            "id": "opencode-node",
+            "label": "OpenCode（随包 Node 版）",
+            "builtin": True,
+            "command": bo,
+            "cwd": "",
+            "env": {},
+            "note": "安装包自带的 OpenCode（npm / Node 分发）",
+            "provider": "",
+            "mode": "",     # 不写死模式：默认跟随用户在面板里最后一次选择
+        })
+        log("[OK] 已加入 opencode-node（%s）" % bo[0])
 
     if agents:
         reg = read_json(agents_file)

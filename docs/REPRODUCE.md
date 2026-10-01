@@ -1,4 +1,4 @@
-# REPRODUCE.md — 从零复现 opencode-ui
+# REPRODUCE.md — 从零复现 cocraft
 
 > 目标：在 Windows 10/11 上把本项目跑起来，并知道每项功能的依赖、验证方法与边界。
 > 本仓库是**脱敏后的公开版本**：不包含本机运行数据、开发笔记和同人图素材。
@@ -59,7 +59,7 @@ OpenCode 启动后必须存在：
 
 ```bat
 :: 1) 取得项目（目录位置随意）
-git clone https://github.com/huaian307/opencode-ui.git
+git clone https://github.com/huaian307/cocraft.git
 cd /d %PROJECT%
 
 :: 2) 确认 OpenCode 桌面版跑起来过一次（生成 service.json）
@@ -191,7 +191,7 @@ Windows 自带的 `powershell.exe` 是 **5.1，默认 ANSI**：agent 读 UTF-8 �
 | `hero.jpg` | 空会话主插画 | 1600×1600 |
 | `badge.jpg` | 左上角头像 | ≥128×128 |
 | `sticker-duck.jpg` / `sticker-couple.jpg` | 空状态贴纸 | 任意 |
-| `opencode-ui.ico` | 快捷方式图标 | 多尺寸最佳 |
+| `cocraft.ico` | 快捷方式图标 | 多尺寸最佳 |
 
 模型品牌标位于 `frontend/assets/models/`，属于仓库内容。需要重新下载时：
 

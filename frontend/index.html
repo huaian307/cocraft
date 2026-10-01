@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>絵梨衣 · OpenCode</title>
-<link rel="icon" href="/assets/opencode-ui.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style.css?v=260926zp">
+<title>cocraft · 絵梨衣</title>
+<link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
+<link rel="stylesheet" href="/style.css?v=0.1.8">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -52,7 +52,7 @@
 
     <div class="side-head">
       <button id="btn-new" class="primary" title="新建会话">＋ 新会话</button>
-      <button id="btn-import" title="把这个 agent 那边已有的会话领进面板" hidden>导入…</button>
+      <button id="btn-import" title="接续这个 agent 那边已有的会话（不是复制历史）" hidden>接续…</button>
       <input id="search" type="search" placeholder="搜索会话…" autocomplete="off">
     </div>
 
@@ -74,12 +74,20 @@
         <div id="session-meta" class="muted"></div>
       </div>
       <div class="actions">
+        <button id="btn-tools" title="工具：面板终端 / 编码模式（VS Code 风格）" aria-label="工具">
+          <svg class="ico-wrench" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/></svg>
+        </button>
         <button id="btn-agent" class="mdl-btn" title="切换智能体 / 模式（对当前会话生效）" aria-label="切换模式">模式</button>
         <button id="btn-model" class="mdl-btn" title="切换模型（对当前会话生效）" aria-label="切换模型">模型</button>
         <button id="btn-cfg" title="设置（亮度 / 毛玻璃 / 壁纸 / 落樱 …）" aria-label="设置"><svg class="ico-gear" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.5 7.5 0 0 0 .06-.94 7.5 7.5 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.24-1.12.56-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.7 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.61.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.58-.24 1.12-.56 1.62-.94l2.39.96c.22.08.48 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg></button>
         <button id="btn-theme" title="昼（白衣绯袴）/ 夜（黑纹付羽织·黄金瞳）" aria-label="切换昼夜">夜</button>
         <button id="btn-refresh" title="重新加载消息" aria-label="重新加载消息">↻</button>
         <button id="btn-stop" class="danger" title="中断当前生成" aria-label="中断当前生成" disabled>■</button>
+      </div>
+      <div id="tools-menu" class="open-menu" hidden>
+        <div id="tm-dir" class="om-dir">—</div>
+        <button type="button" data-tool="term" id="tm-term">面板终端</button>
+        <button type="button" data-tool="code" id="tm-code">编码模式</button>
       </div>
     </header>
 
@@ -122,13 +130,14 @@
       </section>
 
       <div id="player" class="player">
-      <div class="p-bg" aria-hidden="true"></div>
+      <div id="p-bg" class="p-bg" aria-hidden="true"></div>
       <div class="p-row">
         <div class="p-vis" id="p-vis" aria-hidden="true">
           <span></span><span></span><span></span><span></span><span></span>
         </div>
         <div class="p-info">
           <b id="p-title">未在播放</b><i id="p-artist"></i>
+          <div id="p-lyric" class="p-lyric"><span id="p-lyric-inner"></span></div>
         </div>
         <div class="p-ctrl">
           <button id="p-prev" title="上一首（QQ音乐）" aria-label="上一首">«</button>
@@ -147,7 +156,7 @@
         <button id="p-search-btn" title="搜索 QQ音乐 曲库（结果可复制，粘到客户端搜索框）">搜</button>
         <button id="p-queue" title="当前播放列表">≡</button>
         <button id="p-home" title="音乐主页（推荐 / 我的）" aria-label="音乐主页"><svg class="ico-house" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3.1 2.4 11.2l1.2 1.5L5 11.5V21h5.2v-5.6h3.6V21H19v-9.5l1.4 1.2 1.2-1.5z"/></svg></button>
-        <button id="p-lyric-btn" title="收起侧栏 → 画面中央显示滚动歌词">词</button>
+        <button id="p-lyric-btn" title="歌词：展开时在播放条歌名处横向滚动，收起侧栏时居中显示">词</button>
         <button id="p-fold" title="收起 / 展开播放条" aria-label="收起或展开播放条">▾</button>
       </div>
       <div class="p-seek-row">
@@ -181,14 +190,159 @@
 
 </div>
 
+<!-- 面板内终端：从底部上滑的抽屉（像群聊那样「分屏」——给 #app 让出底部空间），
+     风格跟主题一致（纸色/青铜边/校徽）。顶边缘可拖动改高度（--term-h）。 -->
+<aside id="term" class="term" aria-label="终端" aria-hidden="true">
+  <div id="term-resize" class="term-resize" title="拖动调整高度"></div>
+  <div class="term-head">
+    <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+    <span class="wp-kind">终端</span><b>面板内终端</b><i class="mk-cap">言灵 · ConPTY</i>
+    <span id="term-meta" class="term-meta"></span>
+    <span class="term-spacer"></span>
+    <button type="button" id="term-ext" title="在外部终端打开这个目录">外部</button>
+    <button type="button" id="term-clear" title="清屏（只清本地显示，终端进程还在）">清屏</button>
+    <button type="button" id="term-restart" title="关掉这个终端、重开一个">重开（新终端）</button>
+    <button type="button" id="term-close" class="term-x" title="隐藏（终端保持运行，下次打开接着用）">×</button>
+  </div>
+  <div id="term-wrap" class="term-wrap" tabindex="0" aria-label="终端内容（点一下聚焦后即可输入）">
+    <pre id="term-screen" class="term-screen"></pre>
+    <span id="term-caret" class="term-caret" hidden></span>
+  </div>
+  <div id="term-measure" class="term-measure" aria-hidden="true">M</div>
+</aside>
+
 <div id="lyrics-overlay" class="lyrics-overlay" aria-hidden="true">
   <div class="ly-scroll" id="ly-scroll"></div>
 </div>
+
+<!-- 收起会话时的歌词「气泡球」：空闲贴边缩成小箭头，点击展开 / 收起歌词，可拖动换位置 -->
+<button id="lyric-ball" class="lyric-ball right" type="button" title="歌词（点击开关 · 拖动换位置）">
+  <span class="lb-ico" id="lyric-ball-ico">词</span>
+  <span class="lb-arrow" aria-hidden="true"></span>
+</button>
 
 <div id="img-view" class="img-view" hidden>
   <img id="img-view-img" alt="">
   <button id="img-view-close" class="img-x" title="关闭">×</button>
 </div>
+
+<!-- 群聊（cocraft）：右边一条**透明触发带**，点一下从右侧滑出抽屉；抽屉里用 iframe 嵌站点，
+     登录 / 聊天都由站点自己处理（未登录 → 站点显示登录注册页；已登录 → 站点显示谈话界面）。
+     ⚠ 加固（2026-09-28，曾把 WebView2 窗口卡死过）：① **绝不自动打开**（必须用户点触发带）；
+     ② iframe 带 `sandbox`（不含 allow-top-navigation / allow-modals）、不委派任何 allow-* 权限；
+     ③ 抽屉滑入动画走完再导航；④ 12s 没 load 就在抽屉里提示"可点 ↗ 用浏览器打开"。 -->
+<button id="chat-strip" type="button" title="群聊（点击展开 / 收起）" aria-label="群聊" aria-expanded="false">
+  <span class="cs-label">群聊</span>
+</button>
+<aside id="cocraft" class="cocraft" aria-label="群聊" aria-hidden="true">
+  <div id="cc-resize" class="cc-resize" title="拖动调整宽度"></div>
+  <div class="cc-head">
+    <span class="cc-title">群聊</span>
+    <i class="cc-cap">cocraft</i>
+    <span class="cc-spacer"></span>
+    <span id="cc-who" class="cc-who"></span>
+    <button id="cc-refresh" type="button" title="刷新">↻</button>
+    <button id="cc-logout" type="button" title="退出登录" hidden>退出</button>
+    <button id="cc-close" type="button" class="cc-x" title="收起">×</button>
+  </div>
+  <div id="cc-note" class="cc-note" hidden></div>
+
+  <!-- 未登录：登录 / 注册 -->
+  <div id="cc-auth" class="cc-auth" hidden>
+    <div class="cc-tabs">
+      <button type="button" class="cc-tab on" data-tab="login">登录</button>
+      <button type="button" class="cc-tab" data-tab="reg">注册</button>
+    </div>
+    <form id="cc-login" class="cc-form">
+      <input id="cc-login-account" type="text" placeholder="用户名或邮箱" autocomplete="username">
+      <input id="cc-login-password" type="password" placeholder="密码" autocomplete="current-password">
+      <button type="submit" class="primary">登录</button>
+    </form>
+    <form id="cc-reg" class="cc-form" hidden>
+      <input id="cc-reg-username" type="text" placeholder="用户名" autocomplete="username">
+      <input id="cc-reg-email" type="email" placeholder="邮箱" autocomplete="email">
+      <div class="cc-inline">
+        <input id="cc-reg-code" type="text" placeholder="邮箱验证码">
+        <button type="button" id="cc-reg-send">发送验证码</button>
+      </div>
+      <input id="cc-reg-password" type="password" placeholder="密码" autocomplete="new-password">
+      <button type="submit" class="primary">注册</button>
+    </form>
+    <div id="cc-auth-msg" class="cc-msg"></div>
+  </div>
+
+  <!-- 已登录：左＝会话列表，右＝聊天内容 -->
+  <div id="cc-main" class="cc-main" hidden>
+    <div class="cc-side">
+      <div class="cc-side-head"><span>会话</span></div>
+      <div id="cc-chats" class="cc-chats"></div>
+    </div>
+    <div class="cc-room">
+      <div id="cc-room-head" class="cc-room-head">
+        <div class="cc-room-title" id="cc-room-title">选一个会话</div>
+        <button type="button" id="cc-menu-btn" class="cc-menu-btn" title="会话操作">☰</button>
+      </div>
+      <div id="cc-menu-pop" class="cc-menu-pop" hidden>
+        <div class="cc-menu-row">
+          <span>邀请成员</span>
+          <div class="cc-inline">
+            <input id="cc-invite-ids" type="text" placeholder="用户 ID，逗号分隔">
+            <button type="button" id="cc-invite-go">邀请</button>
+          </div>
+        </div>
+        <div class="cc-menu-row">
+          <span>移出成员<i>（填自己 = 退群）</i></span>
+          <div class="cc-inline">
+            <input id="cc-remove-id" type="text" placeholder="用户 ID">
+            <button type="button" id="cc-remove-go">移出</button>
+          </div>
+        </div>
+      </div>
+      <div id="cc-msgs" class="cc-msgs"></div>
+      <form id="cc-send-form" class="cc-send">
+        <textarea id="cc-send" rows="1" placeholder="说点什么……（Enter 发送，Shift+Enter 换行；📎 可发文件）"></textarea>
+        <button type="button" id="cc-attach" title="发送文件（图片会直接预览）">📎</button>
+        <input type="file" id="cc-file" hidden>
+        <button type="submit" class="primary">发送</button>
+      </form>
+    </div>
+  </div>
+</aside>
+
+<!-- 编码模式（仿 VS Code 的简便版）：**从右侧滑出的抽屉**（跟群聊一样分屏：给 #app 让出右侧），
+     左边缘可拖动改宽度（--code-w）；左边文件树，右边看/改代码并保存。
+     根目录 = 当前会话的工作目录；后端 /fs/* 会做越界校验。 -->
+<aside id="code" class="code" aria-label="编码模式" aria-hidden="true">
+  <div id="code-resize" class="code-resize" title="拖动调整宽度"></div>
+  <div class="code-head">
+    <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+    <span class="wp-kind">编码</span><b>编码模式</b><i class="mk-cap">project</i>
+    <span id="code-root" class="code-root" title="当前会话的工作目录"></span>
+    <span id="code-status" class="code-status"></span>
+    <button type="button" id="code-exec" title="运行当前文件（Ctrl+Enter）：按扩展名自动挑解释器（Python / Node / PowerShell…），先自动保存再送进下方终端">▶ 运行</button>
+    <button type="button" id="code-menu" title="更多：打开文件夹 / 新建终端 / 在 VS Code 打开">菜单 ▾</button>
+    <button type="button" id="code-refresh" title="刷新文件树">↻</button>
+    <button type="button" id="code-close" class="code-x" title="关闭编码模式">×</button>
+    <div id="code-menu-list" class="open-menu code-menu" hidden>
+      <button type="button" id="cm-folder">打开文件夹</button>
+      <button type="button" id="cm-term">新建终端</button>
+      <button type="button" id="cm-vsc">在 VS Code 打开</button>
+    </div>
+  </div>
+  <div class="code-body">
+    <div id="code-tree" class="code-tree" aria-label="文件树"></div>
+    <div class="code-main">
+      <div id="code-path" class="code-path">未打开文件</div>
+      <div class="code-edit-wrap">
+        <pre id="code-highlight" class="code-highlight" aria-hidden="true"></pre>
+        <textarea id="code-editor" class="code-editor" spellcheck="false" wrap="off" disabled
+                  placeholder="← 从左边选一个文件"></textarea>
+      </div>
+    </div>
+  </div>
+  <!-- 「允许代码」的终端槽：终端（#term）会被临时移动到这儿 —— 宽度 = 抽屉宽度，高度可拖 -->
+  <div id="code-term-slot" class="code-term-slot" hidden></div>
+</aside>
 
 <div id="cfg" class="cfg" hidden>
   <div class="cfg-box">
@@ -218,6 +372,14 @@
         <label>首次设置<i>重新选择默认引擎 / agent / 模型</i></label>
         <button id="cfg-setup">运行向导…</button>
       </div>
+      <div class="cfg-row wide">
+        <label>软件更新<i id="upd-note">安装版可从 GitHub Releases 一键更新到最新；开发环境不支持</i></label>
+        <div class="cfg-ctl">
+          <span class="cfg-key-var mono" id="upd-cur" title="当前版本">—</span>
+          <button type="button" id="upd-check">检查更新</button>
+          <button type="button" id="upd-apply" hidden>立即更新</button>
+        </div>
+      </div>
       <div class="cfg-row">
         <label>左上角名字<i>留空则恢复默认「絵梨衣」</i></label>
         <input type="text" id="cfg-brand" maxlength="24" placeholder="絵梨衣">
@@ -227,7 +389,7 @@
         <input type="text" id="cfg-brand-sub" maxlength="40" placeholder="落尽红樱君不见，轻绘梨花泪沾衣">
       </div>
       <div class="cfg-row wide">
-        <label>头像 / 空会话素材<i>都能换成本机图片；「默认」= 用自带素材（只记路径，存在本机 runtime/state）</i></label>
+        <label>头像 / 素材 / 气泡球<i>都能换成本机图片；「默认」= 用自带素材（只记路径，存在本机 runtime/state）</i></label>
         <div class="cfg-ctl cfg-art">
           <span class="cfg-art-k">左上角头像</span>
           <button type="button" class="cfg-img-pick" data-img="brand">选择…</button>
@@ -257,6 +419,18 @@
           <button type="button" class="cfg-img-pick" data-img="sticker2">选择…</button>
           <button type="button" class="cfg-img-clear" data-img="sticker2" title="恢复自带素材">默认</button>
           <span class="cfg-img-name" data-img-name="sticker2">默认</span>
+        </div>
+        <div class="cfg-ctl cfg-art">
+          <span class="cfg-art-k">歌词气泡球图标</span>
+          <button type="button" class="cfg-img-pick" data-img="lyricball">选择…</button>
+          <button type="button" class="cfg-img-clear" data-img="lyricball" title="恢复默认图标">默认</button>
+          <span class="cfg-img-name" data-img-name="lyricball">默认</span>
+        </div>
+        <div class="cfg-ctl cfg-art">
+          <span class="cfg-art-k">音乐条背景</span>
+          <button type="button" class="cfg-img-pick" data-img="playerbg">选择…</button>
+          <button type="button" class="cfg-img-clear" data-img="playerbg" title="恢复自带背景">默认</button>
+          <span class="cfg-img-name" data-img-name="playerbg">默认</span>
         </div>
       </div>
       <div class="cfg-row">
@@ -298,6 +472,14 @@
       <div class="cfg-row">
         <label>任务栏自动隐藏<i>面板打开且未最小化时隐藏；最小化或关掉开关就恢复显示</i></label>
         <button id="cfg-taskbar" class="cfg-toggle">开</button>
+      </div>
+      <div class="cfg-row">
+        <label>面板窗口<i id="cfg-window-note">开启面板时用哪种窗口；改完关掉面板再开生效</i></label>
+        <select id="cfg-window">
+          <option value="auto">自动（能用软件窗口就用）</option>
+          <option value="native">软件窗口（WebView2）</option>
+          <option value="browser">浏览器窗口（Edge 风格）</option>
+        </select>
       </div>
       <div class="cfg-row">
         <label>对话两侧音频条<i>在消息区左右各显示一条真频谱（随系统声音跳动）</i></label>
@@ -405,14 +587,43 @@
   <div class="wp-box">
     <div class="wp-head">
       <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">会话</span><b>从这个 agent 导入会话</b><i class="mk-cap">读歌单式</i>
+      <span class="wp-kind">会话</span><b>从这个 agent 接续会话</b><i class="mk-cap">attach</i>
       <button id="imp-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="wp-cur muted" id="imp-cur">读取中…</div>
     <div class="wp-list" id="imp-list"></div>
     <div class="wp-foot">
-      <span class="muted" id="imp-note">这些是 agent 自己记着的会话。导入只建一条索引，**历史留在 agent 那边**（ACP 没有读消息的接口），导入后直接接着聊即可</span>
+      <span class="muted" id="imp-note">这些是 agent 自己记着的会话。「接续」= 在面板里建一条**指向**它的记录，不是复制历史：OpenCode 的会话（与桌面端共用一个库）会**把历史读进来**；其它 agent 没有读历史的接口，历史留在对面。若那条会话在 agent 侧已不存在，接续会失败并在继续聊时新建一条</span>
       <button id="imp-reload">重新读取</button>
+    </div>
+  </div>
+</div>
+
+<div id="newsess" class="wp" hidden>
+  <div class="wp-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">新会话</span><b>选择工作目录</b><i class="mk-cap">场所</i>
+      <button id="ns-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="cfg-body">
+      <div class="cfg-row wide">
+        <label>工作目录<i>这个会话在哪个目录下工作；留空 = 用引擎默认（ACP 是共享工作区）</i></label>
+        <div class="cfg-ctl">
+          <input type="text" id="ns-dir" class="mono" placeholder="留空 = 引擎默认；也可点「选择…」" autocomplete="off">
+          <button type="button" id="ns-pick">选择…</button>
+          <button type="button" id="ns-clear" title="清空，改用引擎默认">清空</button>
+        </div>
+      </div>
+      <div class="cfg-row">
+        <label>标题<i>可留空，发出第一句会自动命名</i></label>
+        <input type="text" id="ns-title" maxlength="60" placeholder="新会话" autocomplete="off">
+      </div>
+    </div>
+    <div class="wp-foot">
+      <span class="muted" id="ns-note"></span>
+      <button id="ns-create">创建</button>
+      <button id="ns-cancel">取消</button>
     </div>
   </div>
 </div>
@@ -428,7 +639,7 @@
     <div class="wp-list" id="agents-list"></div>
     <div class="wp-foot">
       <span class="muted">切换会重启 ACP 子进程；命令 / 路径鼠标悬停可见；provider 只影响模型图标</span>
-      <button id="agents-add">＋ 新增 agent…</button>
+      <button id="agents-add">＋ 扫描本机 / 新增…</button>
       <button id="agents-detect">自动检测</button>
       <button id="agents-edit">编辑当前 agent…</button>
       <button id="agents-reload">重新加载</button>
@@ -478,13 +689,14 @@
   <div class="wp-box">
     <div class="wp-head">
       <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">ACP</span><b>新增 Agent</b><i class="mk-cap">发现 / 选文件夹</i>
+      <span class="wp-kind">ACP</span><b>扫描本机 Agent</b><i class="mk-cap">扫描 / 选文件夹</i>
       <button id="anew-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="wp-cur muted" id="anew-cur">扫描中…</div>
     <div class="wp-list" id="anew-list"></div>
     <div class="wp-foot">
-      <span class="muted">没找到你的 agent？用「选择文件夹」指向它的目录（自动识别 node 适配器或 *acp*.exe）</span>
+      <span class="muted">扫描本机常见位置（PATH / npm / Programs / 随包目录…）；没找到就用「选择文件夹」指向 agent 目录</span>
+      <button id="anew-addall">可用的一键加入</button>
       <button id="anew-folder">选择文件夹…</button>
       <button id="anew-reload">重新扫描</button>
     </div>
@@ -543,16 +755,16 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/app.js?v=260926zp"></script>
+<script src="/app.js?v=0.1.8"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */
 (function () {
   try {
-    var n = +(sessionStorage.getItem("opencode-ui.appReloads") || 0);
+    var n = +(sessionStorage.getItem("cocraft.appReloads") || 0);
     setTimeout(function () {
       if (!window.__appLoaded && n < 3) {
-        sessionStorage.setItem("opencode-ui.appReloads", n + 1);
+        sessionStorage.setItem("cocraft.appReloads", n + 1);
         location.reload();
       }
     }, 4000);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start the opencode-ui panel (and OpenCode, only when the panel still needs it).
+"""Start the cocraft panel (and OpenCode, only when the panel still needs it).
 
 This is what the "OpenCode (with panel)" desktop shortcut runs. It is meant to
 run under pythonw.exe so that no console window flashes.
@@ -27,6 +27,17 @@ WATCH = os.path.join(BACKEND, "watch.py")
 HEAL = os.path.join(ROOT, "scripts", "heal_opencode_link.py")
 ENGINE_FILE = os.path.join(ROOT, "runtime", "state", "_engine.json")
 
+# 进程查询走纯 ctypes（不起 tasklist），并抑制"应用程序无法正常启动"硬错误框
+# （子进程——含自愈用的 powershell——会继承这个 error mode）。
+try:
+    if BACKEND in sys.path:
+        sys.path.remove(BACKEND)
+    sys.path.insert(0, BACKEND)
+    import procutils as _proc      # noqa: PLC0415
+    _proc.set_error_mode()
+except Exception:  # noqa: BLE001
+    _proc = None
+
 # Candidate paths of the OpenCode desktop executable; first existing one wins.
 # Only per-machine/per-user locations are probed (no hard-coded user paths).
 OPENCODE_CANDIDATES = [
@@ -46,7 +57,13 @@ def find_opencode():
 
 
 def opencode_running():
-    """Cheap, dependency-free check (tasklist is filtered by image name only)."""
+    """Cheap check. Pure ctypes first (no child process → nothing to pop an error box);
+    tasklist only as a fallback."""
+    if _proc is not None:
+        try:
+            return _proc.is_running("OpenCode.exe")
+        except Exception:  # noqa: BLE001
+            pass
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", "IMAGENAME eq OpenCode.exe", "/NH"],
@@ -65,8 +82,9 @@ def active_engine():
     engine package cannot be imported for any reason.
     """
     try:
-        if BACKEND not in sys.path:
-            sys.path.insert(0, BACKEND)
+        if BACKEND in sys.path:
+            sys.path.remove(BACKEND)
+        sys.path.insert(0, BACKEND)
         from engines import active_engine_id      # noqa: PLC0415
         return str(active_engine_id() or "")
     except Exception:

@@ -16,11 +16,37 @@ import os
 import queue
 import re
 import threading
+import time
 import urllib.parse
 
 from ..base import Engine
 from . import agents
 from .service import AcpService, BusyError
+
+
+# ACP / agent 的 stderr 以前是直接丢掉的（log=lambda s: None）—— 出问题时（比如随包 codex 起不来、
+# 网络不通、缺 API Key）完全看不到现场。现在落到 runtime/logs/acp.log，超过 2MB 截断重来。
+ACP_LOG_LOCK = threading.Lock()
+
+
+def acp_log_path() -> str:
+    return os.path.join(agents.ROOT_DIR, "runtime", "logs", "acp.log")
+
+
+def acp_log(s: str) -> None:
+    try:
+        p = acp_log_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with ACP_LOG_LOCK:
+            try:
+                if os.path.getsize(p) > 2 * 1024 * 1024:
+                    open(p, "w", encoding="utf-8").close()
+            except OSError:
+                pass
+            with open(p, "a", encoding="utf-8") as fh:
+                fh.write("%s %s\n" % (time.strftime("%H:%M:%S"), str(s)))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _empty(handler, code: int):
@@ -157,6 +183,19 @@ class AcpEngine(Engine):
                 "env": {str(k): agents.mask_secret(v) for k, v in env.items()},
                 "envNames": sorted(str(k) for k in env.keys())}
 
+    def log_tail(self, n: int = 200) -> str:
+        """最近 n 行 ACP / agent 日志（排查随包 codex 起不来、网络不通、缺 Key 用）。"""
+        try:
+            n = max(1, min(int(n), 2000))
+        except Exception:  # noqa: BLE001
+            n = 200
+        try:
+            with open(acp_log_path(), "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            return ""
+        return "".join(lines[-n:])
+
     def prewarm(self):
         """启动当前 agent 的子进程并顺手拿一次模型清单（不弹命令、不建会话）。"""
         try:
@@ -194,7 +233,7 @@ class AcpEngine(Engine):
             if not command:
                 raise RuntimeError("未配置 ACP agent 命令：runtime/state/_acp.json 缺少 command")
             svc = AcpService(command, cwd=cfg.get("cwd"),
-                             env=cfg.get("env"), log=lambda s: None,
+                             env=cfg.get("env"), log=acp_log,
                              agent_id=aid,
                              provider_id=cfg.get("provider") or "",
                              baseline=cfg.get("_baseline") or {})

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""把 opencode-ui 打包成安装包（Inno Setup）要用的 payload。
+r"""把 cocraft 打包成安装包（Inno Setup）要用的 payload。
 
 产物（都在 dist/ 下）：
     dist/payload/app/                      项目核心（backend/frontend/tools/launchers/scripts/docs）
@@ -9,7 +9,7 @@ r"""把 opencode-ui 打包成安装包（Inno Setup）要用的 payload。
     dist/payload/agents/codex/…            codex-acp + 依赖 + 原生 codex.exe + 干净的 codex-home 模板
     dist/payload/components/music/…        可选：音乐服务的 site-packages
     dist/payload/components/audio/…        可选：音频频谱的 site-packages
-    dist/opencode-ui-setup-<ver>.exe       由 ISCC 编译出来的安装包
+    dist/cocraft-setup-<ver>.exe       由 ISCC 编译出来的安装包
 
 用法：
     python packaging\build.py                 # 默认：核心 + codex agent（可选组件不预置）
@@ -53,6 +53,9 @@ CORE_SKIP_FILES = ("refs.html", "refs_q.html")
 VENV_SITE = {
     "music": os.path.join(ROOT, "runtime", "venvs", "music", "Lib", "site-packages"),
     "audio": os.path.join(ROOT, "runtime", "venvs", "audio", "Lib", "site-packages"),
+    # 面板内终端（ConPTY / pywinpty）与原生窗口（WebView2 / pywebview+pythonnet）
+    "terminal": os.path.join(ROOT, "runtime", "venvs", "terminal", "Lib", "site-packages"),
+    "panel": os.path.join(ROOT, "runtime", "venvs", "panel", "Lib", "site-packages"),
 }
 # 打包时要踢掉的东西：pip/wheel/缓存/元数据（运行时不看）。
 # ⚠ **每个组件不一样**：`NeteaseCloudMusic` 运行时要 `pkg_resources`（来自 setuptools）——
@@ -62,6 +65,8 @@ SITE_SKIP_COMMON = ("pip", "pip-*", "wheel", "wheel-*", "__pycache__", "*.dist-i
 SITE_SKIP = {
     "music": SITE_SKIP_COMMON,
     "audio": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
+    "terminal": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
+    "panel": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
 }
 
 # 随包 agent（codex 完整路线）
@@ -282,7 +287,7 @@ def _stage_codex() -> None:
     os.makedirs(home, exist_ok=True)
     with open(os.path.join(home, "config.toml"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(
-            '# opencode-ui 随包 Codex 配置（干净模板，不含任何密钥）\n'
+            '# cocraft 随包 Codex 配置（干净模板，不含任何密钥）\n'
             '# API Key 由「首次设置」向导写入 runtime/state/_acp_agents.json 的 baseline.env，\n'
             '# 或你自己设成系统环境变量 DEEPSEEK_API_KEY。\n'
             '# 想换成别的 provider：改 base_url / env_key / model 三项即可。\n'
@@ -419,16 +424,24 @@ def clean_payload() -> None:
                 drop_tree(os.path.join(root, d), tries=1)
 
 
+def _v4(ver: str) -> str:
+    """把 SemVer（可能带 -rc1）折成 Inno 要求的 **4 段数字**文件版本：`0.1.0` → `0.1.0.0`。"""
+    base = str(ver or "").split("-")[0].split("+")[0]
+    nums = re.findall(r"\d+", base) or ["0"]
+    nums = (nums + ["0", "0", "0"])[:4]
+    return ".".join(str(min(int(n), 65535)) for n in nums)
+
+
 def run_iscc(ver: str) -> str:
     iscc = next((p for p in ISCC_CANDIDATES if os.path.isfile(p)), "")
     if not iscc:
         log("[!] 找不到 ISCC.exe（Inno Setup）。装一下：winget install JRSoftware.InnoSetup")
         return ""
     log("[5/6] 编译安装包（Inno Setup）...")
-    iss = os.path.join(HERE, "opencode-ui.iss")
-    out = os.path.join(DIST, "opencode-ui-setup-%s.exe" % ver)
-    cmd = [iscc, "/Qp", "/DAppVersion=%s" % ver, "/DPayloadDir=%s" % PAYLOAD,
-           "/DOutputDir=%s" % DIST, iss]
+    iss = os.path.join(HERE, "cocraft.iss")
+    out = os.path.join(DIST, "cocraft-setup-%s.exe" % ver)
+    cmd = [iscc, "/Qp", "/DAppVersion=%s" % ver, "/DVersionInfoVersion=%s" % _v4(ver),
+           "/DPayloadDir=%s" % PAYLOAD, "/DOutputDir=%s" % DIST, iss]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if not os.path.isfile(out):
         log("[BAD] 编译失败 rc=%s" % r.returncode)
@@ -443,7 +456,7 @@ COMPONENTS_GLOBAL: list = []
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="打包 opencode-ui 安装包")
+    ap = argparse.ArgumentParser(description="打包 cocraft 安装包")
     ap.add_argument("--agents", default="codex",
                     help="随包 agent：codex / claude / both（逗号分隔也行）/ none")
     ap.add_argument("--components", default="", help="顺带准备哪些可选组件：music,audio")

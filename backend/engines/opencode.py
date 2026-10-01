@@ -16,10 +16,13 @@ import base64
 import json
 import os
 import shutil
+import subprocess
 import urllib.error
 import urllib.request
 
 from .base import Engine, HOP_BY_HOP
+
+_NO_WINDOW = 0x08000000
 
 SERVICE_REL = os.path.join(".local", "state", "opencode", "service.json")
 
@@ -97,6 +100,42 @@ def cli_path() -> str:
             return os.path.realpath(p)
     w = shutil.which("opencode-cli") or shutil.which("opencode")
     return os.path.realpath(w) if w else ""
+
+
+def desktop_exe() -> str:
+    """OpenCode **桌面端**（OpenCode.exe）的路径；找不到回 ""。"""
+    for p in (os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                           "@opencodedesktop", "OpenCode.exe"),
+              r"C:\Program Files\@opencodedesktop\OpenCode.exe"):
+        if p and os.path.isfile(p):
+            return os.path.realpath(p)
+    return ""
+
+
+def desktop_running() -> bool:
+    """OpenCode 桌面端在不在跑（纯 ctypes 名字枚举，不起子进程）。"""
+    try:
+        import procutils
+        return procutils.is_running("OpenCode.exe")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def launch_desktop() -> bool:
+    """把 OpenCode 桌面端拉起来（引擎 = opencode 但没在跑时用）。已在跑就不重复。
+
+    ⚠ 为什么需要：以前**只有桌面启动器** `launch_opencode.py` 会在"启动那一刻引擎=opencode"
+      时启动它；**运行中把引擎切到 opencode**、或**启动时引擎还是 acp**，就没人拉起 →
+      面板代理不到上游，界面报 `502 无法连接 OpenCode 服务`（用户实测）。
+    """
+    try:
+        exe = desktop_exe()
+        if not exe or desktop_running():
+            return False
+        subprocess.Popen([exe], cwd=os.path.dirname(exe), creationflags=_NO_WINDOW)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def read_service(path: str = None):
