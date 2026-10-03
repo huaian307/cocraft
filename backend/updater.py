@@ -31,6 +31,15 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
+# 证书兜底：安装版嵌入式 Python 缺 CA 根证书（见 netsafe）。
+# server.py 启动时已把 backend 放到 sys.path 最前，这里直接 import（拿不到就跳过，
+# server.py 也会自己装一次，不影响）。
+try:
+    import netsafe
+    netsafe.install()
+except Exception:  # noqa: BLE001
+    netsafe = None
+
 REPO = "huaian307/cocraft"
 API_URL = (os.environ.get("COCRAFT_UPDATE_API")
            or os.environ.get("OPENCODE_UI_UPDATE_API")

@@ -805,6 +805,27 @@ html[data-theme="hiru"].has-live #live-bg .lb-wash { display: none; }
   background: var(--paper-2);
 }
 .composer-wrap { flex: 1; min-width: 0; }
+.composer-foot { display: flex; gap: 8px; margin: 6px 0 0 2px; }
+.perm-btn {
+  font: inherit; font-size: 11px; line-height: 1; padding: 5px 9px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 6px; background: transparent;
+  color: var(--ink-dim);
+}
+.perm-btn:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.perm-btn[data-level="edit"],
+.perm-btn[data-level="exec"] { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 35%, var(--line)); }
+.perm-btn[data-level="all"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.perm-menu {
+  position: fixed; z-index: 24; display: flex; flex-direction: column; gap: 4px;
+  padding: 8px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--paper); box-shadow: 0 10px 30px rgba(0,0,0,.28);
+}
+.perm-menu button {
+  font: inherit; font-size: 12px; text-align: left; padding: 7px 10px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--ink-dim);
+}
+.perm-menu button:hover { color: var(--hi); background: color-mix(in srgb, var(--hi) 8%, transparent); }
+.perm-menu button.on { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
 .composer-label {
   font-family: var(--serif); font-size: 11px; color: var(--ink-faint);
   letter-spacing: .12em; margin: 0 0 6px 2px;
@@ -1034,7 +1055,7 @@ body.no-petals #petals { display: none; }
 
 /* 群聊抽屉：**分屏**（把面板内容整体推开），而不是盖在上面。
    抽屉是 fixed 在右边；给 #app 让出同样宽度的 padding，内容就整体缩小而不是被遮住。 */
-html.cc-open #app { padding-right: var(--cc-w, 520px); }
+html.cc-open #app { padding-right: clamp(300px, var(--cc-pad, var(--cc-w, 520px)), 96vw); }
 html.cc-resizing #app { transition: none; }          /* 拖动调宽时别走过渡，跟手 */
 
 html[data-sidebar="closed"] { --col-side: 0px; }
@@ -1787,6 +1808,7 @@ html[data-sidebar="closed"] .lyric-ball { display: flex; }
   box-shadow: -14px 0 34px rgba(0, 0, 0, .24);
   transform: translateX(102%); visibility: hidden;
   transition: transform .22s ease, visibility .22s ease;
+  contain: layout paint;                       /* 抽屉内容的重排/重绘限制在抽屉内 */
 }
 .cocraft.open { transform: translateX(0); visibility: visible; }
 .cocraft.resizing { transition: none; }        /* 拖动中别走过渡，跟手 */
@@ -1813,6 +1835,14 @@ html[data-sidebar="closed"] .lyric-ball { display: flex; }
 .cc-head .cc-who {
   font-size: 11px; color: var(--ink-faint); max-width: 130px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cc-head .cc-myid {
+  font-size: 10.5px; font-family: var(--mono); color: var(--ink-faint);
+  border: 1px dashed var(--line); border-radius: 4px; padding: 1px 6px;
+  cursor: pointer; white-space: nowrap;
+}
+.cc-head .cc-myid:hover {
+  color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent);
 }
 .cc-head button {
   width: 26px; height: 26px; min-width: 26px; padding: 0;
@@ -1904,7 +1934,8 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
 }
 .cc-menu-row > span { display: block; font-size: 11px; color: var(--ink-faint); margin-bottom: 5px; }
 .cc-menu-row > span i { font-style: normal; opacity: .8; }
-.cc-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.cc-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; contain: layout paint; }
+.cc-msgs .cc-m { content-visibility: auto; contain-intrinsic-size: auto 44px; }   /* 屏外消息跳过布局 → 拖动变宽不再重排整列 */
 .cc-msgs .cc-empty { color: var(--ink-faint); font-size: 12px; text-align: center; margin: auto; }
 .cc-m { max-width: 82%; display: flex; flex-direction: column; gap: 3px; }
 .cc-m .cc-mt { font-size: 10.5px; color: var(--ink-faint); }

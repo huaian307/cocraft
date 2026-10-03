@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft · 絵梨衣</title>
 <link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style.css?v=0.1.8">
+<link rel="stylesheet" href="/style.css?v=0.1.14">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -181,6 +181,9 @@
         <div class="composer-label">絵梨衣の小本子</div>
         <div id="attach-row" class="attach-row" hidden></div>
         <textarea id="input" rows="1" placeholder="写在这里……  Enter 送出，Shift+Enter 换行（可粘贴/拖入图片）" disabled></textarea>
+        <div class="composer-foot">
+          <button type="button" id="btn-perm" class="perm-btn" title="权限授予等级（点开选择）" data-level="ask">权限：全部询问 ▾</button>
+        </div>
       </div>
       <input type="file" id="file-input" multiple hidden>
       <button type="button" id="btn-attach" title="添加附件（也可直接粘贴或拖入窗口）">＋</button>
@@ -241,6 +244,7 @@
     <i class="cc-cap">cocraft</i>
     <span class="cc-spacer"></span>
     <span id="cc-who" class="cc-who"></span>
+    <span id="cc-myid" class="cc-myid" hidden title="点击复制我的 ID"></span>
     <button id="cc-refresh" type="button" title="刷新">↻</button>
     <button id="cc-logout" type="button" title="退出登录" hidden>退出</button>
     <button id="cc-close" type="button" class="cc-x" title="收起">×</button>
@@ -755,7 +759,7 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/app.js?v=0.1.8"></script>
+<script src="/app.js?v=0.1.14"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

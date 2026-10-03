@@ -378,6 +378,15 @@ CHECKS = [
     ("更新", "★应用内刷新（原生窗口快捷键不一定管用）", r"function safeReload"),
     ("更新", "★点横幅即可刷新", r'bnEl\.addEventListener\("click"'),
     ("更新", "★刷新期间跳过 /bye", r"reloading = true"),
+    # ---- 群聊（cocraft）----
+    ("群聊", "★抽屉顶部显示「我的 ID」（本机、仅自己可见）", r"ccUpdateMyId"),
+    ("群聊", "★点击可复制我的 ID", r"ccCopyMyId"),
+    ("群聊", "★抽屉拖宽用 rAF 节流（不卡）", r"rafId = requestAnimationFrame"),
+    # ---- 权限授予等级 ----
+    ("权限", "★输入框左下角「权限等级」按钮", r"btn-perm"),
+    ("权限", "★按等级自动放行（不弹窗、不需要理由）", r"permAllowedByLevel"),
+    ("权限", "★等级接口 /api/permission/level", r"/api/permission/level"),
+    ("权限", "★工作区内判定（越界仍询问）", r"function inWorkspace"),
 ]
 
 # index.html 也要有：龙族标记 / 弹窗 / 控件（这些不是 app.js 里的东西）
@@ -472,6 +481,8 @@ HTML_CHECKS = [
     # ---- 软件更新 ----
     ("更新", "★设置里「软件更新」行", r'id="upd-check"'),
     ("更新", "★立即更新按钮", r'id="upd-apply"'),
+    ("群聊", "★「我的 ID」元素", r'id="cc-myid"'),
+    ("权限", "★权限等级按钮元素", r'id="btn-perm"'),
 ]
 
 # style.css 里的背景层（纯 CSS 的改动 app.js/index.html 都断言不了，这里补上）
@@ -509,7 +520,7 @@ CSS_CHECKS = [
     ("设置", "★群聊图片放大光标", r"cursor: zoom-in"),
     ("设置", "★群聊会话菜单样式", r"\.cc-menu-pop"),
     ("设置", "★刷新中图标转动样式", r"button\.busy"),
-    ("设置", "★群聊分屏：抽屉打开时面板让位", r"html\.cc-open #app \{ padding-right: var\(--cc-w"),
+    ("设置", "★群聊分屏：抽屉打开时面板让位（松手才提交，拖动不重排主面板）", r"html\.cc-open #app \{ padding-right: clamp\(300px, var\(--cc-pad"),
     ("设置", "分屏拖动宽度时不走过渡", r"html\.cc-resizing #app"),
     # ---- 外部打开 / 面板内终端 ----
     ("打开", "★打开菜单样式", r"\.open-menu \{"),
@@ -551,6 +562,7 @@ ISS_CHECKS = [
     ("安装包", "卸载清 codex-home（运行时 state）", r'"\{app\}\\agents\\codex\\codex-home"'),
     ("安装包", "卸载先按端口停进程（含安装版端口）", r"17888,17887,17990"),
     ("安装包", "装完跑 init_state", r'init_state\.py"" --app-dir'),
+    ("安装包", "★档1：init_state 的 .pyc 也随包（否则注册不了随包 agent）", r"init_state\.\*"),
 ]
 
 PY_CHECKS = [
@@ -762,6 +774,13 @@ PY_CHECKS = [
     ("更新", "★路由 /update/apply", r'"/update/apply"'),
     ("更新", "★仓库已改名 cocraft", r"huaian307/cocraft"),
     ("更新", "★安装包名前缀 cocraft-setup-（兼容旧前缀）", r'ASSET_PREFIXES = \("cocraft-setup-"'),
+    # ---- HTTPS 证书兜底（安装版嵌入式 Python 没有 CA 根证书 → 群聊/更新全挂） ----
+    ("证书", "★证书兜底模块：系统 + 随包 CA 合并", r"def ssl_context"),
+    ("证书", "★全局替换默认 HTTPS context（urlopen 自动生效）", r"_create_default_https_context = ssl_context"),
+    ("证书", "★随包 CA 文件名 cacert.pem", r"cacert\.pem"),
+    ("证书", "★设环境变量照顾第三方库（requests/curl）", r"REQUESTS_CA_BUNDLE"),
+    ("证书", "★server 启动时调用 install()", r"netsafe\.install\(\)"),
+    ("证书", "★selftest 实探 DeepSeek Key 走证书兜底", r"netsafe\.urlopen"),
     # ---- 安装版启动（嵌入式 Python ._pth 隔离） ----
     ("安装包", "★本地模块前置 sys.path（否则 import pty 会命中标准库 Unix pty）", r"sys\.path\.remove\(HERE\)"),
     ("安装包", "NOT:不再用「不在才插入」的 sys.path 写法", r"NOT:not in sys\.path"),
@@ -790,6 +809,21 @@ PY_CHECKS = [
     ("编码", "★路由 /fs/list", r'"/fs/list"'),
     ("编码", "★路由 /fs/read", r'"/fs/read"'),
     ("编码", "★路由 /fs/write", r'"/fs/write"'),
+    # ---- 面板窗口（pywebview / WebView2 + 独立托盘进程） ----
+    ("窗口", "★窗口用 pywebview（WebView2，不闪）", r"import webview"),
+    ("窗口", "★持久 profile（否则 localStorage 不持久）", r"private_mode=False"),
+    ("窗口", "★关窗收托盘（closing 拦截）", r"events\.closing"),
+    ("窗口", "★独立托盘进程（与窗口渲染无关）", r"tray_host\.py"),
+    ("窗口", "★托盘用 pystray（轻量，无 Qt）", r"import pystray"),
+    ("窗口", "★托盘命令文件", r"_panel_cmd\.json"),
+    ("窗口", "★watch.py 认 panel_window.py", r"panel_window\.py"),
+    # ---- 权限授予等级（server 本地，引擎无关） ----
+    ("权限", "★权限等级分级表", r"PERM_LEVELS"),
+    ("权限", "★权限等级读写", r"def write_perm_level"),
+    # ---- 档1：去源码（打包时） ----
+    ("安装包", "★档1：Python 去源码（.pyc + 启动壳）", r"def _tier1_protect"),
+    ("安装包", "★档1：JS 压缩（rjsmin，项目内 vendor）", r"def _minify_frontend"),
+    ("安装包", "★档1：可关（--no-protect）", r"--no-protect"),
 ]
 
 
@@ -823,10 +857,13 @@ def main() -> int:
                  os.path.join("backend", "cleanup.py"),
                  os.path.join("backend", "external.py"),
                  os.path.join("backend", "fsview.py"),
+                 os.path.join("backend", "netsafe.py"),
                  os.path.join("backend", "updater.py"),
                  os.path.join("backend", "procutils.py"),
                  os.path.join("backend", "pty.py"),
                  os.path.join("backend", "pty_host.py"),
+                 os.path.join("backend", "panel_window.py"),
+                 os.path.join("backend", "tray_host.py"),
                  os.path.join("launchers", "launch_opencode.py"),
                  os.path.join("scripts", "heal_opencode_link.py"),
                  os.path.join("packaging", "build.py"),
@@ -860,6 +897,19 @@ def main() -> int:
             print(f"  {'OK  ' if ok else 'MISS'} {name}")
             if not ok:
                 fails.append(f"{g}/{name}")
+
+    # 随包 CA 文件（不在 .py 里，单独校验：存在且是真 PEM）
+    _ca = os.path.join(HERE, "backend", "cacert.pem")
+    try:
+        _ca_ok = (os.path.isfile(_ca)
+                  and "BEGIN CERTIFICATE" in io.open(_ca, encoding="utf-8", errors="ignore").read())
+    except OSError:
+        _ca_ok = False
+    total += 1
+    print("\n[证书 · 文件]")
+    print("  %s ★随包 CA 文件 backend/cacert.pem" % ("OK  " if _ca_ok else "MISS"))
+    if not _ca_ok:
+        fails.append("证书/随包 CA 文件")
 
     print(f"\n共 {total} 项，缺失 {len(fails)} 项")
     if fails:

@@ -121,7 +121,7 @@ BROWSERS = [
 DETACHED = 0x00000008 | 0x08000000          # DETACHED_PROCESS | CREATE_NO_WINDOW
 NO_WINDOW = 0x08000000
 
-# ---- 原生窗口（WebView2 / pywebview，可选组件）----
+# ---- 原生窗口（pywebview / WebView2，可选组件）----
 STATE_DIR = os.path.join(RUNTIME_DIR, "state")
 PANEL_WINDOW_PY = os.path.join(HERE, "panel_window.py")
 PANEL_TITLE = "cocraft · 絵梨衣"
@@ -194,7 +194,7 @@ def want_native() -> bool:
 def _panel_proc_filter() -> str:
     """PowerShell 条件：是不是「我们的面板进程」。
 
-    两种形态都算：① Edge/Chrome 的专属 profile 窗口；② 原生窗口（`panel_window.py`）。
+    两种形态都算：① Edge/Chrome 的专属 profile 窗口；② 原生窗口（`panel_window6.py`）。
     ⚠ 必须限定进程名，否则执行这段 PowerShell 的自己会因命令行含该路径而被误数。
     """
     return ("(($_.Name -match 'msedge|chrome' -and $_.CommandLine -like '*" + PROFILE_DIR + "*') "

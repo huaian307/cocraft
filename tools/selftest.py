@@ -24,6 +24,16 @@ import socket
 import subprocess
 import sys
 
+# 证书兜底：安装版的嵌入式 Python 缺 CA 根证书，否则下面实探 api.deepseek.com 会
+# CERTIFICATE_VERIFY_FAILED（看起来像"网络不通"，其实是证书问题）。
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(_SELF_DIR), "backend"))
+try:
+    import netsafe
+    netsafe.install()
+except Exception:  # noqa: BLE001
+    netsafe = None
+
 FAILS: list = []
 WARNS: list = []
 PASSES = 0
@@ -64,8 +74,9 @@ def _check_model_key(app: str, base_env: dict) -> None:
         return
     req = urllib.request.Request("https://api.deepseek.com/v1/models",
                                  headers={"Authorization": "Bearer " + key})
+    _open = netsafe.urlopen if netsafe else urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with _open(req, timeout=15) as r:
             body = r.read(8000).decode("utf-8", "replace")
         has_flash = "deepseek-flash" in body
         check("DeepSeek Key 有效 + 网络可达", True,

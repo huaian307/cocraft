@@ -53,7 +53,7 @@ CORE_SKIP_FILES = ("refs.html", "refs_q.html")
 VENV_SITE = {
     "music": os.path.join(ROOT, "runtime", "venvs", "music", "Lib", "site-packages"),
     "audio": os.path.join(ROOT, "runtime", "venvs", "audio", "Lib", "site-packages"),
-    # 面板内终端（ConPTY / pywinpty）与原生窗口（WebView2 / pywebview+pythonnet）
+    # 面板内终端（ConPTY / pywinpty）与原生窗口（pywebview / WebView2 + pystray 托盘）
     "terminal": os.path.join(ROOT, "runtime", "venvs", "terminal", "Lib", "site-packages"),
     "panel": os.path.join(ROOT, "runtime", "venvs", "panel", "Lib", "site-packages"),
 }
@@ -180,6 +180,9 @@ def stage_core() -> None:
     shutil.copy2(os.path.join(ROOT, "tools", "selftest.py"),
                  os.path.join(app, "tools", "selftest.py"))
     shutil.copy2(os.path.join(HERE, "init_state.py"), os.path.join(PAYLOAD, "init_state.py"))
+    if _PROTECT:
+        _minify_frontend(app)
+        _tier1_protect(app, os.path.join(PAYLOAD, "init_state.py"))
     for root, _d, files in os.walk(app):
         for f in files:
             try:
@@ -187,6 +190,167 @@ def stage_core() -> None:
             except OSError:
                 pass
     log("      核心 %.1f MB" % (total / 1048576))
+
+
+# ---- PySide6（panel6 组件）裁剪 ----
+# 清单来自**运行时实际加载的模块**（抓进程 Modules，不是猜）：窗口 + QtWebEngine 只用
+# QtCore/Gui/Widgets/Network/PrintSupport/OpenGL/Positioning/Qml/Quick/QuickWidgets/
+# WebChannel/WebEngine(Core+Widgets) + platforms/imageformats/styles/tls 等插件 + resources。
+# 其余（3D/Charts/Designer/Pdf/Multimedia/qml/翻译/工具 exe…）全部踢掉。实测 632 → ~421 MB。
+_PANEL6_DEL_NAMES = (
+    # DLL
+    "Qt6Designer*", "Qt6Pdf*", "Qt6Quick3D*", "Qt63D*", "Qt6Charts*", "Qt6Graphs*",
+    "Qt6DataVisualization*", "Qt6Multimedia*", "Qt6Bluetooth*", "Qt6Nfc*", "Qt6Sensors*",
+    "Qt6SerialBus*", "Qt6SerialPort*", "Qt6TextToSpeech*", "Qt6SpatialAudio*", "Qt6Scxml*",
+    "Qt6StateMachine*", "Qt6RemoteObjects*", "Qt6Location*", "Qt6Help*", "Qt6UiTools*",
+    "Qt6Test*", "Qt6NetworkAuth*", "Qt6HttpServer*", "Qt6WebView*", "Qt6WebSockets*",
+    "Qt6DBus*", "Qt6Sql*", "Qt6CanvasPainter*", "Qt6Lottie*", "Qt6VirtualKeyboard*",
+    "Qt6Labs*", "Qt6QuickTest*", "Qt6QuickDialogs2*", "Qt6QuickParticles*", "Qt6QuickTimeline*",
+    "Qt6QuickEffects*", "Qt6QuickVectorImage*", "Qt6QuickShapes*", "Qt6QuickLayouts*",
+    "Qt6ShaderTools*", "Qt6QuickControls2*",
+    # .pyd（Python 绑定；运行时只需下面白名单那些）
+    "Qt3D*.pyd", "QtBluetooth*.pyd", "QtCharts*.pyd", "QtDataVisualization*.pyd",
+    "QtDesigner*.pyd", "QtGraphs*.pyd", "QtHelp*.pyd", "QtHttpServer*.pyd", "QtLocation*.pyd",
+    "QtMultimedia*.pyd", "QtNfc*.pyd", "QtNetworkAuth*.pyd", "QtPdf*.pyd",
+    "QtRemoteObjects*.pyd", "QtScxml*.pyd", "QtSensors*.pyd", "QtSerialBus*.pyd",
+    "QtSerialPort*.pyd", "QtSpatialAudio*.pyd", "QtSql*.pyd", "QtStateMachine*.pyd",
+    "QtTest*.pyd", "QtTextToSpeech*.pyd", "QtUiTools*.pyd", "QtWebEngineQuick*.pyd",
+    "QtWebSockets*.pyd", "QtWebView*.pyd", "QtCanvasPainter*.pyd", "QtDBus*.pyd",
+    "QtQuick*.pyd", "QtQml*.pyd", "QtConcurrent*.pyd", "QtXml*.pyd", "QtSvgWidgets*.pyd",
+)
+_PANEL6_KEEP_PLUGINS = {"platforms", "imageformats", "iconengines", "styles", "tls",
+                        "networkinformation", "generic", "platforminputcontexts"}
+_PANEL6_KEEP_QM = {"qt_zh_CN.qm", "qt_en.qm"}
+_PANEL6_KEEP_LOCALES = {"en-US.pak", "zh-CN.pak"}
+
+
+def _rm(path: str) -> None:
+    """删文件/目录，失败不抛（被占用就跳过）。"""
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _trim_panel6(dst: str) -> None:
+    """裁掉 PySide6 里用不到的部分（见上方清单）。"""
+    import fnmatch
+    p = os.path.join(dst, "PySide6")
+    if not os.path.isdir(p):
+        return
+    for name in os.listdir(p):                                  # 顶层 DLL / pyd
+        fp = os.path.join(p, name)
+        if os.path.isfile(fp) and any(fnmatch.fnmatch(name, pat) for pat in _PANEL6_DEL_NAMES):
+            _rm(fp)
+    for name in os.listdir(p):                                  # 工具 exe（留 WebEngineProcess）
+        if name.lower().endswith(".exe") and name != "QtWebEngineProcess.exe":
+            _rm(os.path.join(p, name))
+    _rm(os.path.join(p, "qml"))                                 # QML 模块（Widgets 不用）
+    tr = os.path.join(p, "translations")                        # 翻译：只留中/英 + WebEngine 两语
+    if os.path.isdir(tr):
+        for name in os.listdir(tr):
+            fp = os.path.join(tr, name)
+            if os.path.isdir(fp):
+                if name != "qtwebengine_locales":
+                    _rm(fp)
+            elif name not in _PANEL6_KEEP_QM:
+                _rm(fp)
+        loc = os.path.join(tr, "qtwebengine_locales")
+        if os.path.isdir(loc):
+            for name in os.listdir(loc):
+                if name not in _PANEL6_KEEP_LOCALES:
+                    _rm(os.path.join(loc, name))
+    pl = os.path.join(p, "plugins")                             # 插件：只留白名单目录
+    if os.path.isdir(pl):
+        for name in os.listdir(pl):
+            if os.path.isdir(os.path.join(pl, name)) and name not in _PANEL6_KEEP_PLUGINS:
+                _rm(os.path.join(pl, name))
+    for name in ("doc", "include", "typesystems", "support", "scripts", "metatypes", "glue"):
+        _rm(os.path.join(p, name))
+    for root, dirs, _files in os.walk(dst):                     # __pycache__
+        for dname in list(dirs):
+            if dname == "__pycache__":
+                _rm(os.path.join(root, dname))
+
+
+# ---- 档 1：去源码（Python → .pyc；JS → 压缩）----
+# ⚠ 这不是"加密"：.pyc 仍可被反编译。它只挡住"打开安装目录直接看源码"。
+_VENDOR = os.path.join(HERE, "_vendor")          # 项目内 vendor（rjsmin）
+_PROTECT = True                                   # --no-protect 可关
+PYC_ENTRIES = {                                   # 会被 `python <file>` 启动 → 留一个极小 .py 壳
+    "backend/server.py", "backend/watch.py", "backend/panel_window.py",
+    "backend/tray_host.py", "backend/pty_host.py",
+    "launchers/launch_opencode.py", "scripts/heal_opencode_link.py",
+    "tools/spectrum.py", "tools/music_service.py", "tools/selftest.py",
+}
+PYC_LEAVE = {                                     # 既被 import 又被当脚本跑 → 保留源码（很小、不敏感）
+    "backend/cleanup.py", "backend/taskbar.py", "backend/acp_mock_agent.py",
+}
+_PYC_SHIM = (
+    "# -*- coding: utf-8 -*-\n"
+    "# 自动生成的启动壳：真正的代码 = 同目录下的同名 .pyc\n"
+    "import os, runpy, sys\n"
+    "_d = os.path.dirname(os.path.abspath(__file__))\n"
+    "sys.path.insert(0, _d)\n"
+    "runpy.run_path(os.path.join(_d, os.path.basename(__file__) + 'c'), run_name='__main__')\n"
+)
+
+
+def _minify_frontend(app: str) -> None:
+    """JS 压缩（rjsmin，纯 Python，安全）。"""
+    try:
+        if _VENDOR in sys.path:
+            sys.path.remove(_VENDOR)
+        sys.path.insert(0, _VENDOR)
+        import rjsmin  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        log("      [!] rjsmin 不可用，跳过 JS 压缩：%s" % exc)
+        return
+    js = os.path.join(app, "frontend", "app.js")
+    try:
+        with open(js, encoding="utf-8") as fh:
+            src = fh.read()
+        out = rjsmin.jsmin(src)
+        with open(js, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(out)
+        log("      JS 压缩：app.js %.0fKB -> %.0fKB" % (len(src) / 1024, len(out) / 1024))
+    except Exception as exc:  # noqa: BLE001
+        log("      [!] JS 压缩失败：%s" % exc)
+
+
+def _tier1_protect(app: str, init_state_path: str) -> None:
+    """Python 去源码：编成 .pyc；入口脚本留极小 .py 壳（启动路径/快捷方式/iss 都不用改）。"""
+    import compileall  # noqa: PLC0415
+    compileall.compile_dir(app, legacy=True, quiet=1, force=True)
+    n_pyc = n_shim = n_keep = 0
+    for root, _d, files in os.walk(app):
+        for f in files:
+            if not f.endswith(".py"):
+                continue
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, app).replace("\\", "/")
+            pyc = full + "c"
+            if rel in PYC_LEAVE:
+                _rm(pyc)                       # 保留源码 → 删掉 .pyc（免得优先用旧的 .pyc）
+                n_keep += 1
+            elif rel in PYC_ENTRIES:
+                with open(full, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(_PYC_SHIM)
+                n_shim += 1
+            else:
+                _rm(full)                      # 只留 .pyc
+                n_pyc += 1
+    # init_state.py 在 payload 根（不在 app 下），单独处理：编译 + 换成壳
+    try:
+        compileall.compile_file(init_state_path, legacy=True, quiet=1, force=True)
+        with open(init_state_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_PYC_SHIM)
+    except Exception as exc:  # noqa: BLE001
+        log("      [!] init_state 编译失败：%s" % exc)
+    log("      档1 去源码：.pyc %d / 启动壳 %d / 保留源码 %d" % (n_pyc, n_shim, n_keep))
 
 
 def stage_components(which) -> None:
@@ -461,10 +625,15 @@ def main() -> int:
                     help="随包 agent：codex / claude / both（逗号分隔也行）/ none")
     ap.add_argument("--components", default="", help="顺带准备哪些可选组件：music,audio")
     ap.add_argument("--no-iss", action="store_true", help="只准备 payload，不编译安装包")
+    ap.add_argument("--no-protect", action="store_true",
+                    help="不做「档1 去源码」（调试用，保留 .py 源码）")
     args = ap.parse_args()
 
-    global COMPONENTS_GLOBAL
+    global COMPONENTS_GLOBAL, _PROTECT
+    _PROTECT = not args.no_protect
     COMPONENTS_GLOBAL = [c.strip() for c in args.components.split(",") if c.strip()]
+    # 兼容旧名：panel6（已弃用的 PySide6 尝试）统一回 panel（pywebview）
+    COMPONENTS_GLOBAL = ["panel" if c == "panel6" else c for c in COMPONENTS_GLOBAL]
 
     os.makedirs(PAYLOAD, exist_ok=True)
     kill_stale_build_helpers()                 # 清掉会占住 payload 的残留（ISCC / 辅助进程）

@@ -51,6 +51,7 @@ import cleanup
 import engines
 import external
 import fsview
+import netsafe
 import procutils
 import pty as pty_term
 import updater
@@ -61,6 +62,14 @@ from engines.acp import agents as acp_agents
 # （音乐/频谱/QQ SMTC/外部打开/更新器/pick 对话框…… 都会继承）。
 try:
     procutils.set_error_mode()
+except Exception:  # noqa: BLE001
+    pass
+
+# 安装版的嵌入式 Python **没有 CA 根证书** → 所有 HTTPS 请求报 CERTIFICATE_VERIFY_FAILED
+# （群聊 `/cocraft/*` 代理、软件更新都中招；开发机的系统 Python 读 Windows 证书存储，所以一直没暴露）。
+# 这里把随包 CA（backend/cacert.pem）+ 系统证书装成默认 HTTPS context，urlopen 全局生效。
+try:
+    netsafe.install()
 except Exception:  # noqa: BLE001
     pass
 
@@ -80,6 +89,42 @@ EXTRA_ROOTS = {
 
 for _directory in (RUNTIME_DIR, STATE_DIR, LOGS_DIR, VENVS_DIR):
     os.makedirs(_directory, exist_ok=True)
+
+# ★ 权限授予等级（引擎无关）：全局一个挡位；命中则该类权限**自动放行**（不弹窗、不需要理由）。
+#   前端据此自动应答；ACP 引擎也会读同一个文件（彼此不冲突）。
+PERM_LEVELS = [
+    ("ask",  "全部询问（默认）"),
+    ("read", "只读自动"),
+    ("edit", "读 + 改（限工作区内）"),
+    ("exec", "读 + 改 + 执行（限工作区内）"),
+    ("all",  "全部放行（含工作区外）"),
+]
+PERM_LEVEL_IDS = [k for k, _ in PERM_LEVELS]
+PERM_LEVEL_FILE = os.path.join(STATE_DIR, "_perm_level.json")
+
+
+def read_perm_level() -> str:
+    try:
+        with open(PERM_LEVEL_FILE, "r", encoding="utf-8") as fh:
+            v = str((json.load(fh) or {}).get("level") or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return "ask"
+    return v if v in PERM_LEVEL_IDS else "ask"
+
+
+def write_perm_level(level: str) -> str:
+    v = str(level or "").strip().lower()
+    if v not in PERM_LEVEL_IDS:
+        v = "ask"
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = PERM_LEVEL_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"level": v}, fh, ensure_ascii=False)
+        os.replace(tmp, PERM_LEVEL_FILE)
+    except OSError:
+        pass
+    return v
 
 UPSTREAM = {"url": None, "auth": None, "version": None}
 
@@ -494,7 +539,7 @@ PANEL_WINDOW_FILE = os.path.join(STATE_DIR, "_panel_window.json")
 
 
 def panel_native_available() -> bool:
-    """原生窗口（WebView2）这个可选组件装没装。"""
+    """原生窗口（pywebview / WebView2）这个可选组件装没装。"""
     if not os.path.isfile(os.path.join(HERE, "panel_window.py")):
         return False
     if os.path.isfile(os.path.join(VENVS_DIR, "panel", "Scripts", "pythonw.exe")):
@@ -1345,6 +1390,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"base": _base, "ws": _ws})
             elif path.startswith("/cocraft/"):
                 self._cocraft_proxy(method, path)
+            elif path == "/api/permission/level":
+                self._perm_level_api(method)
             elif path.startswith("/api/"):
                 self._proxy(method)
             else:
@@ -2065,6 +2112,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send_file(target)
 
     # ---------- 反向代理 ----------
+
+    def _perm_level_api(self, method: str):
+        if method == "GET":
+            return self._send_json(200, {"ok": True, "level": read_perm_level(),
+                                         "levels": [{"id": k, "label": lb} for k, lb in PERM_LEVELS]})
+        if method == "POST":
+            body = self._read_json_body() or {}
+            return self._send_json(200, {"ok": True, "level": write_perm_level(body.get("level"))})
+        return self._send_json(405, {"error": "GET/POST only"})
 
     def _proxy(self, method: str):
         """交给「当前引擎」实现；默认引擎（opencode）就是原来的反代行为。"""

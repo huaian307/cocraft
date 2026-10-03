@@ -1766,10 +1766,39 @@ function ccRefreshUserUI() {
   if (!cocraftIsOpen()) return;
   const who = ccEl("cc-who");
   if (who && CC.me) who.textContent = ccUserName(CC.me.id);
+  ccUpdateMyId();
   const box = ccEl("cc-msgs");
   const top = box ? box.scrollTop : 0;
   ccRenderMsgs(false);
   if (box) box.scrollTop = top;
+}
+
+/** 「我的 ID」：本机显示、仅供自己看/复制（不发给别人，聊天里别人看不到）。 */
+function ccUpdateMyId() {
+  const el = ccEl("cc-myid");
+  if (!el) return;
+  if (CC.me && CC.me.id != null) { el.textContent = "ID " + CC.me.id; el.hidden = false; }
+  else { el.textContent = ""; el.hidden = true; }
+}
+
+function ccCopyMyId(el) {
+  if (!CC.me || CC.me.id == null) return;
+  const t = String(CC.me.id);
+  const done = () => {
+    if (!el) return;
+    el.textContent = "已复制 " + t;
+    setTimeout(ccUpdateMyId, 1000);
+  };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(done).catch(() => {});
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = t; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch { /* ignore */ }
+      document.body.removeChild(ta); done();
+    }
+  } catch { /* ignore */ }
 }
 
 function cocraftIsOpen() {
@@ -1788,6 +1817,7 @@ function setCocraft(open) {
   box.classList.toggle("open", !!open);
   box.setAttribute("aria-hidden", open ? "false" : "true");
   document.documentElement.classList.toggle("cc-open", !!open);   // ← 分屏：面板内容让位
+  if (open) ccApplyWidth(parseInt(ccLoad(CC_W_KEY), 10) || CC_W_DEFAULT, true);  // 打开时把让位宽度同步好
   const strip = $("chat-strip");
   if (strip) strip.setAttribute("aria-expanded", open ? "true" : "false");
   try { localStorage.setItem(CC_OPEN_KEY, open ? "1" : "0"); } catch { /* 隐私模式 */ }
@@ -1835,6 +1865,8 @@ function ccShowAuth(msg) {
   ccEl("cc-auth").hidden = false;
   ccEl("cc-main").hidden = true;
   ccEl("cc-who").textContent = "";
+  ccEl("cc-myid").hidden = true;
+  ccEl("cc-myid").textContent = "";
   ccEl("cc-logout").hidden = true;
   ccMenuOpen(false);
   ccAuthMsg(msg || "", !!msg);
@@ -1848,6 +1880,7 @@ function ccShowMain() {
   ccEl("cc-main").hidden = false;
   ccCacheUser(CC.me);
   ccEl("cc-who").textContent = CC.me ? ccUserName(CC.me.id) : "";
+  ccUpdateMyId();
   ccEl("cc-logout").hidden = false;
   ccConnectWS();
   ccLoadChats();
@@ -2183,17 +2216,19 @@ async function ccSendCode(email, username) {
 }
 
 /* ---- 抽屉宽度可拖动 ---- */
-function ccApplyWidth(w) {
+function ccApplyWidth(w, commit) {
   // 分屏：给面板至少留 300px（抽屉最大 = 视口 - 300）
   const max = Math.max(300, window.innerWidth - 300);
   const nw = Math.max(300, Math.min(w, max));
   document.documentElement.style.setProperty("--cc-w", nw + "px");
+  // ★ 只有"提交"时才同步 #app 的 padding —— 拖动过程中不重排整个主面板（否则每帧重排，很卡）
+  if (commit) document.documentElement.style.setProperty("--cc-pad", nw + "px");
 }
 
 function ccInitResize() {
   const box = $("cocraft"), grip = $("cc-resize");
   if (!box || !grip) return;
-  let dragging = false, startX = 0, startW = 0;
+  let dragging = false, startX = 0, startW = 0, rafId = -1, lastW = 0;
   grip.addEventListener("pointerdown", (e) => {
     dragging = true; startX = e.clientX; startW = box.getBoundingClientRect().width;
     box.classList.add("resizing");
@@ -2202,11 +2237,15 @@ function ccInitResize() {
     e.preventDefault();
   });
   grip.addEventListener("pointermove", (e) => {
-    if (dragging) ccApplyWidth(startW + (startX - e.clientX));   // 往左拖 = 变宽
+    if (!dragging) return;
+    lastW = startW + (startX - e.clientX);          // 往左拖 = 变宽
+    if (rafId !== -1) return;                        // ★ rAF 节流：每帧最多改一次 CSS 变量
+    rafId = requestAnimationFrame(() => { rafId = -1; ccApplyWidth(lastW, true); });
   });
   const end = (e) => {
     if (!dragging) return;
     dragging = false; box.classList.remove("resizing");
+    if (rafId !== -1) { cancelAnimationFrame(rafId); rafId = -1; ccApplyWidth(lastW, true); }
     document.documentElement.classList.remove("cc-resizing");
     try { grip.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     ccStore(CC_W_KEY, String(Math.round(box.getBoundingClientRect().width)));
@@ -2219,6 +2258,8 @@ function initCocraft() {
   if (!$("cocraft") || !$("chat-strip")) return;
   $("chat-strip").addEventListener("click", toggleCocraft);
   $("cc-close").addEventListener("click", () => setCocraft(false));
+  const _mid = ccEl("cc-myid");
+  if (_mid) _mid.addEventListener("click", () => ccCopyMyId(_mid));
   $("cc-refresh").addEventListener("click", ccRefreshAll);
   $("cc-logout").addEventListener("click", () => { ccSetToken(""); ccCloseWS(); ccShowAuth("已退出登录"); });
   window.addEventListener("keydown", (e) => {
@@ -2303,7 +2344,10 @@ function initCocraft() {
   });
 
   ccInitResize();
-  ccApplyWidth(parseInt(ccLoad(CC_W_KEY), 10) || CC_W_DEFAULT);
+  ccApplyWidth(parseInt(ccLoad(CC_W_KEY), 10) || CC_W_DEFAULT, true);
+  window.addEventListener("resize", () => {                       // 窗口尺寸变了要重算让位宽度
+    ccApplyWidth(parseInt(ccLoad(CC_W_KEY), 10) || CC_W_DEFAULT, true);
+  });
   ccInit();     // 取 /cocraft/_url + 校验已存 token（不加载任何第三方 iframe）
 }
 
@@ -3235,6 +3279,93 @@ async function ignoreForm() {
   }
 }
 
+/* ---- 权限授予等级（通用分级；命中则自动放行、不弹窗、不需要理由） ---- */
+const PERM = { level: "ask", levels: [
+  { id: "ask",  label: "全部询问" },
+  { id: "read", label: "只读自动" },
+  { id: "edit", label: "读 + 改（限工作区内）" },
+  { id: "exec", label: "读 + 改 + 执行（限工作区内）" },
+  { id: "all",  label: "全部放行（含工作区外）" },
+] };
+
+function permLevelLabel(id) {
+  const it = PERM.levels.find((x) => x.id === id);
+  return it ? it.label : (id || "全部询问");
+}
+function permBtnSync() {
+  const b = $("btn-perm");
+  if (!b) return;
+  b.textContent = "权限：" + permLevelLabel(PERM.level) + " ▾";
+  b.dataset.level = PERM.level;
+}
+async function loadPermLevel() {
+  try {
+    const r = await api("/api/permission/level");
+    if (r && r.level) PERM.level = r.level;
+    if (r && Array.isArray(r.levels) && r.levels.length) PERM.levels = r.levels;
+  } catch { /* ignore */ }
+  permBtnSync();
+}
+async function setPermLevel(lv) {
+  PERM.level = lv;
+  permBtnSync();
+  try { await api("/api/permission/level", { method: "POST", body: { level: lv } }); } catch { /* ignore */ }
+}
+function permMenuToggle() {
+  const old = document.getElementById("perm-menu");
+  if (old) { old.remove(); return; }
+  const b = $("btn-perm");
+  if (!b) return;
+  const m = document.createElement("div");
+  m.id = "perm-menu"; m.className = "perm-menu";
+  m.innerHTML = PERM.levels.map((it) =>
+    `<button type="button" data-lv="${esc(it.id)}" class="${it.id === PERM.level ? "on" : ""}">${esc(it.label)}</button>`
+  ).join("");
+  document.body.appendChild(m);
+  const r = b.getBoundingClientRect();
+  m.style.left = Math.max(8, r.left) + "px";
+  m.style.top = Math.max(8, r.top - m.offsetHeight - 6) + "px";
+  m.addEventListener("click", (e) => {
+    const t = e.target.closest("button[data-lv]");
+    if (!t) return;
+    setPermLevel(t.dataset.lv);
+    m.remove();
+  });
+  setTimeout(() => {
+    const close = (ev) => {
+      if (!m.contains(ev.target) && ev.target !== b) {
+        m.remove(); document.removeEventListener("pointerdown", close, true);
+      }
+    };
+    document.addEventListener("pointerdown", close, true);
+  }, 0);
+}
+function inWorkspace(paths) {
+  const root = (typeof currentDir === "function" ? currentDir() : "") || "";
+  if (!root) return true;
+  const norm = (p) => String(p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const r = norm(root);
+  for (const p of (paths || [])) {
+    const n = norm(p);
+    if (n && !(n === r || n.startsWith(r + "/"))) return false;
+  }
+  return true;
+}
+function permAllowedByLevel(pm) {
+  const lv = PERM.level;
+  if (!lv || lv === "ask") return false;
+  if (lv === "all") return true;
+  const hay = (String(pm.kind || "") + " " + String(pm.action || "") + " " + String(pm.message || "")).toLowerCase();
+  const isRead = /read|search|fetch|think|list|glob|grep|view|cat|ls\b|dir\b/.test(hay);
+  const isWrite = /edit|write|create|delete|move|rename|patch|mkdir|rm\b|touch|save/.test(hay);
+  const isExec = /execute|exec|bash|shell|run\b|command|terminal|powershell|cmd/.test(hay);
+  const ws = inWorkspace(pm.resources);
+  if (lv === "read") return isRead && !isWrite && !isExec;
+  if (lv === "edit") return (isRead || isWrite) && !isExec && ws;
+  if (lv === "exec") return (isRead || isWrite || isExec) && ws;
+  return false;
+}
+
 async function pollAsks() {
   try {
     if (state.current) {
@@ -3243,7 +3374,22 @@ async function pollAsks() {
         api(`/api/session/${sid}/form`).catch(() => null),
         api(`/api/session/${sid}/permission`).catch(() => null),
       ]);
-      renderAsk((f && f.data) || [], (p && p.data) || []);
+      let perms = (p && p.data) || [];
+      // ★ 权限等级：命中就直接自动放行（不弹窗、不需要理由）
+      if (PERM.level && PERM.level !== "ask" && perms.length) {
+        const keep = [];
+        for (const pm of perms) {
+          if (permAllowedByLevel(pm)) {
+            try {
+              await api(`/api/session/${sid}/permission/${encodeURIComponent(pm.id)}/reply`,
+                        { method: "POST", body: { decision: "once" } });
+              setBanner(`已按权限等级「${permLevelLabel(PERM.level)}」自动放行：${pm.action || pm.kind || "权限"}`);
+            } catch { keep.push(pm); }
+          } else { keep.push(pm); }
+        }
+        perms = keep;
+      }
+      renderAsk((f && f.data) || [], perms);
     }
   } catch { /* 轮询失败就下一轮再说 */ }
   setTimeout(pollAsks, 1200);
@@ -3251,6 +3397,9 @@ async function pollAsks() {
 
 function initAsk() {
   window.__askSubmit = submitAsk;                       // 内联 onclick 兜底用
+  const _pb = $("btn-perm");
+  if (_pb) _pb.addEventListener("click", (e) => { e.stopPropagation(); permMenuToggle(); });
+  loadPermLevel();
 
   $("ask-body").addEventListener("click", (e) => {
     const b = e.target.closest(".ask-opt");

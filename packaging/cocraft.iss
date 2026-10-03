@@ -96,14 +96,14 @@ Name: "audio";   Description: "可选：音频频谱（真频谱可视化）"; T
 Name: "terminal"; Description: "可选：面板内终端（ConPTY / pywinpty）"; Types: custom
 #endif
 #if HavePanelDir
-Name: "panel";   Description: "可选：原生软件窗口（WebView2 / pywebview）"; Types: custom
+Name: "panel";   Description: "可选：原生软件窗口（WebView2 / pywebview + 托盘）"; Types: custom
 #endif
 
 [Files]
 ; —— 核心（必装）——
 Source: "{#PayloadDir}\python\*";        DestDir: "{app}\python";   Flags: ignoreversion recursesubdirs createallsubdirs; Components: core
 Source: "{#PayloadDir}\app\*";           DestDir: "{app}";          Flags: ignoreversion recursesubdirs createallsubdirs; Components: core
-Source: "{#PayloadDir}\init_state.py";   DestDir: "{app}";          Flags: ignoreversion; Components: core
+Source: "{#PayloadDir}\init_state.*";   DestDir: "{app}";          Flags: ignoreversion; Components: core
 Source: "{#PayloadDir}\VERSION";         DestDir: "{app}";          Flags: ignoreversion; Components: core
 ; —— 随包 agent ——
 #ifdef HaveAgent
