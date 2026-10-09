@@ -20,6 +20,7 @@ import threading
 from .. import STATE_DIR
 from .client import AcpClient, AcpClosed
 from .map_events import AssistantTurn, content_text, now_ms, pick_option_id, schema_to_fields
+from .skills import injection_text
 
 # 只声明「form 模式的 elicitation」；ACP 规定没声明=不支持，所以 agent 不会乱调别的。
 # fs / terminal 一律不开（安全默认），要开由调用方以后显式传入。
@@ -313,6 +314,42 @@ class BusyError(Exception):
     """同一会话上一轮还在生成。"""
 
 
+# ★ 每个 agent「最近一次成功的模型」：模型不可用时拿它当回退（比瞎猜可靠）。
+#   落盘 `_acp_model_ok.json` = {agent_id: modelID}，重启后还记得。
+_MODEL_OK_NAME = "_acp_model_ok.json"
+
+
+# ★ 「默认/未命名」标题：两条会话标题都还是这些时，不按标题判重（可能都还没起名）
+_DEFAULT_TITLES = {"", "新会话", "(无标题)", "untitled", "new session", "新对话"}
+
+
+def _load_ok_models() -> dict:
+    try:
+        with open(os.path.join(STATE_DIR, _MODEL_OK_NAME), "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_ok_model(agent_id: str, model_id: str) -> None:
+    if not agent_id or not model_id:
+        return
+    try:
+        with _SESSIONS_IO_LOCK:
+            d = _load_ok_models()
+            if d.get(agent_id) == model_id:
+                return
+            d[agent_id] = model_id
+            p = os.path.join(STATE_DIR, _MODEL_OK_NAME)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(d, fh, ensure_ascii=False)
+            os.replace(tmp, p)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class AcpService:
     def __init__(self, command, cwd=None, env=None, log=None, default_model="acp",
                  agent_id="", provider_id="", baseline=None):
@@ -339,7 +376,8 @@ class AcpService:
         self._model = ""
         self._model_from_state = False   # True = 模型清单来自旧式 `models`（切换用 session/set_model）
         self._effort = ""
-        self._commands = []        # available_commands_update（斜杠命令清单，先记着）
+        self._commands = []        # available_commands_update（斜杠命令清单）
+        self._last_ok_model = str(_load_ok_models().get(self.agent_id) or "")   # 最近一次成功的模型（回退用）
         self._bound = set()        # 已与「当前 client」绑定的会话（重启后要 resume 才能续聊）
         # ⚠ agent 侧 sessionId → 本地会话 id 的**别名表**。
         #   本地 id 可能不是 agent id（导入 / resume 失败后 session_new 降级都会这样），
@@ -443,6 +481,7 @@ class AcpService:
             s.setdefault("plan", None)
             s.setdefault("imported", False)
             s.setdefault("messages", [])
+            s.setdefault("pendingSkills", [])
             s.setdefault("agentSessionId", "")
             s["turn"] = None
             s["permissions"] = {}
@@ -466,13 +505,70 @@ class AcpService:
                 self._alias[a] = str(s.get("id"))
         if self._order:
             self._log("[acp] 已载入 %d 个历史会话" % len(self._order))
+        # ★ 合并「同一条对话」的重复本地会话（引擎/agent 切换造成的），顺便把它从盘里清掉
+        if self._dedupe_duplicates():
+            self._save()
+
+    @staticmethod
+    def _first_user_text(s) -> str:
+        for m in (s.get("messages") or []):
+            if m.get("type") == "user" and str(m.get("text") or "").strip():
+                return str(m["text"]).strip()[:120]
+        return ""
+
+    def _dedupe_duplicates(self) -> bool:
+        """把「同一段对话」的重复本地会话合并成一条，返回是否有改动。
+
+        判据（同 agent 内）：① `agentSessionId` 相同；或 ② **标题 + 目录 + 第一句用户消息**都相同
+        （标题是自动命名的，只看标题可能误伤 → 再加"首句也相同"这道闸）。
+        保留**消息最多**的那条，其余丢弃（随后 `_save` 会把它从盘里清掉）。
+        """
+        changed = False
+
+        def merge_group(ids):
+            nonlocal changed
+            if len(ids) < 2:
+                return
+            ids.sort(key=lambda i: len((self._sessions[i].get("messages") or [])), reverse=True)
+            keep = ids[0]
+            for drop in ids[1:]:
+                self._sessions.pop(drop, None)
+                if drop in self._order:
+                    self._order.remove(drop)
+                self._bound.discard(drop)
+                for a, l in list(self._alias.items()):
+                    if l == drop:
+                        self._alias.pop(a, None)
+                self._log("[acp] 合并重复会话：保留 %s，丢弃 %s" % (keep, drop))
+                changed = True
+
+        by_sid = {}                                    # ① 同一 agent 会话
+        for sid in list(self._order):
+            s = self._sessions.get(sid) or {}
+            a = str(s.get("agentSessionId") or "")
+            if a:
+                by_sid.setdefault(a, []).append(sid)
+        for ids in by_sid.values():
+            merge_group(ids)
+
+        by_title = {}                                  # ② 标题 + 目录 + 首句 全同
+        for sid in list(self._order):
+            s = self._sessions.get(sid) or {}
+            title = str(s.get("title") or "").strip()
+            if not title or title in _DEFAULT_TITLES:
+                continue
+            loc = str((s.get("location") or {}).get("directory") or "")
+            by_title.setdefault((title, loc, self._first_user_text(s)), []).append(sid)
+        for ids in by_title.values():
+            merge_group(ids)
+        return changed
 
     def _save(self):
         """只写属于当前 agent 的会话；别人的原样保留（多 agent 保活时互不覆盖）。"""
         try:
             keys = ("id", "agent", "agentSessionId", "title", "location", "model", "time",
                     "tokens", "cost", "outcome", "context", "plan", "imported", "attach",
-                    "messages")
+                    "messages", "pendingSkills")
             with self._lock:
                 mine = [{k: s.get(k) for k in keys}
                         for i in self._order if (s := self._sessions.get(i))]
@@ -651,6 +747,18 @@ class AcpService:
                           % (kind, json.dumps(update, ensure_ascii=False)[:500]))
         except Exception:  # noqa: BLE001
             pass
+        # ★ 斜杠命令（available_commands_update）是 **agent 级**、且常常在 `session/new`
+        #   **还没返回**时就发过来 —— 那时会话还没进 self._sessions → 以前会被下面的
+        #   `s is None: return` 丢掉（实测：opencode-acp 的 init/review、codex 的 plan 全丢）。
+        #   所以必须在会话查找**之前**记下来。
+        if kind == "available_commands_update":
+            cmds = [{"name": c.get("name"), "description": c.get("description") or ""}
+                    for c in (update.get("availableCommands") or [])
+                    if isinstance(c, dict) and c.get("name")]
+            with self._lock:
+                self._commands = cmds
+            self._log("[acp] 斜杠命令(%d)：%s" % (len(cmds), ", ".join(c["name"] for c in cmds)))
+            return
         save = False
         with self._lock:
             s = self._sessions.get(sid)
@@ -705,7 +813,8 @@ class AcpService:
                      "data": {"sessionID": sid, "severity": severity,
                               "title": title, "description": desc}}]
         if kind == "available_commands_update":
-            cmds = [c.get("name") for c in (update.get("availableCommands") or [])
+            cmds = [{"name": c.get("name"), "description": c.get("description") or ""}
+                    for c in (update.get("availableCommands") or [])
                     if isinstance(c, dict) and c.get("name")]
             self._commands = cmds
             return []
@@ -1402,6 +1511,14 @@ class AcpService:
                         "capabilities": {"tools": True}})
         return out
 
+    def commands(self) -> list:
+        """agent 宣告的斜杠命令（`available_commands_update`），形状与 OpenCode 对齐。
+
+        ⚠ 只有跑过一轮（拿到 agent 的通知）之后才有；没跑过就是空表。
+        """
+        with self._lock:
+            return [dict(c) for c in (self._commands or []) if isinstance(c, dict)]
+
     def model_default(self):
         """当前模型。⚠ 不能返回 AcpService 的占位 default_model（"acp"）：
         还没有会话时配置里没有模型，此时应回 None，让前端别把 "acp" 当模型写进新会话。"""
@@ -1561,6 +1678,12 @@ class AcpService:
 
         `cursor` 是上一页返回的**最旧一条消息 id**；传回来就只取比它更旧的消息。
         """
+        # ★ opencode-acp 与 OpenCode 客户端**共用同一个库**：历史直接读库 →
+        #   面板（ACP 侧）与客户端看到的是**同一条记录**（否则两边各存一份、永远对不上）。
+        if self._is_opencode():
+            got = self._opencode_messages(sid, limit, cursor)
+            if got is not None:
+                return got
         with self._lock:
             s = self._sessions.get(sid)
             asc = list(s["messages"]) if (s and self._owns(s)) else []   # 旧 → 新
@@ -1570,6 +1693,23 @@ class AcpService:
                 asc = asc[:idx]
         start = max(0, len(asc) - int(limit)) if limit else 0
         page = asc[start:]
+        next_cursor = page[0].get("id") if (page and start > 0) else None
+        return list(reversed(page)), next_cursor
+
+    def _opencode_messages(self, sid, limit, cursor):
+        """读共享库里的历史（面板形状，新→旧 + cursor）。库不可用/为空 → None（退回本地）。"""
+        try:
+            hist = _opencode_history(self._agent_sid(sid), limit=2000)   # 旧 → 新
+        except Exception:  # noqa: BLE001
+            return None
+        if not hist:
+            return None
+        if cursor:
+            idx = next((i for i, m in enumerate(hist) if str(m.get("id")) == str(cursor)), -1)
+            if idx >= 0:
+                hist = hist[:idx]
+        start = max(0, len(hist) - int(limit)) if limit else 0
+        page = hist[start:]
         next_cursor = page[0].get("id") if (page and start > 0) else None
         return list(reversed(page)), next_cursor
 
@@ -1642,6 +1782,7 @@ class AcpService:
             # ★ agent 侧会话如果是空的（刚重置/接不回）→ 本轮把本地历史补记上
             reseed = bool(s.pop("_needsReseed", False))
             prior = list(s.get("messages") or []) if reseed else []
+            pending = s.pop("pendingSkills", None) or []    # ★ 已装填的技能：随本轮一起发出去
             s["messages"].append(um)
             turn = AssistantTurn(sid, "a_%d" % next(self._id), agent=(self.agent_id or "acp"),
                                  model=(s["model"] or {}).get("id") or self._model or "")
@@ -1652,6 +1793,10 @@ class AcpService:
             "sessionID": sid, "assistantMessageID": turn.id, "agent": turn.agent,
             "model": {"id": turn.model}, "started": turn.started}})
         blocks = self._prompt_blocks(text, files)
+        skill_note = "\n\n".join(str(p.get("text") or "") for p in pending if p.get("text"))
+        if skill_note:
+            blocks = [{"type": "text", "text": skill_note}] + blocks
+            self._log("[acp] 本轮带上了 %d 个已装填的技能" % len(pending))
         if reseed:
             note = _reseed_text(prior)
             if note:
@@ -1659,6 +1804,39 @@ class AcpService:
                 self._log("[acp] agent 侧会话是空的 → 已把最近 %d 条本地历史补记给本轮" % len(prior))
         threading.Thread(target=self._run_turn, args=(sid, turn, blocks), daemon=True).start()
         return {"ok": True}
+
+    def inject_skill(self, sid, skill: dict, resume: bool = False) -> dict:
+        """把技能注入会话。
+
+        - `resume=False`（默认）：**只装填** —— 在本地历史留一条 `skill` 消息（面板显示成
+          「已注入技能 X」），并把正文暂存到 `pendingSkills`；用户**下次发言**时随那条消息
+          一起发给 agent（什么时候跑交给用户）。对应 OpenCode `/skill` 的 `resume:false`。
+        - `resume=True`：立刻把正文作为一条消息发出去、跑一轮。
+
+        ACP 协议没有"往会话上下文里塞东西但不跑"的接口，所以"只装填"只能靠暂存实现。
+        """
+        name = skill.get("name") or skill.get("id") or "技能"
+        text = injection_text(skill)
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is None or not self._owns(s):
+                raise KeyError("会话不存在：%s" % sid)
+            now = now_ms()
+            sm = {"id": "sk_%d" % next(self._id), "type": "skill",
+                  "skill": skill.get("id"), "name": name, "text": text,
+                  "time": {"created": now, "completed": now}}
+            s["messages"].append(sm)
+            s["time"]["updated"] = now_ms()
+            if not resume:
+                pend = s.setdefault("pendingSkills", [])
+                pend.append({"id": skill.get("id"), "name": name, "text": text})
+        self._save()
+        if resume:
+            try:
+                self.prompt(sid, text)
+            except BusyError as exc:
+                raise RuntimeError("上一轮还在生成，稍后再试：%s" % exc)
+        return {"ok": True, "injected": skill.get("id"), "resumed": bool(resume)}
 
     def _record_usage(self, s, usage, stop):
         """把一轮的 token 用量累加到会话上，并把 stopReason 记成「结果」。
@@ -1697,6 +1875,46 @@ class AcpService:
                             "max_turn_requests": "max_turn_requests", "cancelled": "cancelled",
                             "refusal": "refusal"}.get(str(stop), str(stop))
 
+    def _recover_model(self, sid, detail) -> str:
+        """本轮因「模型不可用」失败 → 自动切到一个已知可用的模型；回可读提示（空 = 没处理）。
+
+        候选顺序：① 本 agent 最近一次跑通的模型 → ② 模型清单里其它模型。
+        ⚠ 用会话上的 `_badModels` 记账：反复重发会**逐个**试下去，不会死磕同一个坏模型。
+        """
+        low = str(detail or "").lower()
+        if ("model unavailable" not in low and "model_not_found" not in low
+                and "modelnotfound" not in low):
+            return ""
+        m = re.search(r"model unavailable[:\s]+([^\s\)'\"`]+)", str(detail), re.I)
+        with self._lock:
+            s = self._sessions.get(sid) or {}
+            failing = (m.group(1).strip() if m else "") or str((s.get("model") or {}).get("id") or "")
+            bad = s.setdefault("_badModels", []) if s else []
+        if failing and failing not in bad:
+            bad.append(failing)
+        options = [o.get("value") for o in ((self._config.get("model") or {}).get("options") or [])
+                   if isinstance(o, dict) and o.get("value")]
+        cands = []
+        if self._last_ok_model and self._last_ok_model not in bad:
+            cands.append(self._last_ok_model)
+        for o in options:
+            if o not in bad and o not in cands:
+                cands.append(o)
+        for cand in cands[:8]:
+            try:
+                if self.set_model(sid, {"id": cand, "providerID": self.provider_id}):
+                    self._log("[acp] 模型 %s 不可用 → 已自动切到 %s" % (failing or "?", cand))
+                    with self._lock:
+                        cur = (self._sessions.get(sid) or {}).get("model")
+                    self._emit({"type": "session.model.update",
+                                "data": {"sessionID": sid, "model": cur}})
+                    return ("模型 %s 在 agent 侧不可用，已自动切到 %s —— 请把刚才那条再发一次。"
+                            % (failing or "?", cand))
+            except Exception:  # noqa: BLE001
+                continue
+        return ("模型 %s 在 agent 侧不可用，且没找到可用的替代 —— 请在「模型」里手动换一个。"
+                % (failing or "?"))
+
     def _run_turn(self, sid, turn, blocks):
         outcome = "completed"
         usage = None
@@ -1710,6 +1928,10 @@ class AcpService:
             if isinstance(res, dict):
                 usage = res.get("usage")
                 stop = res.get("stopReason")
+            # ★ 记下「这一轮真的跑通了用的模型」——下次模型不可用时拿它回退
+            if self._model:
+                self._last_ok_model = self._model
+                _save_ok_model(self.agent_id, self._model)
         except Exception as exc:  # noqa: BLE001
             outcome = "error"
             turn.aborted = True
@@ -1722,10 +1944,14 @@ class AcpService:
                           "下次提问自动新开" % sid)
                 detail += ("（agent 侧会话历史已损坏：上一轮的工具调用被中途打断、留下了悬空 tool_call。"
                            "已自动丢弃这条 agent 会话 —— 请把刚才那条消息再发一次即可继续。）")
+            model_note = self._recover_model(sid, detail)
+            if model_note:
+                detail = model_note
             if not (turn.text_parts or turn.reason_parts or turn.tools):
                 turn.text_parts.append("（本轮未产生输出：%s）" % detail)
             self._emit({"type": "session.error", "data": {
-                "sessionID": sid, "assistantMessageID": turn.id, "error": detail}})
+                "sessionID": sid, "assistantMessageID": turn.id, "error": detail,
+                "modelUnavailable": bool(model_note)}})
         turn.completed = now_ms()
         self._log("[acp] turn done outcome=%s text_parts=%d reason_parts=%d tools=%d usage=%s"
                   % (outcome, len(turn.text_parts), len(turn.reason_parts), len(turn.tools),

@@ -9,6 +9,15 @@
    两套主题：默认「昼」（白衣绯袴）／「夜」（黑纱黄金瞳），右上角可切换。
    ============================================================================ */
 
+/* 反斜杠全局修正：日文字体（Yu Mincho / Yu Gothic UI 等）按 Shift-JIS 习惯把 U+005C(\) 画成「￥」。
+   用一个**只覆盖 U+005C** 的本地字体面顶在字体栈最前面 —— CSS 字体回退是「按字符」挑的，
+   unicode-range 之外的字符会跳到下一个字体，所以只有反斜杠换成正经的反斜杠，其它字一律不受影响。 */
+@font-face {
+  font-family: "cocraft-bslash";
+  src: local("Consolas"), local("Courier New"), local("Segoe UI"), local("Cascadia Mono");
+  unicode-range: U+005C;
+}
+
 :root {
   /* —— 昼：白衣绯袴 —— */
   --paper:      #faf7f2;   /* 和纸白（白衣） */
@@ -31,9 +40,9 @@
   --err:        #b3261e;
 
   /* Cambria Math 放在最后一位：前面的字体缺数学符号时由它补，避免 ∑ ∫ √ 这类显示成方框 */
-  --serif: "Yu Mincho", "MS Mincho", "Noto Serif SC", "Source Han Serif SC",
+  --serif: "cocraft-bslash", "Yu Mincho", "MS Mincho", "Noto Serif SC", "Source Han Serif SC",
            "Songti SC", "SimSun", "Cambria Math", serif;
-  --sans:  "Yu Gothic UI", "Microsoft YaHei UI", "Segoe UI", "Cambria Math", system-ui, sans-serif;
+  --sans:  "cocraft-bslash", "Yu Gothic UI", "Microsoft YaHei UI", "Segoe UI", "Cambria Math", system-ui, sans-serif;
   --mono:  ui-monospace, "Cascadia Mono", Consolas, "Courier New", "Cambria Math", monospace;
 
   --radius: 3px;          /* 和风：小圆角，接近直角更利落 */
@@ -740,6 +749,20 @@ html[data-theme="hiru"].has-live #live-bg .lb-wash { display: none; }
 .cfg-row .cfg-ctl input[type="text"],
 .cfg-row .cfg-ctl input[type="password"] { flex: 1 1 160px; width: auto; min-width: 0; }
 .cfg-row .cfg-ctl button { flex: none; }
+/* 新会话：项目单选列表（当前 agent 用过的目录）+ 「＋ 新建项目…」 */
+.ns-projects { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow: auto; }
+.ns-proj {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  width: 100%; text-align: left; padding: 7px 10px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ink-faint) 6%, transparent);
+}
+.ns-proj:hover { border-color: var(--gold-soft); }
+.ns-proj.on { border-color: var(--gold); box-shadow: inset 0 0 0 1px var(--gold); }
+.ns-proj .np-name { font-size: 13px; }
+.ns-proj .np-path { font-size: 11px; color: var(--ink-faint); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ns-proj.ns-new { align-items: center; color: var(--gold); font-size: 13px; }
+.ns-empty { font-size: 12px; padding: 2px 2px 4px; }
 /* API Key：变量名是**只读小标签**（按品牌自动决定），旁边只有值输入框 + 保存。
    ⚠ 以前是两个输入框（变量名 + 值），用户第一反应是"为什么有两个"——所以砍掉手填。 */
 .cfg-key-var {
@@ -1396,6 +1419,61 @@ html.lyrics-on #p-lyric { display: block; }
 #mode-list .mode-chip:hover { border-color: var(--hi); color: var(--hi); }
 #mode-list .mode-chip.on { background: var(--hi); color: #fff; border-color: var(--hi); }
 #mode-list .mode-chip.local { box-shadow: inset 0 0 0 1px var(--gold); }
+
+/* 技能 / 斜杠命令弹窗（紧凑：小字全部收进 title，正文不占版面） */
+.skill-body { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 6px 0 2px; }
+@media (max-width: 720px) { .skill-body { grid-template-columns: 1fr; } }
+.skill-sec { min-width: 0; }
+.skill-sec-head {
+  margin-bottom: 5px; padding-bottom: 3px; font-family: var(--serif); font-size: 12.5px;
+  border-bottom: 1px solid var(--line-soft);
+}
+#skill-list, #cmd-list { grid-template-columns: 1fr; gap: 5px; margin: 0 0 4px; }
+.skill-empty { padding: 8px 2px; font-size: 11.5px; }
+.skill-item {
+  display: flex; align-items: center; gap: 7px; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-2);
+}
+.skill-item .si-name {
+  flex: 1; min-width: 0; font-size: 12.5px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.skill-item .si-src {
+  flex: none; font-size: 9.5px; line-height: 1.6; padding: 0 5px; border-radius: 999px; color: var(--hi);
+  border: 1px solid color-mix(in srgb, var(--hi) 35%, transparent);
+}
+.skill-item .si-act { display: flex; gap: 4px; flex: none; }
+.skill-item .si-act button { padding: 3px 7px; font-size: 11px; }
+.skill-item .si-run { min-width: 28px; }
+.skill-item .si-upd, .skill-item .si-del { padding: 3px 6px; }
+.skill-item .si-del { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+
+/* 技能安装（通用 GitHub/URL） */
+.skill-install[hidden] { display: none; }   /* ⚠ 下面给了 display:grid 会盖掉 [hidden]，必须显式兜底 */
+.skill-install { display: grid; gap: 8px; margin: 6px 0 4px; }
+.si-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.si-row > label { font-size: 12px; color: var(--ink-dim); }
+.si-row input[type="text"] {
+  flex: 1; min-width: 220px; padding: 6px 9px; font-size: 12.5px; font-family: var(--mono);
+  color: var(--ink); background: var(--paper-2); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.si-row select {
+  padding: 5px 8px; font-size: 12px; color: var(--ink); background: var(--paper-2);
+  border: 1px solid var(--line); border-radius: var(--radius);
+}
+.si-chk { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
+.si-list { max-height: 46vh; overflow: auto; display: grid; gap: 5px; }
+.si-item {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-2); cursor: pointer;
+}
+.si-item input { flex: none; }
+.si-item .si-name {
+  flex: 1; min-width: 0; font-size: 12.5px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.si-item .si-name .si-id { font-weight: 400; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin-left: 5px; }
+.si-item .si-meta { flex: none; font-size: 11px; color: var(--ink-faint); }
 /* 卡片上的 provider 徽章 + 「改」按钮（编辑名称/命令/目录/provider） */
 .agents-row .badge {
   flex: none; font-size: 10px; line-height: 1.5; padding: 1px 6px; border-radius: 999px;
@@ -2241,5 +2319,29 @@ html.code-resizing #app { transition: none; }
   html.code-open #app { padding-right: 0; }          /* 窄屏：抽屉占满，退回覆盖式 */
   .code-tree { width: 160px; }
 }
+
+/* ---------- 主题图标槽：主题给了 --ico-val 就遮住默认图标 / 文字、改画主题图标 ---------- */
+[data-ico-on] { position: relative; font-size: 0 !important; }
+[data-ico-on] > * { visibility: hidden; }
+[data-ico-on]::after {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 18px; height: 18px; transform: translate(-50%, -50%);
+  background: currentColor;
+  -webkit-mask: var(--ico-val) center / contain no-repeat;
+  mask: var(--ico-val) center / contain no-repeat;
+}
+
+/* ---------- 主题工坊卡片 ---------- */
+.th-tabs { display: flex; gap: 6px; margin: 4px 0 8px; }
+.th-tab { padding: 4px 10px; font-size: 12px; }
+.th-tab.on { background: var(--hi); border-color: var(--hi); color: #fff; font-weight: 600; }
+.th-swatch { display: flex; align-items: center; justify-content: center; font-size: 11px; border-radius: var(--radius); }
+.th-swatch.light { background: linear-gradient(135deg, rgb(246,248,251), rgb(201,211,224)); color: rgb(51,65,90); }
+.th-swatch.dark { background: linear-gradient(135deg, rgb(13,17,23), rgb(34,48,63)); color: rgb(159,179,200); }
+.th-desc { display: block; font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
+.th-installed { color: var(--gold); font-size: 11px; }
+.wp-it.th-on { border-color: color-mix(in srgb, var(--hi) 45%, transparent);
+  background: color-mix(in srgb, var(--hi) 10%, transparent); }
+
 
 

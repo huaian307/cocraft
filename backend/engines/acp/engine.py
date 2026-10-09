@@ -19,8 +19,8 @@ import threading
 import time
 import urllib.parse
 
-from ..base import Engine
-from . import agents
+from ..base import Engine, EngineError
+from . import agents, skills
 from .service import AcpService, BusyError
 
 
@@ -415,6 +415,80 @@ class AcpEngine(Engine):
             svc.reply_permission(sid, urllib.parse.unquote(mp.group(1)), b.get("decision") or "reject")
             return _empty(handler, 204)
         return handler._send_json(404, {"error": "未知的会话子路径", "sub": rest})
+
+    # ---------------- 技能 / 斜杠命令 ----------------
+    #
+    # ACP 协议**没有** skill：技能由我们自己扫文件系统（见 acp/skills.py），
+    # 「激活」= 把一个 `skill` 消息写进本地历史 + 把正文装填/发送（见 AcpService.inject_skill）。
+    # 斜杠命令来自 agent 的 `available_commands_update`，执行 = 把 `/命令 参数` 当一条消息发出去。
+
+    def _skill_cwd(self, sid=None, directory=None) -> str:
+        """技能扫描用哪个目录：显式 directory > 会话目录 > 服务默认 cwd。"""
+        if directory:
+            return str(directory)
+        try:
+            svc = self.service()
+        except Exception:  # noqa: BLE001
+            return ""
+        if sid:
+            s = svc.get_session(sid) or {}
+            d = (s.get("location") or {}).get("directory")
+            if d:
+                return str(d)
+        return svc.cwd
+
+    def list_skills(self, directory=None) -> dict:
+        cwd = self._skill_cwd(directory=directory)
+        data = []
+        for it in skills.discover(cwd):
+            row = skills.public(it)
+            row.pop("content", None)     # 列表不带正文，省流量
+            data.append(row)
+        return {"location": {"directory": cwd}, "data": data}
+
+    def skill_detail(self, skill_id, directory=None):
+        it = skills.find(skill_id, self._skill_cwd(directory=directory))
+        return skills.public(it) if it else None
+
+    def list_commands(self, directory=None) -> dict:
+        svc = self.service()
+        try:
+            svc.ensure_model_config()    # 顺带确保会话已拉过（命令清单要靠 agent 的通知）
+        except Exception:  # noqa: BLE001
+            pass
+        return {"location": {"directory": directory or svc.cwd}, "data": svc.commands()}
+
+    def activate_skill(self, sid, skill_id, resume=False) -> dict:
+        svc = self.service()
+        s = svc.get_session(sid)
+        if s is None:
+            raise EngineError(404, "会话不存在（可能刚切换过引擎：请刷新面板，或在左侧重选一个会话）")
+        cwd = (s.get("location") or {}).get("directory") or svc.cwd
+        it = skills.find(skill_id, cwd)
+        if it is None:
+            raise EngineError(404, "找不到技能：%s" % skill_id)
+        try:
+            return svc.inject_skill(sid, it, resume=bool(resume))
+        except KeyError:
+            raise EngineError(404, "会话不存在")
+        except RuntimeError as exc:
+            raise EngineError(409, str(exc))
+
+    def run_command(self, sid, name, text="", files=None) -> dict:
+        svc = self.service()
+        if svc.get_session(sid) is None:
+            raise EngineError(404, "会话不存在")
+        cmd = "/" + str(name or "").strip().lstrip("/")
+        if cmd == "/":
+            raise EngineError(400, "缺少命令名")
+        full = (cmd + (" " + str(text) if text else "")).strip()
+        try:
+            svc.prompt(sid, full, files)
+        except KeyError:
+            raise EngineError(404, "会话不存在")
+        except BusyError as exc:
+            raise EngineError(409, str(exc))
+        return {"ok": True}
 
     # ---------------- SSE ----------------
 

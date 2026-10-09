@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft · 絵梨衣</title>
 <link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style.css?v=0.1.14">
+<link rel="stylesheet" href="/style.css?v=0.1.30">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -183,6 +183,7 @@
         <textarea id="input" rows="1" placeholder="写在这里……  Enter 送出，Shift+Enter 换行（可粘贴/拖入图片）" disabled></textarea>
         <div class="composer-foot">
           <button type="button" id="btn-perm" class="perm-btn" title="权限授予等级（点开选择）" data-level="ask">权限：全部询问 ▾</button>
+          <button type="button" id="btn-skill" class="perm-btn" title="技能 / 斜杠命令（点开选择）">技能 ▾</button>
         </div>
       </div>
       <input type="file" id="file-input" multiple hidden>
@@ -518,6 +519,10 @@
         <button id="cfg-wall">选壁纸…</button>
       </div>
       <div class="cfg-row">
+        <label>主题工坊<i>浏览 / 安装社区主题（按钮图标 + 界面样式）；也能从这里切回内置主题</i></label>
+        <button id="cfg-themes">打开主题工坊…</button>
+      </div>
+      <div class="cfg-row">
         <label>音乐登录 · 网易云<i>粘贴 music.163.com 的 Cookie（含 MUSIC_U）</i></label>
         <button id="cfg-ck-netease">贴 Cookie</button>
       </div>
@@ -587,6 +592,91 @@
   </div>
 </div>
 
+<div id="skill" class="wp" hidden>
+  <div class="wp-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">技能</span><b>技能 / 斜杠命令</b><i class="mk-cap">言灵</i>
+      <button id="skill-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div id="skill-main">
+      <div class="skill-body">
+        <div class="skill-sec">
+          <div class="skill-sec-head" title="点一下「装填」→ 下一条消息生效；点「▶」立刻跑">技能</div>
+          <div class="wp-list" id="skill-list"></div>
+        </div>
+        <div class="skill-sec">
+          <div class="skill-sec-head" title="点一下立即执行（不含参数）">斜杠命令</div>
+          <div class="wp-list" id="cmd-list"></div>
+        </div>
+      </div>
+    </div>
+    <div id="skill-install" class="skill-install" hidden>
+      <div class="si-row">
+        <input type="text" id="si-src" placeholder="owner/repo，或 https://github.com/owner/repo[/tree/ref/path]" autocomplete="off" spellcheck="false">
+        <button type="button" id="si-preview">预览</button>
+      </div>
+      <div class="si-row">
+        <label>装到</label>
+        <select id="si-target">
+          <option value="global-agents">全局 · 跨工具（~/.agents/skills）</option>
+          <option value="global-opencode">全局 · OpenCode（~/.config/opencode/skills）</option>
+          <option value="global-claude">全局 · Claude（~/.claude/skills）</option>
+          <option value="global-codex">全局 · Codex（~/.codex/skills）</option>
+          <option value="project-agents">当前项目 · .agents/skills</option>
+          <option value="project-opencode">当前项目 · .opencode/skills</option>
+          <option value="project-codex">当前项目 · .codex/skills</option>
+        </select>
+        <label class="si-chk"><input type="checkbox" id="si-force"> 覆盖已存在</label>
+      </div>
+      <div id="si-list" class="si-list"></div>
+      <div class="si-row">
+        <button type="button" id="si-go" disabled>安装选中</button>
+        <span class="muted" id="si-msg"></span>
+      </div>
+    </div>
+    <div class="wp-foot">
+      <span class="muted" id="skill-cur"></span>
+      <button id="skill-import">＋ 安装技能</button>
+      <button id="skill-reload">重新读取</button>
+    </div>
+  </div>
+</div>
+
+<div id="themes" class="wp" hidden>
+  <div class="wp-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">主题</span><b>主题工坊</b><i class="mk-cap">Workshop</i>
+      <button id="th-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="wp-cur muted" id="th-cur">加载中…</div>
+    <div class="th-tabs">
+      <button type="button" class="th-tab on" data-tab="installed">已安装 / 内置</button>
+      <button type="button" class="th-tab" data-tab="online">在线工坊</button>
+    </div>
+    <div class="wp-list" id="th-list"></div>
+    <div id="th-install" class="skill-install" hidden>
+      <div class="si-row">
+        <input type="text" id="th-src" placeholder="owner/repo，或 https://github.com/owner/repo[/tree/ref/path]" autocomplete="off" spellcheck="false">
+        <button type="button" id="th-preview">预览</button>
+      </div>
+      <div id="th-list2" class="si-list"></div>
+      <div class="si-row">
+        <button type="button" id="th-go" disabled>安装选中</button>
+        <label class="si-chk"><input type="checkbox" id="th-force"> 覆盖已存在</label>
+        <span class="muted" id="th-msg"></span>
+      </div>
+    </div>
+    <div class="wp-foot">
+      <span class="muted" id="th-foot"></span>
+      <button id="th-reset" title="回到内置主题（保持当前明暗）">恢复内置</button>
+      <button id="th-import">＋ 从 GitHub 安装…</button>
+      <button id="th-reload">重新读取</button>
+    </div>
+  </div>
+</div>
+
 <div id="import" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
@@ -611,6 +701,21 @@
       <button id="ns-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="cfg-body">
+      <div class="cfg-row wide">
+        <label>项目<i>当前 agent 用过的项目目录；点一个即选中。要长期保留新工作，选「＋ 新建项目…」</i></label>
+        <div class="cfg-ctl">
+          <div id="ns-projects" class="ns-projects"></div>
+        </div>
+      </div>
+      <div class="cfg-row wide" id="ns-newproj" hidden>
+        <label>新建项目<i>选一个长期保存的位置，再输入项目名 —— 会在磁盘上真正建目录（不是缓存）</i></label>
+        <div class="cfg-ctl">
+          <input type="text" id="ns-newbase" class="mono" placeholder="项目位置（父目录）" autocomplete="off">
+          <button type="button" id="ns-newbase-pick">选择位置…</button>
+          <input type="text" id="ns-newname" placeholder="项目名" autocomplete="off">
+          <button type="button" id="ns-newname-create">创建项目</button>
+        </div>
+      </div>
       <div class="cfg-row wide">
         <label>工作目录<i>这个会话在哪个目录下工作；留空 = 用引擎默认（ACP 是共享工作区）</i></label>
         <div class="cfg-ctl">
@@ -759,7 +864,7 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/app.js?v=0.1.14"></script>
+<script src="/app.js?v=0.1.30"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

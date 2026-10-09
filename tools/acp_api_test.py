@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -304,6 +305,53 @@ def main() -> int:
         st, js = call("GET", "/engine/acp/agents")
         check("agents list still healthy after candidates scan",
               st == 200 and isinstance((js or {}).get("agents"), list), str(js)[:120])
+
+        # ---- 技能 / 斜杠命令（ACP：面板自己扫文件系统 + 注入；见 engines/acp/skills.py）----
+        print("[10] skills (ACP scans the filesystem)")
+        _q = urllib.parse.quote(tmp, safe="")
+        skroot = os.path.join(tmp, ".opencode", "skills", "demo-skill")
+        os.makedirs(skroot, exist_ok=True)
+        with open(os.path.join(skroot, "SKILL.md"), "w", encoding="utf-8") as fh:
+            fh.write("---\nname: Demo Skill\ndescription: demo\n---\n\nDEMO BODY\n")
+        st, js = call("GET", "/api/skill?directory=%s" % _q)
+        ids = [s.get("id") for s in ((js or {}).get("data") or [])]
+        check("GET /api/skill lists the project skill", st == 200 and "demo-skill" in ids, str(js)[:200])
+        row = next((s for s in ((js or {}).get("data") or []) if s.get("id") == "demo-skill"), {})
+        check("list rows carry name/source but NOT content",
+              row.get("name") == "Demo Skill" and "content" not in row, str(row)[:200])
+        st, js = call("GET", "/api/skill/demo-skill?directory=%s" % _q)
+        check("GET /api/skill/<id> returns the body",
+              st == 200 and "DEMO BODY" in (((js or {}).get("data") or {}).get("content") or ""),
+              str(js)[:160])
+        st, js = call("GET", "/api/skill/no-such-skill")
+        check("unknown skill -> 404", st == 404, str(js)[:120])
+        st, js = call("GET", "/api/command")
+        cmd_names = [c.get("name") for c in ((js or {}).get("data") or [])]
+        check("GET /api/command lists the agent's own advertised commands (mock-cmd)",
+              st == 200 and "mock-cmd" in cmd_names, str(js)[:200])
+
+        print("[11] activate skill = inject only (no immediate run)")
+        st, js = call("POST", "/api/session/%s/skill" % sid, {"id": "demo-skill"})
+        check("POST .../skill 200", st == 200 and (js or {}).get("injected") == "demo-skill", str(js)[:160])
+        st, js = call("GET", "/api/session/%s/message" % sid)
+        msgs = (js or {}).get("data") or []
+        check("a `skill` message lands in local history",
+              any(m.get("type") == "skill" and m.get("skill") == "demo-skill" for m in msgs),
+              str(msgs)[:220])
+        st, js = call("POST", "/api/session/%s/skill" % sid, {"id": "nope"})
+        check("activating an unknown skill -> 404", st == 404, str(js)[:120])
+        _svc = server.engines.get_engine("acp").service()
+        _pend = (_svc._sessions.get(sid) or {}).get("pendingSkills") or []
+        check("skill is armed as a pending injection (runs on the user's next message)",
+              len(_pend) == 1 and _pend[0].get("id") == "demo-skill", str(_pend)[:160])
+        st, js = call("GET", "/api/session/%s" % sid)
+        check("generic session route not shadowed by the skill route", st == 200, str(js)[:120])
+
+        print("[12] slash command runs (ACP: sends `/name` as a prompt)")
+        st, js = call("POST", "/api/session/%s/command" % sid, {"name": "hello", "text": "world"})
+        check("POST .../command 200", st == 200, str(js)[:160])
+        st, js = call("POST", "/api/session/sess_missing/command", {"name": "x"})
+        check("command on unknown session -> 404", st == 404, str(js)[:120])
     finally:
         try:
             eng = server.engines.get_engine("acp")

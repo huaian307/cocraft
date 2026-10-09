@@ -97,6 +97,13 @@ while True:
                       "authMethods": []})
     elif method == "session/new":
         STATE["sid"] = "sess_mock_1"
+        # ★ 真实 agent（opencode-acp / codex）会在 `session/new` **返回之前**就发
+        #   available_commands_update —— 那会儿客户端还没登记会话。这里照样模拟，
+        #   用来锁住"命令不能被丢"（见 service._on_notification 的提前分支）。
+        notify({"sessionUpdate": "available_commands_update",
+                "availableCommands": [{"name": "mock-cmd", "description": "mock slash command"},
+                                      {"name": "init", "description": "guided setup"}]},
+               sid="sess_mock_1")
         res = {"sessionId": "sess_mock_1"}
         res.update(session_config())
         respond(rid, res)

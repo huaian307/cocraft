@@ -54,8 +54,10 @@ import fsview
 import netsafe
 import procutils
 import pty as pty_term
+import skills_install
+import themes
 import updater
-from engines.base import HOP_BY_HOP
+from engines.base import HOP_BY_HOP, EngineError
 from engines.acp import agents as acp_agents
 
 # 抑制「应用程序无法正常启动 (0xc0000142)」这类硬错误模态框：本进程 + 所有子进程
@@ -1358,8 +1360,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._fs_read()
             elif path == "/fs/write":
                 self._fs_write(method)
+            elif path == "/mkdir":
+                # 新建会话的「新建项目」：在磁盘上真正创建一个长期目录（与引擎无关）
+                self._mkdir(method)
+            elif path == "/projectroot":
+                # 新建项目的默认位置 = 对应 agent 的目录
+                self._projectroot()
             elif path == "/update/check":
                 self._update_check()
+            elif path == "/update/status":
+                self._update_status()
+            elif path == "/update/ack":
+                self._update_ack(method)
             elif path == "/update/apply":
                 self._update_apply(method)
             elif path == "/appearance":
@@ -1390,8 +1402,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"base": _base, "ws": _ws})
             elif path.startswith("/cocraft/"):
                 self._cocraft_proxy(method, path)
+            elif path == "/skills/preview":
+                self._skills_preview(method)
+            elif path == "/skills/install":
+                self._skills_install(method)
+            elif path == "/skills/uninstall":
+                self._skills_uninstall(method)
+            elif path == "/skills/update":
+                self._skills_update(method)
+            elif path == "/themes":
+                self._themes_list(method)
+            elif path == "/themes/preview":
+                self._themes_preview(method)
+            elif path == "/themes/install":
+                self._themes_install(method)
+            elif path == "/themes/uninstall":
+                self._themes_uninstall(method)
+            elif path == "/themes/update":
+                self._themes_update(method)
+            elif path == "/themes/get":
+                self._themes_get(method)
+            elif path == "/themes/apply":
+                self._themes_apply(method)
+            elif path == "/themes/asset":
+                self._themes_asset(method)
+            elif path == "/themes/img":
+                self._themes_img(method)
             elif path == "/api/permission/level":
                 self._perm_level_api(method)
+            elif (path == "/api/skill" or path.startswith("/api/skill/")
+                  or path == "/api/command"
+                  or re.match(r"^/api/session/[^/]+/(skill|command)$", path)):
+                # 技能 / 斜杠命令：面板统一语义，两个引擎都实现（见 engines/base.Engine）
+                self._skill_api(method, path)
             elif path.startswith("/api/"):
                 self._proxy(method)
             else:
@@ -1779,6 +1822,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._pick_path("pick_folder.ps1", "pickdir", "选择文件夹")
 
+    def _projectroot(self):
+        """新建项目的默认位置：ACP = 当前 agent 的生效工作目录（agent 自己的 cwd，无则共享基线）；
+        其它引擎（opencode）= ""，由前端用「当前会话目录」（agent 正在工作的目录）兜底。"""
+        eng = ""
+        root = ""
+        try:
+            eng = engines.active_engine_id()
+            if eng == "acp":
+                root = str((engines.get_engine("acp").config() or {}).get("cwd") or "")
+        except Exception:  # noqa: BLE001
+            root = ""
+        self._send_json(200, {"ok": True, "engine": eng, "root": root})
+
+    def _mkdir(self, method: str):
+        """新建项目目录：{base, name} → 在 base 下真正创建一个长期目录（不是缓存）。"""
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        b = self._read_json_body() or {}
+        try:
+            res = fsview.make_project(str(b.get("base") or ""), str(b.get("name") or ""))
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._send_json(200, res)
+
     def _open_dir(self, method: str):
         """在外部程序里打开目录：{what:"terminal"|"editor"|"explorer", dir}。"""
         if method != "POST":
@@ -1923,6 +1992,16 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(urlsplit(self.path).query)
         force = (q.get("force") or ["0"])[0] in ("1", "true", "yes")
         self._send_json(200, {"ok": True, "data": updater.check(force=force)})
+
+    def _update_status(self):
+        self._send_json(200, {"ok": True, "data": updater.read_status()})
+
+    def _update_ack(self, method: str):
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        updater.clear_status()
+        self._send_json(200, {"ok": True})
 
     def _update_apply(self, method: str):
         if method != "POST":
@@ -2121,6 +2200,226 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json_body() or {}
             return self._send_json(200, {"ok": True, "level": write_perm_level(body.get("level"))})
         return self._send_json(405, {"error": "GET/POST only"})
+
+    def _skills_preview(self, method: str):
+        """技能安装·预览：给一个来源，列出里面有啥技能（不写盘）。引擎无关。"""
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            res = skills_install.preview(body.get("source"))
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(502, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+        return self._send_json(200, res)
+
+    def _skills_install(self, method: str):
+        """技能安装：把选中的技能写进本机技能目录（`global-agents` 等）。引擎无关。"""
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            res = skills_install.install(
+                body.get("source"), ids=body.get("ids"),
+                target=body.get("target") or "global-agents",
+                directory=body.get("directory") or "", force=bool(body.get("force")))
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(502, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+        return self._send_json(200, res)
+
+    def _skills_uninstall(self, method: str):
+        """卸载技能：删掉它的目录（只允许已知技能根目录下）。"""
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            res = skills_install.uninstall(body.get("path"), body.get("directory") or "")
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+        return self._send_json(200, res)
+
+    def _skills_update(self, method: str):
+        """更新技能：按安装时记下的来源重新下载覆盖。"""
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            res = skills_install.update(body.get("path"), body.get("directory") or "")
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(502, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+        return self._send_json(200, res)
+
+    # ---------- 主题工坊 ----------
+
+    def _themes_list(self, method: str):
+        if method != "GET":
+            return self._send_json(405, {"error": "GET only"})
+        try:
+            themes.ensure_dir()
+            return self._send_json(200, {"ok": True, "active": themes.read_active(),
+                                         "official": themes.DEFAULT_CATALOG,
+                                         "builtin": themes.BUILTIN,
+                                         "installed": themes.list_installed()})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+
+    def _themes_preview(self, method: str):
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            return self._send_json(200, themes.preview(body.get("source")))
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(502, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+
+    def _themes_install(self, method: str):
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            res = themes.install(body.get("source"), ids=body.get("ids"),
+                                 force=bool(body.get("force")))
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(502, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+        return self._send_json(200, res)
+
+    def _themes_uninstall(self, method: str):
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            return self._send_json(200, themes.uninstall(body.get("id")))
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+
+    def _themes_update(self, method: str):
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        try:
+            return self._send_json(200, themes.update(body.get("id")))
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(502, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+
+    def _themes_get(self, method: str):
+        if method != "GET":
+            return self._send_json(405, {"error": "GET only"})
+        q = parse_qs(urlsplit(self.path).query)
+        tid = (q.get("id") or [""])[0]
+        mode = (q.get("mode") or [""])[0]
+        try:
+            return self._send_json(200, themes.get_theme(tid, mode))
+        except ValueError as exc:
+            return self._send_json(404, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+
+    def _themes_apply(self, method: str):
+        if method != "POST":
+            return self._send_json(405, {"error": "POST only"})
+        body = self._read_json_body() or {}
+        tid = str(body.get("id") or "").strip()
+        ids = {t["id"] for t in themes.BUILTIN} | {t["id"] for t in themes.list_installed()}
+        if tid not in ids:
+            return self._send_json(404, {"ok": False, "error": "未知主题：%s" % tid})
+        themes.write_active(tid)
+        return self._send_json(200, {"ok": True, "active": tid})
+
+    def _themes_asset(self, method: str):
+        if method != "GET":
+            return self._send_json(405, {"error": "GET only"})
+        q = parse_qs(urlsplit(self.path).query)
+        tid = (q.get("id") or [""])[0]
+        rel = (q.get("path") or [""])[0]
+        try:
+            target = themes.asset_path(tid, rel)
+        except ValueError as exc:
+            return self._send_json(404, {"error": str(exc)})
+        self._send_file(target)
+
+    def _themes_img(self, method: str):
+        """代理远程主题预览图（限图，≤6MB）；只认主题来源里的相对路径，不做开放代理。"""
+        if method != "GET":
+            return self._send_json(405, {"error": "GET only"})
+        q = parse_qs(urlsplit(self.path).query)
+        source = (q.get("source") or [""])[0]
+        rel = (q.get("path") or [""])[0]
+        try:
+            data, ctype = themes.fetch_remote_image(source, rel)
+        except ValueError as exc:
+            return self._send_json(400, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(502, {"error": "%s: %s" % (type(exc).__name__, exc)})
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _skill_api(self, method: str, path: str):
+        """技能 / 斜杠命令的统一入口（两个引擎都实现同一组方法）。
+
+        GET  /api/skill[?directory=]        → 技能列表（不带正文）
+        GET  /api/skill/<id>[?directory=]   → 技能详情（含正文）
+        GET  /api/command[?directory=]      → 斜杠命令列表
+        POST /api/session/<sid>/skill       → 激活技能 {id, resume?}
+        POST /api/session/<sid>/command     → 执行命令 {name, text?, files?}
+        """
+        eng = engines.active_engine()
+        q = parse_qs(urlsplit(self.path).query)
+        directory = (q.get("directory") or [""])[0] or None
+        try:
+            if path == "/api/skill":
+                if method != "GET":
+                    return self._send_json(405, {"error": "GET only"})
+                return self._send_json(200, eng.list_skills(directory))
+            if path.startswith("/api/skill/"):
+                if method != "GET":
+                    return self._send_json(405, {"error": "GET only"})
+                skill_id = urllib.parse.unquote(path[len("/api/skill/"):])
+                detail = eng.skill_detail(skill_id, directory)
+                if detail is None:
+                    return self._send_json(404, {"error": "找不到技能：%s" % skill_id})
+                return self._send_json(200, {"data": detail})
+            if path == "/api/command":
+                if method != "GET":
+                    return self._send_json(405, {"error": "GET only"})
+                return self._send_json(200, eng.list_commands(directory))
+            m = re.match(r"^/api/session/([^/]+)/(skill|command)$", path)
+            if m:
+                if method != "POST":
+                    return self._send_json(405, {"error": "POST only"})
+                sid = urllib.parse.unquote(m.group(1))
+                body = self._read_json_body() or {}
+                if m.group(2) == "skill":
+                    res = eng.activate_skill(sid, body.get("id"), resume=bool(body.get("resume")))
+                else:
+                    res = eng.run_command(sid, body.get("name"), body.get("text") or "",
+                                          body.get("files"))
+                return self._send_json(200, res if isinstance(res, dict) else {"ok": True})
+            return self._send_json(404, {"error": "未知的技能路径", "path": path})
+        except EngineError as exc:
+            return self._send_json(exc.code, {"error": exc.message})
+        except NotImplementedError:
+            return self._send_json(501, {"error": "当前引擎不支持技能 / 命令"})
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
 
     def _proxy(self, method: str):
         """交给「当前引擎」实现；默认引擎（opencode）就是原来的反代行为。"""

@@ -9,6 +9,18 @@ HOP_BY_HOP = {
 }
 
 
+class EngineError(Exception):
+    """引擎把「已知错误」抛给 HTTP 层：`code` = 建议的 HTTP 状态码。
+
+    用途：技能 / 命令这类面板统一接口由 server.py 调用引擎方法，引擎用它与
+    「意料之外的异常（500）」区分开（比如 404 找不到技能、409 会话正忙）。
+    """
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = int(code)
+        self.message = str(message)
+
+
 class Engine:
     """一个可替换的 agent 后端。
 
@@ -41,4 +53,36 @@ class Engine:
 
     def handle_api(self, handler, method: str) -> None:
         """实现 /api/* 的语义（handler 是 BaseHTTPRequestHandler）。"""
+        raise NotImplementedError
+
+    # ---- 技能 / 斜杠命令（面板统一语义）----
+    #
+    # 背景：OpenCode 原生有 skill（`/api/skill` + `/api/experimental/session/{id}/skill`），
+    # 而 ACP 协议**没有** skill —— 由我们自己扫文件系统发现 + 把 SKILL.md 正文注入会话。
+    # 这里把两者抽象成同一组方法，server.py 只认这一组，前端不用管背后是谁。
+
+    def list_skills(self, directory: str = None) -> dict:
+        """列出技能：`{location:{directory}, data:[{id,name,description,autoinvoke,source,path}]}`。
+
+        ⚠ 列表**不带正文**（`content`）：省流量，正文走 `skill_detail()`。
+        """
+        raise NotImplementedError
+
+    def skill_detail(self, skill_id: str, directory: str = None):
+        """单个技能详情（含 `content` 正文）；找不到回 None。"""
+        raise NotImplementedError
+
+    def list_commands(self, directory: str = None) -> dict:
+        """列出斜杠命令：`{location:{directory}, data:[{name,description}]}`。"""
+        raise NotImplementedError
+
+    def activate_skill(self, sid: str, skill_id: str, resume: bool = False) -> dict:
+        """把技能注入会话。默认**只注入**（`resume=False`），什么时候跑交给用户下一条消息。
+
+        失败请抛 `EngineError`（找不到技能 → 404）。
+        """
+        raise NotImplementedError
+
+    def run_command(self, sid: str, name: str, text: str = "", files=None) -> dict:
+        """执行一个斜杠命令。失败请抛 `EngineError`（会话不存在 → 404、忙 → 409）。"""
         raise NotImplementedError

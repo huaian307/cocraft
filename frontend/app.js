@@ -409,6 +409,14 @@ function renderMessage(m) {
       <span class="line"></span></div>`;
   }
 
+  // 技能注入：OpenCode 与 ACP 都可能有这种消息，只显示"装了哪个技能"，不倒正文
+  if (type === "skill") {
+    const nm = m.name || m.skill || "技能";
+    return `<div class="notice"><span class="line"></span>
+      <span class="label">已注入技能：${esc(String(nm))}</span>
+      <span class="line"></span></div>`;
+  }
+
   let parts = "";
   if (Array.isArray(m.content) && m.content.length) {
     parts = m.content.map((p, i) => {
@@ -891,6 +899,13 @@ async function refreshMessages() {
     for (const id of Object.keys(state.live)) if (known.has(id)) delete state.live[id];
     for (const id of Object.keys(state.reveal)) if (known.has(id)) delete state.reveal[id];
     for (const id of Object.keys(state.frozen)) if (known.has(id)) delete state.frozen[id];
+    // 已收尾、但权威数据里没有同 id 的「生成中」（id 换了）→ 丢掉，避免和权威消息重复显示
+    for (const id of Object.keys(state.live)) {
+      if (state.live[id] && state.live[id].done && !known.has(id)) {
+        delete state.live[id];
+        delete state.reveal[id];
+      }
+    }
     // 我发的消息：服务端已收录就撤掉本地回显（按出现次数配对，避免同文重复误删）
     if (state.pending.length) {
       const left = new Map();
@@ -1007,9 +1022,10 @@ async function send() {
   }
 }
 
-/* ---------------- 新建会话：先选工作目录 ---------------- */
+/* ---------------- 新建会话：选项目 / 新建项目 ---------------- */
 
 const NS_DIR_KEY = "cocraft.newsession.dir";
+const NS_BASE_KEY = "cocraft.newsession.base";
 
 function lastNewSessionDir() {
   try { return localStorage.getItem(NS_DIR_KEY) || ""; } catch { return ""; }
@@ -1020,9 +1036,120 @@ function saveNewSessionDir(dir) {
     else localStorage.removeItem(NS_DIR_KEY);
   } catch { /* 隐私模式 */ }
 }
+function lastNewSessionBase() {
+  try { return localStorage.getItem(NS_BASE_KEY) || ""; } catch { return ""; }
+}
+function saveNewSessionBase(dir) {
+  try {
+    if (dir) localStorage.setItem(NS_BASE_KEY, dir);
+    else localStorage.removeItem(NS_BASE_KEY);
+  } catch { /* 隐私模式 */ }
+}
 
-/** 点「＋ 新会话」→ 弹目录弹窗（不直接建：先让用户确认/选择工作目录） */
-function openNewSession() {
+const NS_PROJECTS_KEY = "cocraft.newsession.projects";
+
+/** 面板里「建过 / 选过」的项目目录（持久化）——即使还没有会话，也能在「项目」列表里看到。 */
+function savedProjects() {
+  try {
+    const a = JSON.parse(localStorage.getItem(NS_PROJECTS_KEY) || "[]");
+    return Array.isArray(a) ? a.filter((x) => x && typeof x.path === "string" && x.path) : [];
+  } catch { return []; }
+}
+function rememberProject(dir, ts) {
+  const d = String(dir || "").trim().replace(/[\\/]+$/, "");
+  if (!d) return;
+  const t = Number(ts) || Date.now();
+  try {
+    const list = savedProjects().filter((x) => normDir(x.path) !== normDir(d));
+    list.unshift({ path: d, ts: t });
+    localStorage.setItem(NS_PROJECTS_KEY, JSON.stringify(list.slice(0, 40)));
+  } catch { /* 隐私模式 */ }
+}
+
+/** 去掉结尾分隔符；比较目录是否同一个（Windows 大小写不敏感 + 分隔符混用） */
+function normDir(p) {
+  return String(p || "").trim().replace(/[\\/]+$/, "").replace(/\//g, "\\").toLowerCase();
+}
+
+/** 看起来像系统临时目录？（提醒用户别把项目建在会被清理的地方） */
+function looksTempPath(p) {
+  const s = String(p || "").toLowerCase().replace(/\//g, "\\");
+  return s.includes("\\appdata\\local\\temp") || s.endsWith("\\temp") || s.includes("\\windows\\temp");
+}
+
+/** 当前 agent 管理的「项目」= 该 agent 会话用过的工作目录（去重，按最近使用排序）。 */
+function agentProjects() {
+  const map = new Map();
+  const add = (dir, upd) => {
+    const d = String(dir || "").trim().replace(/[\\/]+$/, "");
+    if (!d) return;
+    const key = normDir(d);
+    const prev = map.get(key);
+    if (!prev || (upd || 0) > (prev.updated || 0)) {
+      map.set(key, { path: d, name: projectNameOf(d), updated: upd || 0 });
+    }
+  };
+  // ① 面板里「建过 / 选过」的项目（持久化）——即使还没有会话，也看得见
+  savedProjects().forEach((p) => add(p.path, p.ts));
+  // ② ACP 的会话列表已按当前 agent 过滤；OpenCode 一个 agent 管全部会话
+  (state.sessions || []).forEach((s) =>
+    add(s.location && s.location.directory, ((s.time || {}).updated) || ((s.time || {}).created)));
+  if (state.current && state.current.location && state.current.location.directory) {
+    add(state.current.location.directory, Date.now());
+  }
+  return Array.from(map.values()).sort((a, b) => (b.updated || 0) - (a.updated || 0));
+}
+
+/** 重画「项目」列表（单选）；末尾常驻「＋ 新建项目…」 */
+function renderNewSessionProjects() {
+  const box = $("ns-projects");
+  if (!box) return;
+  const cur = normDir($("ns-dir").value);
+  const projs = agentProjects();
+  const rows = projs.map((p) => {
+    const on = normDir(p.path) === cur && cur !== "";
+    return `<button type="button" class="ns-proj${on ? " on" : ""}" data-dir="${esc(p.path)}" title="${esc(p.path)}">`
+      + `<span class="np-name">${esc(p.name || projectNameOf(p.path))}</span>`
+      + `<span class="np-path mono">${esc(p.path)}</span></button>`;
+  }).join("");
+  const newOn = $("ns-newproj") && !$("ns-newproj").hidden;
+  box.innerHTML = `<button type="button" class="ns-proj ns-new${newOn ? " on" : ""}" id="ns-proj-new">＋ 新建项目…</button>`
+    + (rows || `<div class="muted ns-empty">还没有用过的项目目录（用上面的「新建项目」来一个）</div>`);
+  box.querySelectorAll(".ns-proj[data-dir]").forEach((b) => {
+    b.addEventListener("click", () => {
+      $("ns-dir").value = b.dataset.dir;
+      $("ns-newproj").hidden = true;
+      $("ns-note").textContent = "";
+      renderNewSessionProjects();
+    });
+  });
+  const nb = $("ns-proj-new");
+  if (nb) nb.addEventListener("click", () => {
+    $("ns-newproj").hidden = !$("ns-newproj").hidden;
+    renderNewSessionProjects();
+    if (!$("ns-newproj").hidden) setTimeout(() => { try { $("ns-newname").focus(); } catch { /* ignore */ } }, 0);
+  });
+}
+
+/** 「新建项目」的默认位置 = **对应 agent 的目录**：
+ *   ACP → 当前 agent 的生效工作目录（后端 `/projectroot`；agent 没设就用共享基线 shared）；
+ *   其它引擎（opencode）→ 当前会话的目录（= agent 正在工作的目录）；
+ *   都没有再退回「上次用的位置」。 */
+async function defaultProjectRoot() {
+  const cur = (state.current && state.current.location && state.current.location.directory)
+    || (state.sessions[0] && state.sessions[0].location && state.sessions[0].location.directory)
+    || "";
+  if (ENGINE.active === "acp") {
+    try {
+      const r = await api("/projectroot");
+      if (r && r.root) return r.root;
+    } catch { /* 拿不到就退回当前目录 */ }
+  }
+  return cur;
+}
+
+/** 点「＋ 新会话」→ 弹窗：选当前 agent 用过的项目，或新建一个长期项目 */
+async function openNewSession() {
   const box = $("newsess");
   if (!box) return;
   const cur = (state.current && state.current.location
@@ -1030,9 +1157,21 @@ function openNewSession() {
   const dir = lastNewSessionDir() || cur;
   $("ns-dir").value = dir;
   $("ns-title").value = "";
-  $("ns-note").textContent = dir ? "沿用上次用的目录（可改；清空 = 引擎默认）" : "";
+  $("ns-newproj").hidden = true;
+  $("ns-newname").value = "";
+  renderNewSessionProjects();
   box.hidden = false;
-  setTimeout(() => { try { $("ns-dir").focus(); } catch { /* ignore */ } }, 0);
+  setTimeout(() => { try { $("ns-title").focus(); } catch { /* ignore */ } }, 0);
+  // 默认「项目位置」要等后端回答（ACP 要问 /projectroot），先填上次的、拿到后再覆盖
+  $("ns-newbase").value = lastNewSessionBase() || "";
+  let root = "";
+  try { root = await defaultProjectRoot(); } catch { root = ""; }
+  const base = root || lastNewSessionBase() || "";
+  $("ns-newbase").value = base;
+  if (root) $("ns-note").textContent = "新项目默认建在 agent 目录：" + root + "（可改）";
+  else if (base) $("ns-note").textContent = "已沿用上次的项目位置：" + base + "（可改）";
+  else if (dir) $("ns-note").textContent = "已沿用上次的目录（可改；清空 = 引擎默认）";
+  else $("ns-note").textContent = "";
 }
 
 function closeNewSession() { const b = $("newsess"); if (b) b.hidden = true; }
@@ -1041,11 +1180,56 @@ function closeNewSession() { const b = $("newsess"); if (b) b.hidden = true; }
 async function pickNewSessionDir() {
   try {
     const r = await api("/pick/folder", { method: "POST" });
-    if (r && r.ok && r.path) { $("ns-dir").value = r.path; $("ns-note").textContent = ""; }
+    if (r && r.ok && r.path) { $("ns-dir").value = r.path; $("ns-note").textContent = ""; renderNewSessionProjects(); }
     else if (r && r.canceled) { /* 用户取消，什么都不做 */ }
     else setBanner("选择目录失败：" + ((r && r.error) || "未知错误"));
   } catch (err) {
     setBanner("选择目录失败：" + (err && err.message ? err.message : err));
+  }
+}
+
+/** 「选择位置…」→ 原生文件夹框：给「新建项目」选父目录 */
+async function pickNewProjectBase() {
+  try {
+    const r = await api("/pick/folder", { method: "POST" });
+    if (r && r.ok && r.path) {
+      $("ns-newbase").value = r.path;
+      $("ns-note").textContent = looksTempPath(r.path)
+        ? "⚠ 这个位置像是临时目录（可能被系统清理）——建议换到文档 / 盘符下，项目才能长期保留"
+        : "";
+    } else if (r && r.canceled) { /* 取消 */ }
+    else setBanner("选择位置失败：" + ((r && r.error) || "未知错误"));
+  } catch (err) {
+    setBanner("选择位置失败：" + (err && err.message ? err.message : err));
+  }
+}
+
+/** 「创建项目」→ 在磁盘上真正建目录（POST /mkdir），成功后选中它 */
+async function createProjectDir() {
+  const base = ($("ns-newbase").value || "").trim();
+  const name = ($("ns-newname").value || "").trim();
+  const note = $("ns-note");
+  if (!base) { note.textContent = "请先选「项目位置」（一个长期保存的父目录）"; try { $("ns-newbase").focus(); } catch { /* ignore */ } return; }
+  if (!name) { note.textContent = "请输入项目名"; try { $("ns-newname").focus(); } catch { /* ignore */ } return; }
+  const btn = $("ns-newname-create");
+  if (btn) btn.disabled = true;
+  note.textContent = "创建中…";
+  try {
+    const r = await api("/mkdir", { method: "POST", body: JSON.stringify({ base, name }) });
+    if (!r || !r.ok || !r.path) throw new Error((r && r.error) || "未知错误");
+    $("ns-dir").value = r.path;
+    saveNewSessionBase(base);
+    rememberProject(r.path);
+    $("ns-newproj").hidden = true;
+    const temp = looksTempPath(r.path)
+      ? "；⚠ 这个位置是临时目录，可能不长期保留" : "";
+    note.textContent = (r.existed ? "项目已存在，已选中：" : "已创建项目：") + r.path + temp;
+    renderNewSessionProjects();
+    try { $("ns-title").focus(); } catch { /* ignore */ }
+  } catch (err) {
+    note.textContent = "创建项目失败：" + (err && err.message ? err.message : err);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -1075,6 +1259,7 @@ async function doCreateSession() {
     const created = await createSessionWith(dir, title);
     if (!created || !created.id) throw new Error("没拿到会话 id");
     saveNewSessionDir(dir);
+    if (dir) rememberProject(dir);
     closeNewSession();
     await loadSessions();
     await openSession(created.id);
@@ -1168,8 +1353,10 @@ function handleEvent(p) {
   if (t === "session.error") {
     const msg = (d && d.error) || "未知错误";
     if (mine) {
-      setBanner("本轮出错：" + msg + "（详见安装目录 runtime/logs/acp.log）");
+      setBanner((d && d.modelUnavailable ? "模型问题：" : "本轮出错：") + msg
+        + "（详见 runtime/logs/acp.log）");
       scheduleRefresh();
+      if (d && d.modelUnavailable) refreshCurrentModel();   // 后端可能已自动换模型 → 同步按钮
     }
     return;
   }
@@ -1209,7 +1396,13 @@ function handleEvent(p) {
 
   // ④ 终态：取权威数据对账
   if (TERMINAL.test(t)) {
-    if (mine) scheduleRefresh();
+    if (mine) {
+      // 这一轮的「生成中」标记为已结束 —— 刷新后若权威数据里没有同 id（opencode-acp 读库后 id 变了），就丢掉，别重复
+      if (d && d.assistantMessageID && state.live[d.assistantMessageID]) {
+        state.live[d.assistantMessageID].done = true;
+      }
+      scheduleRefresh();
+    }
     // 本轮失败：常见原因是会话绑的模型被下架（ModelUnavailableError）→ 体检一下并说清楚
     if (mine && (t === "session.step.failed" || t === "session.execution.failed")) {
       repairStaleModel(state.current);
@@ -1363,25 +1556,446 @@ function startHeartbeat() {
   });
 }
 
-/* ---------------- 昼 / 夜 主题 ---------------- */
+/* ---------------- 昼 / 夜 主题 + 用户主题（主题工坊） ----------------
+ * 两条属性：
+ *   html[data-theme]      = hiru | yoru     —— 「底盘」（明/暗），决定内置样式与背景槽
+ *   html[data-theme-user] = <用户主题 id>    —— 用户主题身份（变量 / 图标 / 背景覆盖）
+ * 用户主题把自己的 mode 映射到 hiru/yoru 底盘，于是所有既有 [data-theme=...] 规则继续生效；
+ * 用户变量注入在 [data-theme-user] 下（特异性更高）覆盖内置变量。详见 docs/THEMES.md。 */
 
 const THEME_KEY = "cocraft.theme";
+const THEME_USER_KEY = "cocraft.themeUser";
+const THEME_USER_MODE_KEY = "cocraft.themeMode";
 
-function applyTheme(theme) {
+let _userThemeModes = [];   // 当前用户主题支持的明暗（[] = 无 / 内置）
+let _userThemeMode = "";    // 当前用户主题正在用的 mode
+
+const THEME_ICON_SLOTS = {
+  sidebar: "#btn-sidebar", tools: "#btn-tools", agent: "#btn-agent", model: "#btn-model",
+  theme: "#btn-theme", refresh: "#btn-refresh", stop: "#btn-stop", home: "#p-home",
+};
+
+function themeUser() {
+  try { return localStorage.getItem(THEME_USER_KEY) || ""; } catch { return ""; }
+}
+
+function themeUserMode() {
+  try { return localStorage.getItem(THEME_USER_MODE_KEY) || ""; } catch { return ""; }
+}
+
+function _setBaseTheme(theme) {
   document.documentElement.dataset.theme = theme;
-  $("btn-theme").textContent = theme === "yoru" ? "昼" : "夜";
-  $("btn-theme").title = theme === "yoru"
-    ? "切回：昼（白衣绯袴）"
-    : "切到：夜（黑纹付羽织 · 黄金瞳）";
   try { localStorage.setItem(THEME_KEY, theme); } catch { /* 隐私模式忽略 */ }
 }
 
+/** 顶栏「夜/昼」按钮：内置主题 = 切昼夜；双模式用户主题 = 在主题内切；单模式 = 禁用并给理由。 */
+function _syncThemeButton() {
+  const b = $("btn-theme");
+  if (!b) return;
+  const u = themeUser();
+  if (u) {
+    const both = _userThemeModes.length > 1;
+    b.disabled = !both;
+    b.textContent = _userThemeMode === "dark" ? "昼" : "夜";
+    b.title = both
+      ? ("主题「" + u + "」· 点一下切到" + (_userThemeMode === "dark" ? "浅色" : "深色"))
+      : ("主题「" + u + "」只有一种明暗，不能切换（设置 →「主题工坊」回内置）");
+  } else {
+    b.disabled = false;
+    const dark = document.documentElement.dataset.theme === "yoru";
+    b.textContent = dark ? "昼" : "夜";
+    b.title = dark ? "切回：昼（内置白昼）" : "切到：夜（内置夜晚）";
+  }
+}
+
+function clearThemeIcons() {
+  document.querySelectorAll("[data-ico-on]").forEach((el) => {
+    el.removeAttribute("data-ico-on");
+    el.style.removeProperty("--ico-val");
+  });
+}
+
+function setThemeIcons(icons) {
+  clearThemeIcons();
+  for (const [slot, url] of Object.entries(icons || {})) {
+    const sel = THEME_ICON_SLOTS[slot];
+    if (!sel || !url) continue;
+    const el = document.querySelector(sel);
+    if (!el) continue;
+    el.style.setProperty("--ico-val", 'url("' + url + '")');
+    el.setAttribute("data-ico-on", "1");
+  }
+}
+
+function setThemeStyle(css) {
+  let el = document.getElementById("cocraft-theme");
+  if (!el) { el = document.createElement("style"); el.id = "cocraft-theme"; document.head.appendChild(el); }
+  el.textContent = css || "";
+}
+
+/** 主题自带背景：覆盖静态背景槽与 #live-bg 的兜底图（按底盘明/暗）。 */
+function _themeBgCss(bg) {
+  let css = "";
+  if (bg && bg.light) {
+    css += '#static-bg .sb[data-bg="hiru"]{background-image:url("' + bg.light + '");}\n';
+    css += 'html[data-theme="hiru"] #live-bg{background-image:url("' + bg.light + '");}\n';
+  }
+  if (bg && bg.dark) {
+    css += '#static-bg .sb[data-bg="yoru"]{background-image:url("' + bg.dark + '");}\n';
+    css += 'html[data-theme="yoru"] #live-bg{background-image:url("' + bg.dark + '");}\n';
+  }
+  return css;
+}
+
+function _themeCss(id, payload) {
+  const vars = Object.entries(payload.vars || {}).map(([k, v]) => k + ":" + v + ";").join("");
+  return 'html[data-theme-user="' + id + '"]{' + vars + '}\n'
+    + (payload.css || "") + "\n" + _themeBgCss(payload.background);
+}
+
+/** 清掉用户主题的注入（回到内置主题外观）。 */
+function clearUserTheme() {
+  delete document.documentElement.dataset.themeUser;
+  setThemeStyle("");
+  setThemeIcons({});
+  _userThemeModes = [];
+  _userThemeMode = "";
+  try {
+    localStorage.removeItem(THEME_USER_KEY);
+    localStorage.removeItem(THEME_USER_MODE_KEY);
+  } catch { /* ignore */ }
+}
+
+/** 应用内置主题（并清掉任何用户主题）。 */
+function applyTheme(theme) {
+  theme = theme === "yoru" ? "yoru" : "hiru";
+  clearUserTheme();
+  _setBaseTheme(theme);
+  _syncThemeButton();
+  syncThemesActive();
+}
+
+/** 应用一个用户主题（从后端取变量 / CSS / 图标 / 背景）；`mode` 指定明或暗。 */
+async function applyUserTheme(id, mode) {
+  const url = "/themes/get?id=" + encodeURIComponent(id)
+    + (mode ? ("&mode=" + encodeURIComponent(mode)) : "");
+  const r = await api(url);
+  if (!r || !r.ok) throw new Error((r && r.error) || "主题读取失败");
+  _userThemeModes = (Array.isArray(r.modes) && r.modes.length) ? r.modes : [r.mode];
+  _userThemeMode = r.mode;
+  _setBaseTheme(r.mode === "dark" ? "yoru" : "hiru");
+  document.documentElement.dataset.themeUser = id;
+  setThemeStyle(_themeCss(id, r));
+  setThemeIcons(r.icons);
+  try {
+    localStorage.setItem(THEME_USER_KEY, id);
+    localStorage.setItem(THEME_USER_MODE_KEY, r.mode);
+  } catch { /* ignore */ }
+  _syncThemeButton();
+  syncThemesActive();
+  return r;
+}
+
 function initTheme() {
-  let theme = "hiru";
-  try { theme = localStorage.getItem(THEME_KEY) || "hiru"; } catch { /* ignore */ }
-  applyTheme(theme);
-  $("btn-theme").addEventListener("click", () => {
+  let base = "hiru", user = "", umode = "";
+  try {
+    base = localStorage.getItem(THEME_KEY) || "hiru";
+    user = localStorage.getItem(THEME_USER_KEY) || "";
+    umode = localStorage.getItem(THEME_USER_MODE_KEY) || "";
+  } catch { /* ignore */ }
+  applyTheme(base);
+  const b = $("btn-theme");
+  if (b) b.addEventListener("click", () => {
+    const u = themeUser();
+    if (u) {
+      if (_userThemeModes.length > 1) {
+        applyUserTheme(u, _userThemeMode === "dark" ? "light" : "dark")
+          .catch((e) => setBanner("切换失败：" + ((e && e.message) ? e.message : e)));
+      } else {
+        setBanner("主题「" + u + "」只有一种明暗，不能切换（设置 →「主题工坊」可回内置）");
+      }
+      return;
+    }
     applyTheme(document.documentElement.dataset.theme === "yoru" ? "hiru" : "yoru");
+  });
+  if (user) applyUserTheme(user, umode).catch(() => { clearUserTheme(); _syncThemeButton(); });
+}
+
+/* ---------------- 主题工坊（浏览 / 安装 / 套用 / 卸载） ---------------- */
+
+const TH = { builtin: [], installed: [], active: "", official: "", tab: "installed",
+             remote: [], cand: [], offLoaded: false, offLoading: false, err: "" };
+
+function openThemes() {
+  const b = $("themes");
+  if (!b) return;
+  b.hidden = false;
+  const f = $("th-install");
+  if (f) f.hidden = true;
+  const imp = $("th-import");
+  if (imp) imp.textContent = "＋ 从 GitHub 安装…";
+  loadThemes();
+}
+
+function closeThemes() { const b = $("themes"); if (b) b.hidden = true; }
+
+function syncThemesActive() {
+  const b = $("themes");
+  if (b && !b.hidden) renderThemes();
+}
+
+async function loadThemes() {
+  const cur = $("th-cur");
+  if (cur) cur.textContent = "读取中…";
+  try {
+    const r = await api("/themes");
+    TH.builtin = (r && r.builtin) || [];
+    TH.installed = (r && r.installed) || [];
+    TH.active = (r && r.active) || "";
+    TH.official = (r && r.official) || "huaian307/cocraft-themes";
+    TH.err = "";
+  } catch (e) {
+    TH.err = (e && e.message) ? e.message : String(e);
+  }
+  renderThemes();
+}
+
+function _themeThumb(t, builtin) {
+  if (!builtin && t.hasPreview && t.preview) {
+    const u = "/themes/asset?id=" + encodeURIComponent(t.id) + "&path=" + encodeURIComponent(t.preview);
+    return '<img class="wp-thumb" src="' + esc(u) + '" alt="" loading="lazy">';
+  }
+  const dark = t.mode === "dark";
+  return '<div class="wp-thumb th-swatch ' + (dark ? "dark" : "light") + '">'
+    + (builtin ? "内置" : (dark ? "深色" : "浅色")) + "</div>";
+}
+
+function _themeCard(t, builtin) {
+  const user = themeUser();
+  const isCur = builtin ? (!user && document.documentElement.dataset.theme === t.id) : (user === t.id);
+  const modes = Array.isArray(t.modes) ? t.modes : [t.mode];
+  const modesLbl = modes.length > 1 ? "明/暗双模式" : (t.mode === "dark" ? "深色" : "浅色");
+  const meta = '<div class="wp-meta"><b>' + esc(t.name || t.id) + "</b>"
+    + "<i>" + esc(t.id) + " · " + esc(t.author || "匿名")
+    + (t.version ? " · " + esc(t.version) : "") + " · " + modesLbl
+    + (builtin ? " · 内置" : "") + "</i>"
+    + (t.description ? '<i class="th-desc">' + esc(t.description) + "</i>" : "")
+    + "</div>";
+  const acts = ['<button type="button" data-th-apply="' + esc(t.id) + '" class="' + (isCur ? "sel" : "") + '">'
+    + (isCur ? "当前" : "套用") + "</button>"];
+  if (!builtin) {
+    if (t.source) acts.push('<button type="button" data-th-update="' + esc(t.id) + '" title="按安装来源重装">更新</button>');
+    acts.push('<button type="button" class="si-del" data-th-del="' + esc(t.id) + '" title="卸载">删</button>');
+  }
+  return '<div class="wp-it' + (isCur ? " th-on" : "") + '">'
+    + _themeThumb(t, builtin) + meta + '<div class="wp-act">' + acts.join("") + "</div></div>";
+}
+
+function renderThemes() {
+  const list = $("th-list");
+  if (!list) return;
+  const cur = $("th-cur");
+  if (cur) {
+    const user = themeUser();
+    cur.textContent = TH.err ? ("读取失败：" + TH.err)
+      : (user ? ("当前：用户主题 " + user) : ("当前：内置 " + (TH.active || "hiru")));
+  }
+  const foot = $("th-foot");
+  if (foot) foot.textContent = "内置 " + TH.builtin.length + " · 已安装 " + TH.installed.length;
+  document.querySelectorAll("#themes .th-tab").forEach((el) => el.classList.toggle("on", el.dataset.tab === TH.tab));
+
+  if (TH.tab === "online") { renderThemesOnline(); return; }
+
+  const cards = [];
+  for (const t of TH.builtin) cards.push(_themeCard(t, true));
+  for (const t of TH.installed) cards.push(_themeCard(t, false));
+  list.innerHTML = cards.join("") || '<div class="muted skill-empty">没有主题</div>';
+}
+
+function renderThemesOnline() {
+  const list = $("th-list");
+  if (!list) return;
+  if (TH.offLoading) { list.innerHTML = '<div class="muted skill-empty">正在读取官方仓库…</div>'; return; }
+  if (!TH.remote.length) {
+    list.innerHTML = '<div class="muted skill-empty">没有加载到在线主题。点「＋ 从 GitHub 安装…」粘贴来源，'
+      + "或点「重新读取」再试官方仓库 <code>" + esc(TH.official || "") + "</code>。</div>";
+    return;
+  }
+  list.innerHTML = TH.remote.map((t) => {
+    const on = TH.installed.some((x) => x.id === t.id);
+    const img = t.previewUrl
+      ? '<img class="wp-thumb" src="' + esc(t.previewUrl) + '" alt="" loading="lazy">'
+      : '<div class="wp-thumb th-swatch ' + (t.mode === "dark" ? "dark" : "light") + '">'
+        + (t.mode === "dark" ? "深色" : "浅色") + "</div>";
+    const meta = '<div class="wp-meta"><b>' + esc(t.name || t.id) + "</b>"
+      + "<i>" + esc(t.id) + " · " + esc(t.author || "匿名") + (t.version ? " · " + esc(t.version) : "")
+      + (t.bytes ? " · " + Math.max(1, Math.round(t.bytes / 1024)) + " KB" : "") + "</i>"
+      + (t.description ? '<i class="th-desc">' + esc(t.description) + "</i>" : "")
+      + (on ? '<i class="th-installed">已安装</i>' : "") + "</div>";
+    return '<div class="wp-it">' + img + meta + '<div class="wp-act">'
+      + '<button type="button" data-th-install="' + esc(t.id) + '"' + (on ? ' data-force="1"' : "") + ">"
+      + (on ? "覆盖" : "安装") + "</button>"
+      + '<button type="button" data-th-apply="' + esc(t.id) + '"' + (on ? "" : " disabled") + ">套用</button>"
+      + "</div></div>";
+  }).join("");
+}
+
+async function ensureOfficial() {
+  if (TH.offLoaded) { renderThemes(); return; }
+  TH.offLoading = true;
+  renderThemes();
+  try {
+    const r = await api("/themes/preview", { method: "POST",
+      body: JSON.stringify({ source: TH.official || "huaian307/cocraft-themes" }) });
+    TH.remote = (r && r.themes) || [];
+    TH.offLoaded = true;
+    TH.err = "";
+  } catch (e) {
+    TH.remote = [];
+    TH.err = (e && e.message) ? e.message : String(e);
+  } finally {
+    TH.offLoading = false;
+    renderThemes();
+  }
+}
+
+async function themesPreview() {
+  const src = (($("th-src") && $("th-src").value) || "").trim();
+  const msg = $("th-msg"), list = $("th-list2"), go = $("th-go");
+  if (!src) { if (msg) msg.textContent = "请输入 owner/repo 或链接"; return; }
+  if (msg) msg.textContent = "读取中…（拉取主题列表，仓库大时稍等）";
+  if (go) go.disabled = true;
+  if (list) list.innerHTML = "";
+  TH.cand = [];
+  try {
+    const r = await api("/themes/preview", { method: "POST", body: JSON.stringify({ source: src }) });
+    TH.cand = (r && r.themes) || [];
+    if (!TH.cand.length) { if (msg) msg.textContent = "没找到主题（要有 theme.json；来源对吗？）"; return; }
+    if (msg) msg.textContent = "找到 " + TH.cand.length + " 个主题，勾选后安装";
+    if (list) list.innerHTML = TH.cand.map((t, i) =>
+      '<label class="si-item"><input type="checkbox" data-i="' + i + '" checked>'
+      + '<span class="si-name">' + esc(t.name || t.id) + '<span class="si-id">' + esc(t.id) + "</span></span>"
+      + '<span class="si-meta">' + (t.files || 0) + " 文件 · "
+      + Math.max(1, Math.round((t.bytes || 0) / 1024)) + " KB</span></label>").join("");
+    if (go) go.disabled = false;
+  } catch (e) {
+    if (msg) msg.textContent = "读取失败：" + ((e && e.message) ? e.message : e);
+    if (list) list.innerHTML = "";
+  }
+}
+
+async function themesInstallIds(ids, force) {
+  if (!ids.length) return;
+  const src = (($("th-src") && $("th-src").value) || "").trim();
+  const msg = $("th-msg");
+  if (msg) msg.textContent = "安装中…";
+  try {
+    const r = await api("/themes/install", { method: "POST",
+      body: JSON.stringify({ source: src, ids, force: !!force }) });
+    const ok = (r.installed || []).length;
+    const er = (r.errors || []).length;
+    if (msg) msg.textContent = "已安装 " + ok + (er ? "，失败 " + er : "");
+    if (er) setBanner("主题安装失败：" + (r.errors || []).map((x) => x.id).join("、"));
+    else setBanner("已安装主题：" + ok + " 个");
+    await loadThemes();
+    TH.tab = "installed";
+    renderThemes();
+  } catch (e) {
+    if (msg) msg.textContent = "安装失败：" + ((e && e.message) ? e.message : e);
+    setBanner("主题安装失败：" + ((e && e.message) ? e.message : e));
+  }
+}
+
+async function themesApply(id) {
+  const builtin = TH.builtin.some((t) => t.id === id);
+  try {
+    if (builtin) applyTheme(id);
+    else await applyUserTheme(id);
+    api("/themes/apply", { method: "POST", body: JSON.stringify({ id }) }).catch(() => {});
+    setBanner("已套用主题：" + id);
+    renderThemes();
+  } catch (e) {
+    setBanner("套用失败：" + ((e && e.message) ? e.message : e));
+  }
+}
+
+async function themesDelete(id) {
+  if (!window.confirm("卸载主题「" + id + "」？会从磁盘删除，不可恢复。")) return;
+  try {
+    await api("/themes/uninstall", { method: "POST", body: JSON.stringify({ id }) });
+    if (themeUser() === id) applyTheme(document.documentElement.dataset.theme);
+    await loadThemes();
+    setBanner("已卸载主题：" + id);
+  } catch (e) {
+    setBanner("卸载失败：" + ((e && e.message) ? e.message : e));
+  }
+}
+
+async function themesUpdate(id) {
+  try {
+    const r = await api("/themes/update", { method: "POST", body: JSON.stringify({ id }) });
+    if ((r.errors || []).length) setBanner("更新失败：" + r.errors[0].error);
+    else setBanner("已更新主题：" + id);
+    if (themeUser() === id) await applyUserTheme(id);
+    await loadThemes();
+  } catch (e) {
+    setBanner("更新失败：" + ((e && e.message) ? e.message : e));
+  }
+}
+
+function initThemes() {
+  const open = $("cfg-themes");
+  if (open) open.addEventListener("click", () => {
+    const c = $("cfg"); if (c) c.hidden = true;
+    openThemes();
+  });
+  const x = $("th-close"); if (x) x.addEventListener("click", closeThemes);
+  const rl = $("th-reload"); if (rl) rl.addEventListener("click", () => {
+    TH.offLoaded = false;
+    if (TH.tab === "online") ensureOfficial(); else loadThemes();
+  });
+  const rst = $("th-reset");
+  if (rst) rst.addEventListener("click", () => {
+    applyTheme(document.documentElement.dataset.theme === "yoru" ? "yoru" : "hiru");
+    setBanner("已恢复内置主题");
+    renderThemes();
+  });
+  const imp = $("th-import");
+  if (imp) imp.addEventListener("click", () => {
+    const f = $("th-install");
+    if (!f) return;
+    f.hidden = !f.hidden;
+    imp.textContent = f.hidden ? "＋ 从 GitHub 安装…" : "收起安装";
+  });
+  const pv = $("th-preview"); if (pv) pv.addEventListener("click", themesPreview);
+  const srcIn = $("th-src");
+  if (srcIn) srcIn.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); themesPreview(); } });
+  const go = $("th-go");
+  if (go) go.addEventListener("click", () => {
+    const ids = [...document.querySelectorAll("#th-list2 input[type=checkbox]")]
+      .filter((c) => c.checked).map((c) => (TH.cand[+c.dataset.i] || {}).id).filter(Boolean);
+    const msg = $("th-msg");
+    if (!ids.length) { if (msg) msg.textContent = "先勾选要安装的主题"; return; }
+    themesInstallIds(ids, !!($("th-force") && $("th-force").checked));
+  });
+  document.querySelectorAll("#themes .th-tab").forEach((el) => el.addEventListener("click", () => {
+    TH.tab = el.dataset.tab;
+    if (TH.tab === "online") ensureOfficial(); else renderThemes();
+  }));
+  const box = $("themes");
+  if (box) box.addEventListener("click", (e) => {
+    if (e.target === box) { closeThemes(); return; }
+    const a = e.target.closest("[data-th-apply]");
+    if (a) { themesApply(a.dataset.thApply); return; }
+    const ins = e.target.closest("[data-th-install]");
+    if (ins) { themesInstallIds([ins.dataset.thInstall], ins.dataset.force === "1"); return; }
+    const del = e.target.closest("[data-th-del]");
+    if (del) { themesDelete(del.dataset.thDel); return; }
+    const upd = e.target.closest("[data-th-update]");
+    if (upd) { themesUpdate(upd.dataset.thUpdate); return; }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && $("themes") && !$("themes").hidden) closeThemes();
   });
 }
 
@@ -3892,6 +4506,271 @@ async function ensureSessionMode(sid) {
   } catch { /* 设不上就算了，不拦着用 */ }
 }
 
+/* ---------------- 技能 / 斜杠命令 ----------------
+ * 面板统一接口（两个引擎都实现，见 backend/engines/base.py）：
+ *   GET  /api/skill?directory=                     技能列表（不带正文）
+ *   GET  /api/skill/{id}                           技能详情（含正文，备用）
+ *   GET  /api/command?directory=                   斜杠命令
+ *   POST /api/session/{id}/skill {id, resume?}     装填（默认不立刻跑）/ resume=true 立刻跑
+ *   POST /api/session/{id}/command {name, text?}   执行命令
+ * ⚠ ACP 的技能是**面板自己扫文件系统**发现的（协议没有 skill）；OpenCode 用它的 /api/skill。
+ */
+
+const SKILL = { list: [], cmds: [], loading: false, err: "" };
+
+function skillDir() { return currentDir() || ""; }
+
+function skillSourceLabel(src) {
+  return ({
+    "~/.config/opencode": "全局", "~/.claude": "全局·claude", "~/.agents": "全局·agents",
+    "~/.codex": "全局·codex", ".codex": "项目·codex",
+    ".opencode": "项目", ".claude": "项目·claude", ".agents": "项目·agents",
+    builtin: "内置", opencode: "opencode",
+  })[src] || src || "";
+}
+
+function openSkills() {
+  const b = $("skill");
+  if (!b) return;
+  b.hidden = false;
+  // 每次打开回到「列表」视图
+  const main = $("skill-main"), inst = $("skill-install"), imp = $("skill-import");
+  if (main) main.hidden = false;
+  if (inst) inst.hidden = true;
+  if (imp) imp.textContent = "＋ 安装技能";
+  renderSkills();
+  loadSkills();
+}
+
+function closeSkills() { const b = $("skill"); if (b) b.hidden = true; }
+
+function renderSkills() {
+  const cur = $("skill-cur");
+  const sl = $("skill-list");
+  const cl = $("cmd-list");
+  if (!sl || !cl) return;
+  const dir = skillDir();
+  const hasSession = !!state.current;
+  if (cur) {
+    cur.textContent = SKILL.err
+      ? ("读取失败：" + SKILL.err)
+      : `${dir ? dir : "（无工作目录，只列全局）"}${hasSession ? "" : " · 未选会话"}`;
+  }
+
+  if (!SKILL.list.length) {
+    sl.innerHTML = `<div class="muted skill-empty">`
+      + `${SKILL.loading ? "读取中…" : "没有发现技能（放一个 <code>.opencode/skills/&lt;id&gt;/SKILL.md</code>）"}</div>`;
+  } else {
+    sl.innerHTML = SKILL.list.map((s) => {
+      const tip = [s.name || s.id, s.id, s.description, s.path].filter(Boolean).join("\n");
+      const p = s.path || "";
+      const onDisk = p && !/^\/builtin\//i.test(p);   // 内置技能不是磁盘文件，不能更新/删
+      return `<div class="skill-item" title="${esc(tip)}">`
+        + `<b class="si-name">${esc(s.name || s.id)}</b>`
+        + (s.source ? `<span class="si-src">${esc(skillSourceLabel(s.source))}</span>` : "")
+        + `<span class="si-act">`
+        + `<button type="button" data-skill-load="${esc(s.id)}"${hasSession ? "" : " disabled"}>装填</button>`
+        + `<button type="button" class="si-run" data-skill-run="${esc(s.id)}"${hasSession ? "" : " disabled"} title="装填并立刻跑一轮">▶</button>`
+        + (onDisk ? `<button type="button" class="si-upd" data-skill-update="${esc(p)}" title="按安装来源重新下载覆盖">更新</button>`
+          + `<button type="button" class="si-del" data-skill-remove="${esc(p)}" title="从磁盘删除这个技能">删</button>` : "")
+        + `</span></div>`;
+    }).join("");
+  }
+
+  if (!SKILL.cmds.length) {
+    cl.innerHTML = `<div class="muted skill-empty">`
+      + `${SKILL.loading ? "读取中…" : "没有斜杠命令（ACP 一般要跑过一轮才拿得到）"}</div>`;
+  } else {
+    cl.innerHTML = SKILL.cmds.map((c) => {
+      const tip = [c.name, c.description].filter(Boolean).join("\n");
+      return `<div class="skill-item" title="${esc(tip)}">`
+        + `<b class="si-name">/${esc(c.name)}</b>`
+        + `<span class="si-act"><button type="button" data-cmd-run="${esc(c.name)}"${hasSession ? "" : " disabled"}>执行</button></span>`
+        + `</div>`;
+    }).join("");
+  }
+}
+
+async function loadSkills() {
+  SKILL.loading = true;
+  SKILL.err = "";
+  renderSkills();
+  const dir = skillDir();
+  const q = dir ? ("?directory=" + encodeURIComponent(dir)) : "";
+  try {
+    const [sk, cm] = await Promise.all([
+      api("/api/skill" + q).then((r) => (r && (r.data || unwrap(r))) || []).catch((e) => { SKILL.err = e.message; return []; }),
+      api("/api/command" + q).then((r) => (r && (r.data || unwrap(r))) || []).catch(() => []),
+    ]);
+    SKILL.list = sk || [];
+    SKILL.cmds = cm || [];
+  } finally {
+    SKILL.loading = false;
+    renderSkills();
+  }
+}
+
+async function useSkill(id, resume) {
+  if (!state.current) { setBanner("先选中一个会话：技能要装填进会话里"); return; }
+  try {
+    await api(`/api/session/${encodeURIComponent(state.current.id)}/skill`,
+      { method: "POST", body: JSON.stringify({ id, resume: !!resume }) });
+    setBanner(resume ? `已激活并运行技能：${id}` : `已装填技能「${id}」：下一条消息会带上它`);
+    closeSkills();
+    await refreshMessages();
+  } catch (e) {
+    setBanner("技能失败：" + (e && e.message ? e.message : e));
+    if ($("skill-cur")) $("skill-cur").textContent = "技能失败：" + (e && e.message ? e.message : e);
+  }
+}
+
+async function runSlash(name) {
+  if (!state.current) { setBanner("先选中一个会话"); return; }
+  try {
+    await api(`/api/session/${encodeURIComponent(state.current.id)}/command`,
+      { method: "POST", body: JSON.stringify({ name, text: "" }) });
+    setBanner(`已执行命令：/${name}`);
+    closeSkills();
+    await refreshMessages();
+  } catch (e) {
+    setBanner("命令失败：" + (e && e.message ? e.message : e));
+    if ($("skill-cur")) $("skill-cur").textContent = "命令失败：" + (e && e.message ? e.message : e);
+  }
+}
+
+/* 技能安装（通用 GitHub / URL）—— 引擎无关，写进跨工具的技能目录 */
+let SKILL_CAND = [];
+
+function siToggle() {
+  const main = $("skill-main"), inst = $("skill-install"), btn = $("skill-import");
+  if (!main || !inst) return;
+  const opening = inst.hidden;
+  inst.hidden = !opening;
+  main.hidden = opening;
+  if (btn) btn.textContent = opening ? "← 返回列表" : "＋ 安装技能";
+}
+
+async function siPreview() {
+  const src = ($("si-src") && $("si-src").value || "").trim();
+  const msg = $("si-msg"), list = $("si-list"), go = $("si-go");
+  if (!src) { if (msg) msg.textContent = "请输入 owner/repo 或链接"; return; }
+  if (msg) msg.textContent = "读取中…（拉取技能列表，仓库大时稍等）";
+  if (go) go.disabled = true;
+  if (list) list.innerHTML = "";
+  SKILL_CAND = [];
+  try {
+    const r = await api("/skills/preview", { method: "POST", body: JSON.stringify({ source: src }) });
+    SKILL_CAND = (r && r.skills) || [];
+    if (!SKILL_CAND.length) { if (msg) msg.textContent = "没找到 SKILL.md（来源对吗？）"; return; }
+    if (msg) msg.textContent = `${r.label || src} · 找到 ${SKILL_CAND.length} 个技能，勾选后安装`;
+    if (list) list.innerHTML = SKILL_CAND.map((s, i) =>
+      `<label class="si-item"><input type="checkbox" data-i="${i}" checked>`
+      + `<span class="si-name">${esc(s.name || s.id)}<span class="si-id">${esc(s.id)}</span></span>`
+      + `<span class="si-meta">${s.files} 文件 · ${Math.max(1, Math.round((s.bytes || 0) / 1024))} KB</span></label>`).join("");
+    if (go) go.disabled = false;
+  } catch (e) {
+    if (msg) msg.textContent = "读取失败：" + (e && e.message ? e.message : e);
+  }
+}
+
+async function siGo() {
+  const src = ($("si-src") && $("si-src").value || "").trim();
+  const msg = $("si-msg"), go = $("si-go");
+  const ids = [...document.querySelectorAll("#si-list input[type=checkbox]")]
+    .filter((c) => c.checked).map((c) => (SKILL_CAND[+c.dataset.i] || {}).id).filter(Boolean);
+  if (!ids.length) { if (msg) msg.textContent = "先勾选要装的技能"; return; }
+  const body = {
+    source: src, ids,
+    target: ($("si-target") && $("si-target").value) || "global-agents",
+    force: !!($("si-force") && $("si-force").checked),
+    directory: skillDir(),
+  };
+  if (go) go.disabled = true;
+  if (msg) msg.textContent = "安装中…";
+  try {
+    const r = await api("/skills/install", { method: "POST", body: JSON.stringify(body) });
+    const ok = (r.installed || []).length;
+    const sk = (r.skipped || []).length;
+    const er = (r.errors || []).length;
+    if (msg) msg.textContent = `装好 ${ok} 个${sk ? "，跳过 " + sk : ""}${er ? "，失败 " + er : ""} → ${r.root || ""}`;
+    setBanner(`技能安装完成：成功 ${ok}${sk ? " / 跳过 " + sk : ""}${er ? " / 失败 " + er : ""}`);
+    await loadSkills();     // 刷新列表（返回时能看到新技能）
+    if (go) go.disabled = false;
+  } catch (e) {
+    if (msg) msg.textContent = "安装失败：" + (e && e.message ? e.message : e);
+    if (go) go.disabled = false;
+  }
+}
+
+/** 更新技能：按安装时记下的来源重新下载覆盖。 */
+async function updateSkill(path) {
+  if (!path) return;
+  setBanner("正在更新技能…");
+  try {
+    const r = await api("/skills/update", { method: "POST",
+      body: JSON.stringify({ path, directory: skillDir() }) });
+    setBanner(`技能已更新：${((r && r.installed) || []).map((x) => x.id).join("、") || path}`);
+    await loadSkills();
+  } catch (e) {
+    setBanner("更新失败：" + (e && e.message ? e.message : e));
+  }
+}
+
+/** 卸载技能：从磁盘删掉它的目录（二次确认）。 */
+async function removeSkill(path) {
+  if (!path) return;
+  const parts = String(path).replace(/[\\/]+$/, "").split(/[\\/]/);
+  let name = parts.pop() || path;
+  if (/^skill\.(md|markdown)$/i.test(name) && parts.length) name = parts.pop();   // path 指向 SKILL.md → 用目录名
+  if (!window.confirm(`卸载技能「${name}」？会从磁盘删除，不可恢复。`)) return;
+  try {
+    const r = await api("/skills/uninstall", { method: "POST",
+      body: JSON.stringify({ path, directory: skillDir() }) });
+    setBanner(`已卸载技能：${(r && r.id) || name}`);
+    await loadSkills();
+  } catch (e) {
+    setBanner("卸载失败：" + (e && e.message ? e.message : e));
+  }
+}
+
+function initSkillPicker() {
+  const b = $("btn-skill");
+  if (b) b.addEventListener("click", () => ($("skill").hidden ? openSkills() : closeSkills()));
+  const x = $("skill-close");
+  if (x) x.addEventListener("click", closeSkills);
+  const rl = $("skill-reload");
+  if (rl) rl.addEventListener("click", loadSkills);
+  const imp = $("skill-import");
+  if (imp) imp.addEventListener("click", siToggle);
+  const pv = $("si-preview");
+  if (pv) pv.addEventListener("click", siPreview);
+  const go = $("si-go");
+  if (go) go.addEventListener("click", siGo);
+  const srcIn = $("si-src");
+  if (srcIn) srcIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); siPreview(); }
+  });
+  const box = $("skill");
+  if (box) {
+    box.addEventListener("click", (e) => {
+      if (e.target === box) { closeSkills(); return; }
+      const load = e.target.closest("[data-skill-load]");
+      if (load) { useSkill(load.dataset.skillLoad, false); return; }
+      const run = e.target.closest("[data-skill-run]");
+      if (run) { useSkill(run.dataset.skillRun, true); return; }
+      const upd = e.target.closest("[data-skill-update]");
+      if (upd) { updateSkill(upd.dataset.skillUpdate); return; }
+      const rem = e.target.closest("[data-skill-remove]");
+      if (rem) { removeSkill(rem.dataset.skillRemove); return; }
+      const cmd = e.target.closest("[data-cmd-run]");
+      if (cmd) { runSlash(cmd.dataset.cmdRun); return; }
+    });
+  }
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && $("skill") && !$("skill").hidden) closeSkills();
+  });
+}
+
 /* ---------------- 从 agent 导入会话（ACP 的 session/list）----------------
  * 背景：ACP 引擎的面板会话列表 = **我们自己的索引**（`_acp_sessions.json`），
  * 所以用 `opencode-acp` 接进 OpenCode 时，OpenCode 那边**早就有的会话看不到**
@@ -4656,17 +5535,25 @@ function initSettings() {
     renderModes();
   });
   $("btn-import").addEventListener("click", openImport);
-  // 新会话：先弹「选择工作目录」
+  // 新会话：选项目 / 新建项目 / 选工作目录
   $("ns-close").addEventListener("click", closeNewSession);
   $("ns-cancel").addEventListener("click", closeNewSession);
   $("ns-pick").addEventListener("click", pickNewSessionDir);
   $("ns-clear").addEventListener("click", () => {
     $("ns-dir").value = ""; $("ns-note").textContent = "已清空 → 用引擎默认目录";
+    renderNewSessionProjects();
   });
+  $("ns-newbase-pick").addEventListener("click", pickNewProjectBase);
+  $("ns-newname-create").addEventListener("click", createProjectDir);
+  $("ns-dir").addEventListener("input", renderNewSessionProjects);
   $("ns-create").addEventListener("click", doCreateSession);
   $("newsess").addEventListener("click", (e) => { if (e.target === $("newsess")) closeNewSession(); });
   ["ns-dir", "ns-title"].forEach((id) => $(id).addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); doCreateSession(); }
+    if (e.key === "Escape") { e.preventDefault(); closeNewSession(); }
+  }));
+  ["ns-newbase", "ns-newname"].forEach((id) => $(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); createProjectDir(); }
     if (e.key === "Escape") { e.preventDefault(); closeNewSession(); }
   }));
   $("imp-close").addEventListener("click", closeImport);
@@ -5620,7 +6507,7 @@ function initMusicAudio() {
  * 清单来自 GET /api/model（{location,data:[...]}）；variants[] 也一并做成可点的变体按钮。
  * ⚠ 切模型后 GET /api/session/{id} 的 model 会更新，但"列表"更可靠（详情也是 {data:...} 包着的）。 */
 
-const MODEL = { list: null, loading: false };
+const MODEL = { list: null, loading: false, pending: null };
 const MODEL_KEY = "cocraft.model";
 
 /* 模型官方图标（本地素材，由 tools/fetch_model_icons.py 下载；OpenCode 接口本身没有图标字段）。
@@ -5700,6 +6587,20 @@ async function resolveDefaultModel() {
   return ref;
 }
 
+/** 把模型 ref 写进会话并同步本地状态（顶栏按钮/列表）；返回落地后的 ref，失败返回 null。 */
+async function writeSessionModel(sid, ref) {
+  try {
+    await api(`/api/session/${encodeURIComponent(sid)}/model`,
+      { method: "POST", body: JSON.stringify({ model: { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" } }) });
+  } catch { return null; }
+  const m = { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" };
+  if (state.current && state.current.id === sid) state.current.model = m;
+  const s = state.sessions.find((x) => x.id === sid);
+  if (s) s.model = m;
+  updateModelBtn();
+  return m;
+}
+
 /**
  * 确保某个会话已绑定**可用**的模型：没有就补默认；已绑但**已下架**也换成默认。
  * send() 之前调用，避免「没模型 / 模型失效 → 发出去空转、没有任何回答」。
@@ -5711,20 +6612,49 @@ async function ensureSessionModel(sid) {
   if (cur && cur.id) {
     if (!MODEL.list || !MODEL.list.length) { try { await loadModels(); } catch { /* ignore */ } }
     if (modelAvailable(cur)) return cur;   // 已有且仍在清单里 → 不动
-    // 模型已下架：落到下面重新解析默认并写回（否则发出去只会空转）
+    // ★ 跨引擎残留（如 providerID=acp、id=deepseek/deepseek-flash）：能归一就就地改写，不换模型
+    const norm = normalizeModelRef(cur);
+    if (norm) {
+      const fixed = await writeSessionModel(sid, norm);
+      if (fixed) return fixed;
+    }
+    // 真下架：落到下面重新解析默认并写回（否则发出去只会空转）
   }
   const ref = await resolveDefaultModel();
   if (!ref) return null;
-  try {
-    await api(`/api/session/${encodeURIComponent(sid)}/model`,
-      { method: "POST", body: JSON.stringify({ model: ref }) });
-    const m = { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" };
-    if (state.current && state.current.id === sid) state.current.model = m;
-    const s = state.sessions.find((x) => x.id === sid);
-    if (s) s.model = m;
-    updateModelBtn();
-    return m;
-  } catch { return null; }
+  return await writeSessionModel(sid, ref);
+}
+
+/**
+ * ★把「跨引擎残留」的模型引用归一成本引擎能识别的一项。
+ *   场景：会话在 ACP 引擎下建立时，模型 id 可能长成 `provider/model`、providerID 兜底成 `acp`；
+ *   切到 opencode 引擎后，这个引用会被解析成 `acp/deepseek/...` → `ModelUnavailableError`
+ *   → 那一轮 **17 毫秒就 idle=failed、界面上没有任何提示**。
+ *   这里按「本引擎模型清单里真实存在的项」重写 providerID/id（同一个模型，只是把 provider 修对）。
+ *   清单还没加载时返回原值（不确定，不做误判）；确实匹配不到返回 null（= 真下架了）。
+ */
+function normalizeModelRef(ref) {
+  if (!ref || !ref.id) return ref || null;
+  const list = MODEL.list;
+  if (!list || !list.length) return ref;              // 清单没加载 → 原样返回（避免误杀）
+  const pick = (m) => ({ id: m.id, providerID: m.providerID, variant: ref.variant });
+  // ① 精确命中（本引擎里就有这一项）
+  let hit = list.find((m) => m.id === ref.id && m.providerID === ref.providerID);
+  if (hit) return pick(hit);
+  // ② id 形如 `<provider>/<model>`（ACP 形态）
+  const slash = ref.id.indexOf("/");
+  if (slash > 0) {
+    const prov = ref.id.slice(0, slash), mid = ref.id.slice(slash + 1);
+    hit = list.find((m) => m.id === mid && m.providerID === prov);
+    if (hit) return pick(hit);
+    // ④ id 带前缀、本引擎的 id 是最后一段
+    hit = list.find((m) => m.id === ref.id.slice(ref.id.lastIndexOf("/") + 1));
+    if (hit) return pick(hit);
+  }
+  // ③ providerID 兜底成了中性值（如 "acp"），但 id 本身是对的
+  hit = list.find((m) => m.id === ref.id);
+  if (hit) return pick(hit);
+  return null;
 }
 
 /** 模型 ref 是否仍在当前清单里；清单还没加载时不做判断（避免误杀）。 */
@@ -5733,6 +6663,20 @@ function modelAvailable(ref) {
   const list = MODEL.list;
   if (!list || !list.length) return true;
   return list.some((m) => m.id === ref.id && m.providerID === ref.providerID);
+}
+
+/** 后端可能因「模型不可用」自动换过模型 → 把这个会话的最新模型同步到顶栏按钮。 */
+async function refreshCurrentModel() {
+  if (!state.current) return;
+  try {
+    const s = unwrap(await api(`/api/session/${encodeURIComponent(state.current.id)}`));
+    if (s && s.id && s.model) {
+      state.current.model = s.model;
+      const hit = state.sessions.find((x) => x.id === s.id);
+      if (hit) hit.model = s.model;
+      updateModelBtn();
+    }
+  } catch { /* ignore */ }
 }
 
 /**
@@ -5745,23 +6689,27 @@ async function repairStaleModel(sess) {
   if (!MODEL.list || !MODEL.list.length) { try { await loadModels(); } catch { /* ignore */ } }
   if (modelAvailable(sess.model)) return false;
   const oldText = modelText(sess.model);
+  // ★ 跨引擎残留：能归一就就地改写引用（同一个模型），别误当成"下架"去换默认
+  const norm = normalizeModelRef(sess.model);
+  if (norm) {
+    const fixed = await writeSessionModel(sess.id, norm);
+    if (fixed) {
+      setBanner(`已修正这个会话的模型引用：${oldText} → ${modelText(fixed)}`);
+      return true;
+    }
+    setBanner(`这个会话的模型引用 ${oldText} 无法修正；请点「模型」另选一个`);
+    return false;
+  }
   const ref = await resolveDefaultModel();
   if (!ref) {
     setBanner(`这个会话绑的模型 ${oldText} 已不可用；请点「模型」另选一个（当前没有可用模型）`);
     return false;
   }
-  try {
-    await api(`/api/session/${encodeURIComponent(sess.id)}/model`,
-      { method: "POST", body: JSON.stringify({ model: ref }) });
-  } catch {
+  const m = await writeSessionModel(sess.id, ref);
+  if (!m) {
     setBanner(`这个会话绑的模型 ${oldText} 已不可用，自动切换失败；请点「模型」另选一个`);
     return false;
   }
-  const m = { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" };
-  if (state.current && state.current.id === sess.id) state.current.model = m;
-  const hit = state.sessions.find((x) => x.id === sess.id);
-  if (hit) hit.model = m;
-  updateModelBtn();
   setBanner(`这个会话原来的模型 ${oldText} 已下架，已自动切到 ${modelText(m)}（可在「模型」里改）`);
   return true;
 }
@@ -5788,12 +6736,18 @@ function updateModelBtn() {
 }
 
 async function loadModels() {
-  if (MODEL.loading) return MODEL.list || [];
+  // ★ 并发调用共享同一次请求的结果：以前并发时会直接返回 MODEL.list（可能还是空 []），
+  //   调用方据此误判"模型清单为空 → 模型一定可用" → 跨引擎残留的引用没被归一 → 发出即失败。
+  if (MODEL.pending) return MODEL.pending;
   MODEL.loading = true;
-  try { MODEL.list = unwrap(await api("/api/model")) || []; }
-  catch { MODEL.list = MODEL.list || []; }
-  finally { MODEL.loading = false; }
-  return MODEL.list;
+  MODEL.pending = (async () => {
+    try { MODEL.list = unwrap(await api("/api/model")) || []; }
+    catch { MODEL.list = MODEL.list || []; }
+    MODEL.loading = false;
+    MODEL.pending = null;
+    return MODEL.list;
+  })();
+  return MODEL.pending;
 }
 
 /** 按 provider 分组渲染；标出当前；带 variants 的给一排变体小按钮 */
@@ -7203,6 +8157,7 @@ async function updApply() {
   setBanner("正在下载并静默更新，安装完成后面板会自动重启…");
   try {
     const r = await api("/update/apply", { method: "POST" });
+    if (apply) apply.textContent = "更新中…（装完自动重启）";
     setBanner((r && r.message) || "已开始更新…");
   } catch (err) {
     UPD.busy = false;
@@ -7217,12 +8172,31 @@ function initUpdate() {
   if (apply) apply.addEventListener("click", updApply);
   // 后台自动查一次（不打扰）；有新版就只在横幅提示，去设置里点更新
   setTimeout(() => {
+    updReportStatus();                     // 先报告"上一次更新"的结果（如有）
     updCheck(false).then((d) => {
       if (d && d.hasUpdate && d.latest) {
         setBanner("软件有新版本 v" + d.latest + "：设置 →「软件更新」可一键更新");
       }
     }).catch(() => {});
   }, 5000);
+}
+
+/** 报告"上一次更新"的结果：安装器是独立进程，装完/失败我们只能靠状态文件知道（读完就清）。 */
+async function updReportStatus() {
+  try {
+    const r = await api("/update/status");
+    const d = (r && r.data) || {};
+    const phase = d.phase;
+    if (!phase) return;
+    if (phase === "done") {
+      setBanner("已更新到 v" + (d.version || "?") + (d.fromVersion ? "（原 v" + d.fromVersion + "）" : ""));
+    } else if (phase === "failed") {
+      setBanner("上次更新失败：" + (d.error || "未知原因") + "（可在「设置 → 软件更新」重试）");
+    } else {
+      setBanner("上次更新似乎未完成（" + phase + "）：" + (d.error || "可能被中断") + "；可到「设置 → 软件更新」重试");
+    }
+    await api("/update/ack", { method: "POST" });
+  } catch { /* ignore */ }
 }
 
 (async function boot() {
@@ -7264,6 +8238,8 @@ function initUpdate() {
   loadAppearance().then(() => refreshAppearanceArt());
   initModelPicker();
   initAsk();
+  initSkillPicker();
+  initThemes();
   pollAsks();
   loadModels().then(updateModelBtn);      // 预取模型清单：顶栏按钮才能立刻显示官方图标
   loadModes();                            // 预取模式清单（opencode 的 build/plan…；ACP 的要等会话）

@@ -43,6 +43,45 @@ def resolve(root: str, path: str):
     return r, t
 
 
+_BAD_NAME_CHARS = set('\\/:*?"<>|')
+
+
+def make_project(base: str, name: str) -> dict:
+    """在 `base` 下创建一个**真实、长期存在**的项目目录。
+
+    新会话的「新建项目」用它（不是写运行态/缓存，而是在磁盘上真建一个可复用的目录）。
+    安全：`base` 必须是已存在的目录，`name` 必须是**单个**安全路径段（不能有分隔符 / `..` /
+    Windows 非法字符），拼出来的目标父目录必须仍是 `base`（`realpath` 前缀校验防越界）。
+    已存在且是目录 → 幂等返回（`existed=True`）；同名是文件 → 报错。
+    """
+    if not base or not os.path.isdir(base):
+        raise ValueError("项目位置不存在：%s" % (base or "(空)"))
+    b = _real(base)
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("项目名不能为空")
+    if nm in (".", "..") or any(c in _BAD_NAME_CHARS for c in nm) \
+            or any(ord(c) < 32 for c in nm):
+        raise ValueError('项目名不能包含 \\ / : * ? " < > | 等字符')
+    nm = nm.rstrip(" .")                       # Windows 不允许以空格 / 点结尾
+    if not nm:
+        raise ValueError("项目名不合法")
+    if len(nm) > 80:
+        raise ValueError("项目名太长（>80）")
+    target = os.path.join(b, nm)
+    if _real(os.path.dirname(target)) != b:    # 双保险：拼出来必须还在 base 下
+        raise ValueError("越界")
+    if os.path.exists(target):
+        if not os.path.isdir(target):
+            raise ValueError("同名文件已存在：%s" % target)
+        return {"ok": True, "path": target, "existed": True}
+    try:
+        os.makedirs(target)
+    except OSError as exc:
+        raise ValueError("创建目录失败：%s" % exc)
+    return {"ok": True, "path": target, "existed": False}
+
+
 def list_dir(root: str, path: str) -> dict:
     r, t = resolve(root, path)
     if not os.path.isdir(t):

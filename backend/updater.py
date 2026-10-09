@@ -10,6 +10,8 @@ r"""软件更新：查 GitHub Releases 最新版 + 一键静默更新（装完�
 * `apply()` 下载安装包到临时目录，再用一个**独立（脱离本进程）的隐藏 PowerShell** 去
   静默运行安装器（`/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS`），**装完自动重启面板**。
   之所以要"独立进程"：安装器会先按端口/路径**杀掉我们自己的进程**，压在面板进程里做重启就来不及。
+* **下载走镜像**：release 资产会 302 到 GitHub 下载 CDN（国内常 `WinError 10060` 连不上）——
+  依次尝试 环境变量 `COCRAFT_UPDATE_DOWNLOAD`（模板 `{url}` 或前缀）> 镜像（ghfast.top / gh-proxy.com / ghproxy.net）> 直连。
 
 安全：只从**配置的仓库**的 latest release 下载（客户端传的 URL 一律不信）；可用环境变量
 `COCRAFT_UPDATE_API`（或旧的 `OPENCODE_UI_UPDATE_API`）换成别的 API，`COCRAFT_VERSION` /
@@ -18,6 +20,7 @@ r"""软件更新：查 GitHub Releases 最新版 + 一键静默更新（装完�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -51,6 +54,86 @@ CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 
 _cache = {"t": 0.0, "data": None}
+
+# 下载走镜像：release 资产的 `browser_download_url` 会 302 到 GitHub 的下载 CDN
+# （objects.githubusercontent.com / release-assets.githubusercontent.com），国内经常**连不上**
+# （实测直连 `WinError 10060` 超时）。项目里技能安装早就用这些代理（ghfast.top ~1s）。
+# 顺序：环境变量覆盖 > 镜像 > 直连（直连放最后当兜底，海外用户仍可用）。
+DOWNLOAD_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://ghproxy.net/")
+
+
+def _download_candidates(url: str) -> list:
+    """给一个 release 资产地址，返回「依次尝试」的候选 URL 列表（去重）。
+    可用 `COCRAFT_UPDATE_DOWNLOAD` 覆盖：既是模板时写 `{url}`，否则当作前缀。"""
+    cands = []
+    env = (os.environ.get("COCRAFT_UPDATE_DOWNLOAD") or "").strip()
+    if env:
+        cands.append(env.replace("{url}", url) if "{url}" in env else env.rstrip("/") + "/" + url)
+    for m in DOWNLOAD_MIRRORS:
+        cands.append(m + url)
+    cands.append(url)
+    seen, out = set(), []
+    for u in cands:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _host_of(url: str) -> str:
+    return url.split("//", 1)[-1].split("/", 1)[0]
+
+
+# ---------------- 更新结果上报（安装器是独立进程，装完/装失败我们看不到 → 落一个状态文件） ----------------
+# 面板每次启动读一次并提示（成功/失败/疑似中断），读完就清（`/update/ack`）。
+# PowerShell 那边也会写这个文件（它没法调 Python），所以格式就是简单 JSON。
+
+def _status_path(app: str) -> str:
+    return os.path.join(app or ROOT, "runtime", "state", "_update.json")
+
+
+def write_status(app: str, **fields) -> None:
+    try:
+        p = _status_path(app)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        data = {}
+        try:
+            with open(p, "r", encoding="utf-8-sig") as fh:
+                data = json.load(fh) or {}
+        except (OSError, ValueError):
+            data = {}
+        data.update(fields)
+        data["at"] = int(time.time())
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def read_status(app: str = "") -> dict:
+    try:
+        with open(_status_path(app), "r", encoding="utf-8-sig") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def clear_status(app: str = "") -> None:
+    try:
+        os.remove(_status_path(app))
+    except OSError:
+        pass
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def current_version() -> str:
@@ -138,6 +221,41 @@ def _relaunch_command(app: str) -> list:
     return []
 
 
+def _build_apply_ps(app: str, setup: str, log: str, latest: str, cur: str, relaunch: list) -> str:
+    """生成「静默安装 → 记录结果 → 重启面板」的 PowerShell 脚本。
+
+    ⚠ 保持**纯 ASCII**：PS5.1 按 ANSI 读无 BOM 的 .ps1，中文会让换行错位、语句串行
+    （见 AGENTS.md 踩坑 #9；所以安装失败的文案在这里只用英文，中文由面板侧补）。
+    """
+    def sq(s):
+        return str(s).replace("'", "''")
+
+    lines = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        "$statePath = '%s'" % sq(_status_path(app)),
+        "function Write-UpdateState($phase, $okTag, $msg) {",
+        "  try {",
+        "    $dir = Split-Path -Parent $statePath",
+        "    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }",
+        "    $obj = @{ phase=$phase; ok=$okTag; version='%s'; fromVersion='%s'; error=$msg; at=[int](Get-Date -UFormat %%s) }"
+        % (sq(latest), sq(cur)),
+        "    [IO.File]::WriteAllText($statePath, ($obj | ConvertTo-Json -Compress))",
+        "  } catch {}",
+        "}",
+        "Start-Sleep -Seconds 1",
+        "$p = Start-Process -FilePath '%s' -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS','/LOG=%s' -PassThru -Wait"
+        % (sq(setup), sq(log)),
+        "$code = if ($p) { $p.ExitCode } else { -1 }",
+        "if ($code -eq 0) { Write-UpdateState 'done' $true '' } else { Write-UpdateState 'failed' $false ('installer exit code ' + $code + ' (log: %s)') }"
+        % sq(log),
+        "Start-Sleep -Seconds 2",
+    ]
+    if relaunch:
+        lines.append("Start-Process -FilePath '%s' -ArgumentList '%s'"
+                     % (sq(relaunch[0]), sq(relaunch[1])))
+    return "\n".join(lines) + "\n"
+
+
 def apply_update(app_dir: str = "") -> dict:
     """下载最新安装包并**脱离本进程**静默安装，装完自动重启面板。"""
     info = check(force=True)
@@ -156,32 +274,63 @@ def apply_update(app_dir: str = "") -> dict:
     os.makedirs(tmp, exist_ok=True)
     name = os.path.basename(asset["name"]) or "cocraft-setup.exe"
     setup = os.path.join(tmp, name)
+    latest = info.get("latest") or ""
+    cur = info.get("current") or ""
+    log = os.path.join(tmp, "install.log")
 
-    # 下载（流式；下完再动安装器，别装到一半）
-    try:
-        req = urllib.request.Request(asset["url"], headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=600) as resp, open(setup, "wb") as fh:
-            shutil.copyfileobj(resp, fh, 256 * 1024)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": "下载失败：%s" % exc}
+    def fail(msg):
+        write_status(app, phase="failed", ok=False, version=latest, fromVersion=cur, error=msg)
+        return {"ok": False, "error": msg}
+
+    write_status(app, phase="downloading", ok=None, version=latest, fromVersion=cur, error="")
+
+    # 下载（流式；依次尝试 环境变量 > 镜像 > 直连；下完先校验再动安装器）
+    errors = []
+    got = False
+    for cand in _download_candidates(asset["url"]):
+        try:
+            req = urllib.request.Request(cand, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=60) as resp, open(setup, "wb") as fh:
+                shutil.copyfileobj(resp, fh, 256 * 1024)
+            got = True
+            break
+        except Exception as exc:  # noqa: BLE001
+            errors.append("%s：%s" % (_host_of(cand), exc))
+            if os.path.exists(setup):
+                try:
+                    os.remove(setup)          # 清掉半截文件，别让下一次从断点续（也不做续传）
+                except OSError:
+                    pass
+    if not got:
+        return fail("下载失败（已试 %d 个源）：%s" % (len(errors), "；".join(errors)))
+
+    # 完整性校验：拒绝半截 / 错文件 / 代理返回的 HTML（否则安装器会静默失败，看着像"没更新"）
     size = os.path.getsize(setup)
     if size < 1024 * 1024:
-        return {"ok": False, "error": "下载的文件太小（%d 字节），可能不是安装包" % size}
+        return fail("下载的文件太小（%d 字节），可能不是安装包" % size)
+    want_size = asset.get("size")
+    if want_size and size != int(want_size):
+        return fail("下载不完整：%d / %s 字节" % (size, want_size))
+    try:
+        with open(setup, "rb") as fh:
+            if fh.read(2) != b"MZ":
+                return fail("下载的不是可执行文件（可能是错误页面）")
+    except OSError as exc:
+        return fail("读取下载文件失败：%s" % exc)
+    digest = str(asset.get("digest") or "").strip()
+    if digest.lower().startswith("sha256:"):
+        want_hash = digest.split(":", 1)[1].strip().lower()
+        got_hash = _sha256(setup)
+        if got_hash != want_hash:
+            return fail("校验失败（sha256 不符）：%s…（期望 %s…）" % (got_hash[:12], want_hash[:12]))
 
-    # 写一个隐藏 PowerShell：静默装 → 装完重启面板（它不在 {app} 下，杀进程不会误伤它）
+    # 写一个隐藏 PowerShell：静默装 → 记录结果（成功/退出码）→ 装完重启面板。
+    # ⚠ 它不在 {app} 下，安装器的 KillOurProcesses 按路径杀不到它，所以能"活过"安装。
+    write_status(app, phase="installing", ok=None, version=latest, fromVersion=cur, error="")
     relaunch = _relaunch_command(app)
     ps = os.path.join(tmp, "apply.ps1")
-    lines = [
-        "Start-Sleep -Seconds 1",
-        "$p = Start-Process -FilePath '%s' -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -PassThru -Wait"
-        % setup.replace("'", "''"),
-        "Start-Sleep -Seconds 2",
-    ]
-    if relaunch:
-        lines.append("Start-Process -FilePath '%s' -ArgumentList '%s'"
-                     % (relaunch[0].replace("'", "''"), relaunch[1].replace("'", "''")))
     with open(ps, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("\n".join(lines) + "\n")
+        fh.write(_build_apply_ps(app, setup, log, latest, cur, relaunch))
 
     try:
         subprocess.Popen(
@@ -190,8 +339,8 @@ def apply_update(app_dir: str = "") -> dict:
             close_fds=True,
             creationflags=(CREATE_NO_WINDOW | DETACHED_PROCESS) if sys.platform == "win32" else 0)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": "启动更新程序失败：%s" % exc}
+        return fail("启动更新程序失败：%s" % exc)
 
     return {"ok": True, "message": "已开始静默更新，安装完成后面板会自动重启",
-            "latest": info.get("latest"), "setup": setup, "size": size,
+            "latest": latest, "setup": setup, "size": size,
             "willRestart": bool(relaunch)}
