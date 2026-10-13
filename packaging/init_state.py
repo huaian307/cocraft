@@ -284,8 +284,10 @@ def main() -> int:
             "builtin": True,
             "command": bo,
             "cwd": "",
-            "env": {},
-            "note": "安装包自带的 OpenCode（npm / Node 分发）",
+            # ⚠ 隔离数据目录（同 codex 的 CODEX_HOME）：随包 OpenCode 与用户自己装的
+            #    OpenCode 版本可能不同，共用 ~/.local/share/opencode 会撞库。
+            "env": {"XDG_DATA_HOME": os.path.join(runtime, "opencode-data")},
+            "note": "安装包自带的 OpenCode（npm opencode-ai）；数据目录独立，不碰你自己的 OpenCode",
             "provider": "",
             "mode": "",     # 不写死模式：默认跟随用户在面板里最后一次选择
         })
@@ -298,13 +300,27 @@ def main() -> int:
         for a in agents:
             if a["id"] not in have:
                 merged.append(a)
+        # ★★ 2026-10-13 修：**绝不覆盖用户已有的 baseline**。
+        #   以前这里硬写成 {"cwd": workspace, "env": {}, "mode": "read-only"} →
+        #   **每次更新都会清掉用户的 API Key（baseline.env）**、把共享工作区/审批模式重置
+        #   （用户反馈"更新把我的设置覆盖了"）。现在只**补缺**，已有的一律保留。
+        old_base = reg.get("baseline") if isinstance(reg.get("baseline"), dict) else {}
+        base = dict(old_base)
+        if not base.get("cwd"):
+            base["cwd"] = workspace
+        if not isinstance(base.get("env"), dict):
+            base["env"] = {}
+        if not base.get("mode"):
+            base["mode"] = "read-only"
         reg = {
             "active": reg.get("active") or agents[0]["id"],
-            "baseline": {"cwd": workspace, "env": {}, "mode": "read-only"},
+            "baseline": base,
             "agents": merged,
         }
+        if old_base.get("env"):
+            log("[i] 保留已有的 baseline.env（%d 项，含 API Key）" % len(old_base.get("env") or {}))
         write_json(agents_file, reg)
-        log("[OK] agent 注册表已写入：%s（active=%s）" % (agents_file, reg["active"]))
+        log("[OK] agent 注册表已写入：%s（active=%s，baseline 只补缺不覆盖）" % (agents_file, reg["active"]))
     else:
         log("[!] 没找到随包 agent，也没找到本机 OpenCode：保持向导模式（首次启动会让你选/加 agent）")
 

@@ -48,35 +48,10 @@
   --radius: 3px;          /* 和风：小圆角，接近直角更利落 */
   --sidebar: 288px;
   --col-side: var(--sidebar);   /* 两栏网格用；收起侧栏时置 0 */
-  /* 背景亮度（1 = 原样，<1 变暗）：按主题分开，设置面板里可调（写内联变量覆盖这两个）。 */
-  --bg-dim-hiru: 1;
-  --bg-dim-yoru: .8;
-  --bg-dim: var(--bg-dim-hiru);
-  /* 会话界面背景的毛玻璃模糊半径（设置面板里可调，0 = 关）。 */
-  --bg-blur: 18px;
-}
-
-/* —— 夜：黑纹付羽织 + 黑纱遮面 + 黄金瞳 —— */
-[data-theme="yoru"] {
-  --paper:      #141110;
-  --paper-2:    #1d1817;
-  --paper-3:    #262020;
-  --ink:        #efe5da;
-  --ink-dim:    #a2958a;
-  --ink-faint:  #6b6058;
-  --hi:         #e03a52;
-  --hi-deep:    #ff5c72;
-  --hi-wash:    #2a1619;
-  --gold:       #dfb654;
-  --gold-soft:  #7a6533;
-  --sakura:     #6e3542;
-  --line:       rgba(239, 229, 218, .16);
-  --line-soft:  rgba(239, 229, 218, .08);
-  --shadow:     0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
-  --ok:         #5fb98a;
-  --run:        #dfb654;
-  --err:        #ff6b6b;
-  --bg-dim:     var(--bg-dim-yoru);   /* 夜主题本来就暗，默认再压两成 */
+  /* 背景亮度（1 = 原样，<1 变暗）：设置面板里可调（写内联变量覆盖）。 */
+  --bg-dim: 1;
+  /* ★统一的「模糊程度」—— 会话界面 / 消息气泡 / 群聊界面**共用**这一个值（设置面板里调）。0 = 全透明不模糊。 */
+  --g-blur: 28px;
 }
 
 * { box-sizing: border-box; }
@@ -342,6 +317,23 @@ h1#session-title {
 }
 .msg .who .copy-btn.copied { opacity: 1; color: var(--hi); border-color: var(--hi); }
 .msg .who .copy-btn.copy-fail { opacity: 1; color: var(--hi); border-color: var(--hi); }
+
+/* ★ 选中回答里的任意片段 → 浮出的「复制选中」按钮（自由复制片段，不必整条） */
+.sel-copy {
+  position: fixed; z-index: 45; transform: translateX(-50%);
+  border: 1px solid var(--gold); border-radius: 999px;
+  background: var(--paper); color: var(--ink);
+  font-family: var(--serif); font-size: 12px; letter-spacing: .06em;
+  padding: 4px 12px; cursor: pointer; box-shadow: var(--shadow);
+  transition: color .15s ease, border-color .15s ease;
+}
+.sel-copy:hover { color: var(--hi); border-color: var(--hi); }
+.sel-copy.copied { color: var(--hi); border-color: var(--hi); }
+.sel-copy[hidden] { display: none; }
+/* 回答内容明确可选中（自由选片段来复制） */
+.msg .bubble .text,
+.msg .bubble details.part .body,
+.msg .bubble pre { -webkit-user-select: text; user-select: text; }
 
 .msg .bubble {
   background: var(--paper); border: 1px solid var(--line);
@@ -622,22 +614,7 @@ details.part .body.stream { max-height: none; overflow: visible; }
   text-shadow: 0 0 4px var(--paper), 0 0 9px var(--paper);
 }
 
-/* ---------- 夜主题：背景插画 + 毛玻璃面板 ---------- */
-
-#static-bg .sb[data-bg="yoru"] {
-  background-image:
-    linear-gradient(180deg, rgba(20,17,16,.34) 0%, rgba(20,17,16,.58) 55%, rgba(20,17,16,.78) 100%),
-    url("/assets/night.jpg");
-}
-[data-theme="yoru"] #sidebar,
-[data-theme="yoru"] #topbar,
-[data-theme="yoru"] #composer {
-  background: rgba(29, 24, 23, .72);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-}
-
-/* 白昼也一样：信纸面板改成半透和纸 + 高斯模糊（夜主题是黑纱毛玻璃，昼主题是白纸毛玻璃） */
+/* ---------- 面板毛玻璃（「液态玻璃」关掉时的纸面兜底）---------- */
 [data-theme="hiru"] #sidebar,
 [data-theme="hiru"] #topbar,
 [data-theme="hiru"] #composer {
@@ -657,7 +634,7 @@ details.part .body.stream { max-height: none; overflow: visible; }
 /* 静态背景两层同样套亮度；展开时再套毛玻璃 */
 #static-bg .sb { filter: brightness(var(--bg-dim, 1)); }
 html[data-sidebar="open"] #static-bg .sb {
-  filter: brightness(var(--bg-dim, 1)) blur(var(--bg-blur, 0px));
+  filter: brightness(var(--bg-dim, 1));
 }
 
 /* 视频层：有动态壁纸时**一直可见**（收起在播、展开暂停）。
@@ -669,17 +646,14 @@ html[data-sidebar="open"] #static-bg .sb {
   filter: brightness(var(--bg-dim, 1));
 }
 html[data-theme="hiru"] #live-bg { background-image: url("/assets/hiru-bg.jpg"); }
-html[data-theme="yoru"] #live-bg { background-image: url("/assets/night.jpg"); }
 html:not(.has-live) #live-bg { display: none; }
 html[data-sidebar="open"] #live-bg {
-  filter: brightness(var(--bg-dim, 1)) blur(var(--bg-blur, 0px));
+  filter: brightness(var(--bg-dim, 1));
 }
 /* 动态层一旦上屏，静态那张就让位（否则它画在更上层，会把视频盖住） */
 html.has-live #static-bg { display: none; }
 /* 模糊会把图层边缘和"透明"混出一圈淡边：开模糊时把图层撑出视口一点。
    收起/展开都撑 —— 两层几何一致，切换时不会有一点点位移。 */
-html.bg-blurred #live-bg { inset: -3vmax; }
-html.bg-blurred[data-sidebar="open"] #static-bg .sb { inset: -3vmax; }
 
 .lb-video {
   position: absolute; inset: 0; width: 100%; height: 100%;
@@ -697,11 +671,6 @@ html.bg-blurred[data-sidebar="open"] #static-bg .sb { inset: -3vmax; }
   background: linear-gradient(180deg,
     rgba(250,247,242,.34) 0%, rgba(250,247,242,.44) 55%, rgba(250,247,242,.58) 100%);
 }
-html[data-theme="yoru"] #live-bg .lb-wash {
-  background: linear-gradient(180deg,
-    rgba(20,17,16,.34) 0%, rgba(20,17,16,.58) 55%, rgba(20,17,16,.78) 100%);
-}
-/* 白昼 + 动态壁纸：不盖纸色蒙层（用户要求"动态状态下的壁纸不要加蒙版"） */
 html[data-theme="hiru"].has-live #live-bg .lb-wash { display: none; }
 
 /* 系统要求减少动态效果：不播，直接用静态壁纸 */
@@ -711,18 +680,38 @@ html[data-theme="hiru"].has-live #live-bg .lb-wash { display: none; }
 
 /* ---------- 弹窗：设置 ---------- */
 
+/* ★设置 = 右侧抽屉（**跟群聊一样的展开形式**：右滑入 + 分屏让位 + 左边缘可拖宽） */
 .cfg {
-  position: fixed; inset: 0; z-index: 22;
-  display: flex; align-items: center; justify-content: center;
-  background: color-mix(in srgb, var(--ink) 34%, transparent);
-  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: var(--cfg-w, 560px); min-width: 300px; max-width: 96vw; z-index: 22;
+  display: flex; flex-direction: column;
+  background: var(--paper); border-left: 1px solid var(--line);
+  box-shadow: -14px 0 34px rgba(0, 0, 0, .24);
+  transform: translateX(102%); visibility: hidden;
+  transition: transform .22s ease, visibility .22s ease;
+  contain: layout paint;
 }
-.cfg[hidden] { display: none; }
+.cfg.open { transform: translateX(0); visibility: visible; }
+.cfg.resizing { transition: none; }                 /* 拖动中别走过渡，跟手 */
+/* 左边缘拖拽手柄 */
+.cfg-resize {
+  position: absolute; left: -3px; top: 0; bottom: 0; width: 7px;
+  cursor: col-resize; z-index: 2; touch-action: none;
+}
+.cfg-resize::after {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 1px;
+  background: var(--gold-soft); opacity: 0; transition: opacity .15s ease;
+}
+.cfg-resize:hover::after, .cfg.resizing .cfg-resize::after { opacity: .85; background: var(--hi); }
+/* 抽屉内容：填满抽屉、自己滚动 */
 .cfg-box {
-  width: min(560px, 94vw); max-height: 86vh; overflow: auto;
-  background: var(--paper); border: 1px solid var(--line);
-  border-radius: 6px; box-shadow: var(--shadow); padding: 16px 18px 12px;
+  flex: 1; min-height: 0; overflow: auto;
+  width: auto; max-height: none; border: 0; border-radius: 0;
+  background: transparent; box-shadow: none; padding: 16px 18px 12px;
 }
+/* 分屏：开关设置抽屉时给面板让出右侧（跟群聊一致） */
+html.cfg-open #app { padding-right: clamp(300px, var(--cfg-w, 560px), 96vw); }
+html.cfg-resizing #app { transition: none; }
 .cfg-head { display: flex; align-items: center; gap: 10px;
             border-bottom: 1px solid var(--line-soft); padding-bottom: 10px; }
 .cfg-head b { font-family: var(--serif); font-size: 16px; }
@@ -905,10 +894,6 @@ html[data-sidebar="closed"] .vis-bar {
 /* 真频谱模式：高度由 JS 直接给，关掉合成动画（否则动画会盖掉内联高度） */
 .vis-bar.real span { animation: none; }
 
-[data-theme="yoru"] .vis-bar {
-  background: linear-gradient(to top, rgba(29, 24, 23, .55), transparent);
-}
-
 /* ---------- 会话区两侧的真频谱音频条 ----------
    数据同 /qq/spectrum；默认由设置里的「对话两侧音频条」开关控制。
    两根都从底部长起，左条贴左、右条贴右，避免压住正文。 */
@@ -971,7 +956,6 @@ button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 1
   padding: 0; display: grid; place-items: center;
   font-size: 16px; line-height: 1; letter-spacing: 0;
 }
-#btn-theme { font-family: var(--serif); font-size: 15px; }
 
 .muted { color: var(--ink-faint); }
 .error-box {
@@ -1112,17 +1096,12 @@ html.collapsed-focus .lyrics-overlay { display: flex; }
 }
 /* 用户自定义了音乐条背景 → 抬高一点，别被纸色蒙层压得看不见 */
 .player.has-pbg .p-bg { opacity: .62; }
-[data-theme="yoru"] .player.has-pbg .p-bg { opacity: .55; }
 .player::after {                         /* 压一层纸色，保证文字可读 */
   content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(90deg,
     color-mix(in srgb, var(--paper-2) 90%, transparent) 0%,
     color-mix(in srgb, var(--paper-2) 60%, transparent) 45%,
     color-mix(in srgb, var(--paper-2) 90%, transparent) 100%);
-}
-[data-theme="yoru"] .p-bg { opacity: .45; }
-[data-theme="yoru"] .player::after {
-  background: linear-gradient(90deg, rgba(20,17,16,.88) 0%, rgba(20,17,16,.55) 45%, rgba(20,17,16,.88) 100%);
 }
 
 .p-row {
@@ -1378,8 +1357,6 @@ html.lyrics-on #p-lyric { display: block; }
   border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-2);
 }
 .wp-it.on-hiru { border-color: var(--gold); box-shadow: inset 0 0 0 1px var(--gold-soft); }
-.wp-it.on-yoru { border-color: var(--hi);
-                 box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hi) 45%, transparent); }
 .wp-thumb {
   width: 128px; height: 72px; flex: none; object-fit: cover;
   border-radius: 3px; background: #000; border: 1px solid var(--line);
@@ -1540,7 +1517,6 @@ html.lyrics-on #p-lyric { display: block; }
 .micon { width: 18px; height: 18px; flex: none; display: block; object-fit: contain; }
 .micon.sm { width: 16px; height: 16px; }
 .micon-tree { color: var(--bronze); }
-[data-theme="yoru"] .micon-tree { color: var(--gold); }
 .micon-mono {
   display: grid; place-items: center; border-radius: 50%;
   font-family: var(--serif); font-size: 11px; line-height: 1; color: var(--mk-cap);
@@ -1576,11 +1552,6 @@ html.lyrics-on #p-lyric { display: block; }
   --bronze:      #8a6a3c;   /* 青铜 */
   --bronze-soft: #b99a63;
   --mk-cap:      #9a7a3c;   /* 题字金 */
-}
-[data-theme="yoru"] {
-  --bronze:      #b99a63;
-  --bronze-soft: #6f5a34;
-  --mk-cap:      #c9a227;
 }
 
 /* ---- 铭牌底：所有按钮＝青铜边 + 纸/墨底 + 顶面高光 ---- */
@@ -1642,7 +1613,7 @@ button.danger:hover:not(:disabled) { border-color: var(--err); }
 }
 
 /* ---- 弹窗：炼金双线框 + 极淡网格 ---- */
-.cfg-box, .wp-box {
+.wp-box {
   border-color: color-mix(in srgb, var(--bronze) 48%, transparent);
   box-shadow: var(--shadow),
               inset 0 0 0 1px color-mix(in srgb, var(--gold) 15%, transparent),
@@ -1656,7 +1627,6 @@ button.danger:hover:not(:disabled) { border-color: var(--err); }
   color: var(--mk-cap); letter-spacing: .12em;
 }
 .mk { width: 21px; height: 21px; flex: none; color: var(--bronze); }
-[data-theme="yoru"] .mk { color: var(--gold); }
 .mk-cap {
   font-style: normal; font-family: var(--serif); font-size: 10.5px;
   letter-spacing: .2em; color: var(--mk-cap); opacity: .85;
@@ -1849,33 +1819,8 @@ html[data-sidebar="closed"] .lyric-ball { display: flex; }
 .ly-scroll p.cur  { font-size: 32px; font-weight: 600; opacity: .97; color: var(--hi); }
 .ly-scroll p.noly { font-family: var(--sans); font-size: 15px; opacity: .5; }
 
-/* ---------- 群聊（cocraft）：右边透明触发带 + 右侧抽屉（**面板内自建 UI**，非 iframe） ---------- */
-
-/* 触发带：贴右边整条，平时几乎透明，悬停才亮、并显现竖排「群聊」 */
-#chat-strip {
-  position: fixed; top: 0; bottom: 0; right: 0; width: 12px; z-index: 11;
-  margin: 0; padding: 0; border: 0; cursor: pointer;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--hi) 7%, transparent));
-  color: var(--ink-faint);
-  transition: width .16s ease, color .16s ease, background .16s ease;
-}
-#chat-strip::before {
-  content: ""; position: absolute; top: 12%; bottom: 12%; right: 0; width: 2px;
-  background: var(--gold-soft); opacity: .35; border-radius: 2px;
-  transition: opacity .16s ease, background .16s ease;
-}
-#chat-strip:hover {
-  width: 22px; color: var(--hi);
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--hi) 18%, transparent));
-}
-#chat-strip:hover::before { opacity: .9; background: var(--hi); }
-#chat-strip .cs-label {
-  position: absolute; top: 50%; right: 4px; transform: translateY(-50%);
-  writing-mode: vertical-rl; letter-spacing: .22em;
-  font-family: var(--serif); font-size: 11px; opacity: .55;
-  transition: opacity .16s ease;
-}
-#chat-strip:hover .cs-label { opacity: 1; }
+/* ---------- 群聊（cocraft）：右侧抽屉（**面板内自建 UI**）。
+   入口 = 顶栏的「群聊 / 音乐」小抽屉（#btn-hub / #hub-menu）；原来右边那条透明触发带已删。 ---------- */
 
 /* 抽屉：从右侧滑入；**左边缘可拖动改宽度**（--cc-w）；z-index 低于弹窗（20+） */
 .cocraft {
@@ -1993,11 +1938,34 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
 
 .cc-room { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .cc-room-head {
-  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  display: flex; flex-direction: column; gap: 5px; padding: 7px 10px;
   font-family: var(--serif); font-size: 13px; border-bottom: 1px solid var(--line-soft);
 }
+.cc-room-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .cc-room-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cc-room-title .muted { font-size: 10.5px; font-family: var(--sans); }
+/* 成员在线（presence）+ 发言权（floor）：小圆片，随主题走 */
+.cc-room-meta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  font-family: var(--sans); font-size: 10.5px; color: var(--ink-dim);
+}
+.cc-room-meta[hidden] { display: none; }          /* 作者 display:flex 会盖掉 [hidden] → 显式兜底 */
+.cc-meta-on { color: var(--ink-faint); }
+.cc-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; max-width: 150px;
+  border: 1px solid var(--line-soft); border-radius: 10px; background: var(--paper-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cc-chip.agent { border-color: color-mix(in srgb, var(--hi) 30%, var(--line-soft)); }
+.cc-chip.floor { border-color: color-mix(in srgb, var(--hi) 60%, transparent); color: var(--hi); background: var(--hi-wash); }
+.cc-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint); flex: none; }
+.cc-dot.on { background: #3fb950; box-shadow: 0 0 4px rgba(63, 185, 80, .65); }
+.cc-floor {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--hi) 55%, transparent);
+  background: var(--hi-wash); color: var(--hi);
+}
+.cc-floor.idle { border-color: var(--line-soft); background: var(--paper-2); color: var(--ink-faint); }
 .cc-menu-btn {
   flex: none; width: 26px; height: 26px; padding: 0; cursor: pointer;
   border: 1px solid var(--line); border-radius: 6px; background: transparent;
@@ -2012,10 +1980,58 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
 }
 .cc-menu-row > span { display: block; font-size: 11px; color: var(--ink-faint); margin-bottom: 5px; }
 .cc-menu-row > span i { font-style: normal; opacity: .8; }
+/* AI 成员（绑定 ACP agent 当大脑；被 @ 时后端桥自动回） */
+.cc-ai-list { display: flex; flex-direction: column; gap: 5px; margin-bottom: 6px; }
+.cc-ai-empty { font-size: 11px; color: var(--ink-faint); }
+.cc-ai { display: flex; align-items: center; gap: 5px; font-size: 11.5px; }
+.cc-ai-name { flex: 1; min-width: 0; display: inline-flex; align-items: center; gap: 5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cc-ai-name small { color: var(--ink-faint); font-size: 10px; }
+.cc-ai-b { flex: none; font-size: 10.5px; padding: 1px 6px; border: 1px solid var(--line);
+  border-radius: 6px; background: transparent; color: var(--ink-dim); cursor: pointer; }
+.cc-ai-b:hover:not(:disabled) { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.cc-ai-b:disabled { opacity: .4; cursor: default; }
+.cc-ai-b.on { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 55%, transparent); background: var(--hi-wash); }
+.cc-ai-b.del { color: var(--ink-faint); }
+.cc-ai-warn { font-size: 10.5px; line-height: 1.35; color: var(--hi); opacity: .92;
+  padding: 2px 6px; border-left: 2px solid color-mix(in srgb, var(--hi) 55%, transparent);
+  background: var(--hi-wash); border-radius: 0 6px 6px 0; }
+/* ★权限申请小弹窗：就在群聊输入框**.上方**（#cc-perm 在 .cc-send 前） */
+.cc-perm { margin: 6px 12px 0; padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--hi) 45%, transparent);
+  border-left: 3px solid var(--hi); border-radius: 8px;
+  background: color-mix(in srgb, var(--paper) 88%, var(--hi) 12%);
+  box-shadow: 0 4px 14px rgba(0,0,0,.14); font-size: 11.5px; line-height: 1.45; }
+.cc-perm-h { display: flex; align-items: center; gap: 5px; color: var(--ink); }
+.cc-perm-h b { color: var(--hi); }
+.cc-perm-h.danger { color: var(--hi); font-weight: 600; }
+.cc-perm-cmd { margin-top: 3px; padding: 3px 6px; font: 10.5px var(--mono); color: var(--ink);
+  background: color-mix(in srgb, var(--paper) 70%, var(--ink) 8%); border-radius: 5px;
+  max-height: 64px; overflow: auto; word-break: break-all; }
+.cc-perm-a button.danger { color: #fff; background: var(--hi);
+  border-color: color-mix(in srgb, var(--hi) 70%, transparent); }
+.cc-perm-t { margin-left: auto; font: 10.5px var(--mono); color: var(--ink-faint); }
+.cc-perm-b { margin-top: 2px; color: var(--ink-dim); word-break: break-all; }
+.cc-perm-p { display: block; font: 10px var(--mono); color: var(--ink-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cc-perm-a { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.cc-perm-a button { flex: none; font-size: 11px; padding: 2px 9px; border: 1px solid var(--line);
+  border-radius: 6px; background: transparent; color: var(--ink-dim); cursor: pointer; }
+.cc-perm-a button:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.cc-perm-a button.primary { color: var(--hi-ink, #fff); background: var(--hi);
+  border-color: color-mix(in srgb, var(--hi) 70%, transparent); }
+.cc-perm-a .cc-perm-x { margin-left: auto; padding: 2px 7px; color: var(--ink-faint); }
+.cc-ai-engine { max-width: 128px; }
+.cc-ai-eng { max-width: 100px; font-size: 10.5px; background: var(--paper); color: var(--ink);
+  border: 1px solid var(--line-soft); border-radius: 6px; padding: 1px 3px; }
+.cc-inline select { background: var(--paper); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 5px; font-size: 11.5px; }
 .cc-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; contain: layout paint; }
-.cc-msgs .cc-m { content-visibility: auto; contain-intrinsic-size: auto 44px; }   /* 屏外消息跳过布局 → 拖动变宽不再重排整列 */
+/* ⚠ 不用 content-visibility:auto：它会让刚插入时的 scrollHeight 被低估
+   → 「一有新消息就跳到最上面」（scrollTop=scrollHeight 落在 0）。 */
+.cc-msgs .cc-m { contain-intrinsic-size: auto 44px; }
 .cc-msgs .cc-empty { color: var(--ink-faint); font-size: 12px; text-align: center; margin: auto; }
 .cc-m { max-width: 82%; display: flex; flex-direction: column; gap: 3px; }
+.cc-m.agent .cc-mb { border-left: 2px solid color-mix(in srgb, var(--hi) 55%, transparent); }
 .cc-m .cc-mt { font-size: 10.5px; color: var(--ink-faint); }
 .cc-m .cc-mb {
   padding: 7px 10px; border-radius: 10px; font-size: 13px;
@@ -2049,12 +2065,14 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
 /* ---- 顶栏「设置」改成齿轮图标 ---- */
 #topbar .actions #btn-cfg { display: inline-flex; align-items: center; justify-content: center; }
 .ico-gear { width: 17px; height: 17px; display: block; }
+.ico-hub { width: 17px; height: 17px; display: block; }
 .ico-open { width: 17px; height: 17px; display: block; }
 
 /* ---- 播放条：可折叠（像会话列表那样收起 / 展开）---- */
 #p-fold { padding: 0 7px; font-size: 11px; line-height: 1; transition: transform .18s ease; }
+#p-close { padding: 0 7px; font-size: 13px; line-height: 1; }
 .player.folded .p-row { padding: 4px 10px; justify-content: flex-end; gap: 0; }
-.player.folded .p-row > *:not(#p-fold) { display: none; }
+.player.folded .p-row > *:not(#p-fold):not(#p-close) { display: none; }
 .player.folded .p-seek-row { display: none; }
 .player.folded #p-search, .player.folded #p-results { display: none !important; }
 .player.folded .p-bg { opacity: .12; }
@@ -2064,12 +2082,49 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
    从**底部上滑**的抽屉（类似群聊的右侧抽屉）：fixed 贴底，`.open` 才滑入；
    打开时给 #app 让出底部（padding-bottom）→ 输入框被顶到抽屉之上，抽屉正好在**文本框下面**。
    配色全部走主题变量（纸色 / 青铜边 / 校徽 / 金色光标）。 */
-#topbar .actions #btn-tools { display: inline-flex; align-items: center; justify-content: center; }
+#topbar .actions #btn-tools,
+#topbar .actions #btn-hub { display: inline-flex; align-items: center; justify-content: center; }
 .ico-wrench { width: 17px; height: 17px; display: block; }
-#topbar .actions #btn-tools.on {
+#topbar .actions #btn-tools.on,
+#topbar .actions #btn-hub.on {
   color: var(--gold);
   border-color: color-mix(in srgb, var(--gold) 45%, transparent);
 }
+/* 顶栏「工具」触发件：平时只一个**淡淡的方阵小图标**（≈隐藏），
+   悬停 / 展开时高亮，并把「工具」两字**伸展**出来（就是旧群聊条那种伸展手感） */
+#topbar .actions #btn-hub {
+  width: auto; min-width: 0; padding: 0 8px; gap: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--ink-faint); opacity: .55;
+  transition: opacity .16s ease, color .16s ease, padding .16s ease,
+              background .16s ease, border-color .16s ease;
+}
+#topbar .actions #btn-hub .hs-label {
+  max-width: 0; overflow: hidden; white-space: nowrap; opacity: 0;
+  font-family: var(--serif); font-size: 11.5px; letter-spacing: .1em;
+  transition: max-width .18s ease, opacity .18s ease, margin-left .18s ease;
+}
+#topbar .actions #btn-hub:hover, #topbar .actions #btn-hub.on {
+  opacity: 1; color: var(--hi);
+  background: color-mix(in srgb, var(--hi) 10%, transparent);
+}
+#topbar .actions #btn-hub:hover .hs-label,
+#topbar .actions #btn-hub.on .hs-label { max-width: 80px; opacity: 1; margin-left: 7px; }
+
+/* 展开后的「工具」方阵抽屉：图标按**方阵**排列，点图标启动对应工具 */
+.hub-grid { min-width: 0; padding: 10px; }
+.hub-tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.open-menu .hub-tool {
+  width: 60px; height: 60px; min-width: 0; padding: 6px 4px; margin: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
+  text-align: center; font-size: 10.5px; letter-spacing: .02em; border-radius: 8px;
+}
+.open-menu .hub-tool svg { width: 20px; height: 20px; display: block; }
+.open-menu .hub-tool.on {
+  color: var(--gold); border-color: color-mix(in srgb, var(--gold) 55%, transparent);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+.open-menu .hub-tool.on::after { content: none; }   /* 方阵里不要「 · 开」后缀 */
 .open-menu button.on {
   color: var(--gold);
   border-color: color-mix(in srgb, var(--gold) 45%, transparent);
@@ -2080,16 +2135,11 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
 :root { --term-h: 42vh; }
 
 /* ANSI 16 色按主题取色（light 用深色系、dark 用经典亮色系）。渲染层写 var(--tN) 即可随主题切换。 */
+/* ANSI 16 色 —— 面板是深色玻璃，用**浅色**那套才看得清（原"夜间"调色板） */
 :root, [data-theme="hiru"] {
-  --t0: #3b3733; --t1: #c0392b; --t2: #1e8449; --t3: #8a6d0b;
-  --t4: #2471a3; --t5: #8e44ad; --t6: #0e7490; --t7: #6f6a64;
-  --t8: #8a847c; --t9: #d9534f; --t10: #27ae60; --t11: #b7950b;
-  --t12: #3498db; --t13: #a569bd; --t14: #17a2b8; --t15: #2c2825;
-}
-[data-theme="yoru"] {
   --t0: #000000; --t1: #cd3131; --t2: #0dbc79; --t3: #e5e510;
   --t4: #2472c8; --t5: #bc3fbc; --t6: #11a8cd; --t7: #e5e5e5;
-  --t8: #666666; --t9: #f14c4c; --t10: #23d18b; --t11: #f5f543;
+  --t8: #8a8a8a; --t9: #f14c4c; --t10: #23d18b; --t11: #f5f543;
   --t12: #3b8eea; --t13: #d670d6; --t14: #29b8db; --t15: #ffffff;
 }
 
@@ -2288,14 +2338,8 @@ html.code-resizing #app { transition: none; }
 .code-editor:disabled { opacity: .6; }
 .code-edit-wrap.disabled .code-highlight { opacity: .6; }
 
-/* VS Code 风格 token 配色（昼=Light+，夜=Dark+） */
+/* VS Code 风格 token 配色 —— 面板已改成**深色玻璃**，所以用**浅色**配色（Dark+）才看得清 */
 :root, [data-theme="hiru"] {
-  --c-comment: #008000; --c-string: #a31515; --c-number: #098658;
-  --c-keyword: #0000ff; --c-control: #af00db; --c-func: #795e26;
-  --c-type: #267f99; --c-var: #001080; --c-const: #0070c1;
-  --c-tag: #800000; --c-attr: #e50000; --c-op: #000000; --c-meta: #af00db;
-}
-[data-theme="yoru"] {
   --c-comment: #6a9955; --c-string: #ce9178; --c-number: #b5cea8;
   --c-keyword: #569cd6; --c-control: #c586c0; --c-func: #dcdcaa;
   --c-type: #4ec9b0; --c-var: #9cdcfe; --c-const: #4fc1ff;
@@ -2342,6 +2386,300 @@ html.code-resizing #app { transition: none; }
 .th-installed { color: var(--gold); font-size: 11px; }
 .wp-it.th-on { border-color: color-mix(in srgb, var(--hi) 45%, transparent);
   background: color-mix(in srgb, var(--hi) 10%, transparent); }
+
+/* ============================================================================
+   ★ 液态玻璃（Liquid Glass）皮肤
+   —— 模仿 DeepSeek Harness 壁纸引擎的观感：面板变成「半透明磨砂玻璃」，
+      壁纸从面板后面透出来；侧栏 / 顶栏 / 消息 / 弹窗 / 抽屉 / 终端 / 编码 / 群聊 / 音乐全部统一。
+   开关：<html class="glass">（设置 →「液态玻璃」；默认开）。移除这个 class 即整套失效、回到纸面面板。
+   ============================================================================ */
+
+/* 玻璃材质参数（昼 / 夜各一套） */
+:root {
+  --g-sat: 120%;       /* 背景饱和度 */
+  --g-radius: 16px;    /* 悬浮玻璃（弹窗 / 菜单 / 抽屉）的圆角 */
+}
+[data-theme="hiru"] {
+  /* 白昼：**无色玻璃 + 白字** —— 中性灰 tint（无暖白）、主面不填色；
+     文字白色高亮、区块靠「中性暗底 + 浅色边线」区分（见下方 html.glass[data-theme=hiru]）。 */
+  --g-tint: 128,128,128; --g-ink: 36,31,29;
+  --g-a1: 0; --g-a2: .05; --g-a3: .04;
+  --g-edge: rgba(255,255,255,.30);   /* 区块 / 气泡之间的浅色边线（明显） */
+  --g-top:  transparent;             /* 不要白色上沿高光 */
+}
+
+/* 把「纸」换成「玻璃」：--paper 系列全部半透明
+   ⚠ specificity：html.glass (0,1,1) 高于 [data-theme=…] (0,1,0)，所以下面稳赢主题块。 */
+html.glass {
+  --paper:       rgba(var(--g-tint), var(--g-a1));
+  --paper-2:     rgba(var(--g-tint), var(--g-a2));
+  --paper-3:     rgba(var(--g-tint), var(--g-a3));
+  --paper-solid: rgb(var(--g-tint));           /* 需要**实色**的地方（如正文柔光）用它 */
+  --line:      rgba(var(--g-ink), .16);
+  --line-soft: rgba(var(--g-ink), .09);
+  --radius: 10px;
+  --shadow: 0 12px 34px rgba(0,0,0,.16);
+}
+html.glass body { background: rgb(var(--g-tint)); }     /* 兜底底色（壁纸层盖在上面） */
+html.glass body::before { opacity: .16; }               /* 纸纹在玻璃下会显脏 → 压淡 */
+
+/* 正文柔光：改成**中性深色**（原来用 `--paper` 实色 = 暖白，用户不要白）。 */
+html.glass .msg .who,
+html.glass .notice,
+html.glass .empty .duck-line1,
+html.glass .empty .duck-line2,
+html.glass .empty .credit { text-shadow: 0 1px 2px rgba(0,0,0,.35), 0 0 8px rgba(0,0,0,.22); }
+
+/* —— 主要面板（侧栏 / 顶栏 / 输入区 / 播放条 / 抽屉 / 弹窗卡片）：磨砂 + 玻璃边 —— */
+html.glass #sidebar,
+html.glass #topbar,
+html.glass #composer,
+html.glass .player,
+html.glass .cocraft,
+html.glass .code,
+html.glass .term,
+html.glass .mus-home,
+html.glass .cfg,
+html.glass .wp-box,
+html.glass .ask-box {
+  backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+  -webkit-backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+}
+/* ★注：面板边缘的**扭曲折射**（`::before` + mask 环 + `#lg-refract`）已按用户要求**移除** ——
+   它看起来像"撕裂/锯齿边"，与"干净的区块边界"冲突。 */
+
+/* 模糊程度统一由 --g-blur 控制（见设置「模糊程度」）—— 会话界面 / 气泡 / 群聊共用同一个值。
+   设成 0 = 全透明不模糊；越大越"磨砂"。 */
+/* 白昼的下拉菜单 / 小浮层：**实底**（透明的底会把下面的字透上来、糊成一片）+ 更强磨砂 */
+html.glass[data-theme="hiru"] .open-menu,
+html.glass[data-theme="hiru"] .perm-menu,
+html.glass[data-theme="hiru"] .cc-menu-pop,
+html.glass[data-theme="hiru"] .sel-copy {
+  background: rgba(12, 12, 15, .86);
+  backdrop-filter: blur(calc(var(--g-blur) + 10px)) saturate(100%);
+  -webkit-backdrop-filter: blur(calc(var(--g-blur) + 10px)) saturate(100%);
+}
+/* 权限申请小弹窗：深底 + 一丝红（原来几乎是透明的 → 字会跟底下的糊在一起） */
+html.glass[data-theme="hiru"] .cc-perm { background: rgba(34, 12, 17, .88); }
+
+/* ============================================================================
+   ★白昼玻璃：**白色高亮文字 + 区块分明**（对齐 DeepSeek Harness 的观感）
+   —— 透明面板上深色字看不清：文字统一**白色**（叠中性深色柔光兜底）；
+      结构性区块给一层**中性暗底**（不是白！）→ 区块彼此 / 和壁纸都分得开、白字也清楚；
+      区块之间用**浅色边线**分隔。
+   ============================================================================ */
+html.glass[data-theme="hiru"] {
+  --ink: #fff;
+  --ink-dim: rgba(255,255,255,.86);
+  --ink-faint: rgba(255,255,255,.62);
+  --line: rgba(255,255,255,.26);        /* 区块 / 气泡边界（浅色 → 深色壁纸上也看得见） */
+  --line-soft: rgba(255,255,255,.13);
+  --hi-wash: rgba(200,16,46,.34);       /* 绯红淡染改半透明（否则白字压在上面看不清） */
+  --g-scrim: rgba(8,8,10,.52);          /* 区块底色：中性暗（不是白） */
+  text-shadow: 0 1px 3px rgba(0,0,0,.55), 0 0 6px rgba(0,0,0,.32);
+}
+/* 结构性区块：一层中性暗底 → 区块彼此 / 和壁纸都分得开 */
+html.glass[data-theme="hiru"] #sidebar,
+html.glass[data-theme="hiru"] #topbar,
+html.glass[data-theme="hiru"] #composer,
+html.glass[data-theme="hiru"] .player,
+html.glass[data-theme="hiru"] .cocraft,
+html.glass[data-theme="hiru"] .code,
+html.glass[data-theme="hiru"] .term,
+html.glass[data-theme="hiru"] .mus-home,
+html.glass[data-theme="hiru"] .cfg,
+html.glass[data-theme="hiru"] .wp-box,
+html.glass[data-theme="hiru"] .ask-box { background: var(--g-scrim); }
+
+/* 透明底会让「选中 / 悬停」看不出来 → 给一层浅色（白字仍清楚） */
+html.glass[data-theme="hiru"] .session:hover { background: rgba(255,255,255,.10); }
+html.glass[data-theme="hiru"] .session.active { background: rgba(255,255,255,.16); }
+html.glass[data-theme="hiru"] .cc-chats .cc-chat:hover { background: rgba(255,255,255,.08); }
+html.glass[data-theme="hiru"] .mus-pl:hover,
+html.glass[data-theme="hiru"] .mus-song:hover,
+html.glass[data-theme="hiru"] .p-results .it:hover { background: rgba(255,255,255,.10); }
+html.glass #sidebar,
+html.glass #topbar,
+html.glass #composer { background: var(--paper); border-color: var(--g-edge); }
+html.glass .player  { background: var(--paper-2); }
+html.glass .cocraft,
+html.glass .code,
+html.glass .term,
+html.glass .mus-home,
+html.glass .cfg,
+html.glass .wp-box,
+html.glass .ask-box { background: var(--paper); }
+
+/* 上沿镜面高光（一条极细的亮线 —— "液态玻璃"的关键质感）+ 轻投影 */
+html.glass #sidebar,
+html.glass #topbar,
+html.glass #composer,
+html.glass .mus-home { box-shadow: inset 0 0 0 1px var(--g-edge), inset 0 2px 18px -10px var(--g-top); }
+html.glass .cocraft,
+html.glass .code,
+html.glass .cfg { box-shadow: -14px 0 34px rgba(0,0,0,.22), inset 0 1px 0 var(--g-top); }
+html.glass .term { box-shadow: 0 -14px 34px rgba(0,0,0,.22), inset 0 1px 0 var(--g-top); }
+html.glass .wp-box,
+html.glass .ask-box { box-shadow: inset 0 1px 0 var(--g-top), var(--shadow); }
+
+/* —— 悬浮玻璃：下拉菜单 / 小浮层 —— */
+html.glass .open-menu,
+html.glass .perm-menu,
+html.glass .cc-menu-pop,
+html.glass .sel-copy,
+html.glass .cc-perm {
+  backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+  -webkit-backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+  border-color: var(--g-edge);
+  border-radius: var(--g-radius);
+  box-shadow: inset 0 1px 0 var(--g-top), var(--shadow);
+}
+
+/* 弹窗遮罩（.wp / .ask 仍是居中弹窗；设置已改成右侧抽屉）：更重的模糊 */
+html.glass .wp,
+html.glass .ask {
+  background: rgba(0,0,0,.42);          /* 固定深色（`--ink` 现在是白，不能再用它调深色） */
+  backdrop-filter: blur(14px) saturate(130%);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+}
+html.glass .img-view {
+  background: rgba(0,0,0,.72);
+  backdrop-filter: blur(10px) saturate(130%);
+  -webkit-backdrop-filter: blur(10px) saturate(130%);
+}
+
+/* 玻璃卡片圆角 */
+html.glass .wp-box,
+html.glass .ask-box { border-radius: 18px; }
+html.glass .msg .bubble { border-radius: 14px; }
+html.glass .cc-m .cc-mb { border-radius: 14px; }
+
+/* 消息气泡：玻璃卡片 —— **模糊程度跟会话 / 群聊统一**（`--g-blur`）。 */
+html.glass .msg .bubble {
+  box-shadow: inset 0 1px 0 var(--g-top), var(--shadow);
+  border-color: var(--g-edge);
+  backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+  -webkit-backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+}
+html.glass .msg.user .bubble {
+  background: color-mix(in srgb, var(--hi) 14%, rgba(var(--g-tint), var(--g-a2)));
+  border-color: color-mix(in srgb, var(--hi) 30%, var(--g-edge));
+}
+html.glass .cc-m .cc-mb { border-color: var(--g-edge); }
+html.glass .cc-m.me .cc-mb { background: color-mix(in srgb, var(--hi) 14%, rgba(var(--g-tint), var(--g-a2))); }
+
+/* 终端 / 代码：跟其他区块一样**透明**（模糊由 --g-blur 统一管；不再单独铺一层灰底） */
+html.glass .term-wrap,
+html.glass .code-highlight { background: var(--paper-2); }
+
+/* ================= 轨迹（思考过程 + 工具调用）=================
+   按钮在顶栏；面板**从左边会话列表的右边界向右推出**（left = 侧栏宽度 `--col-side`），覆盖会话区左侧。
+   主会话界面从此只显示「思考时间 + 输出正文」，细节都在这里。 */
+:root { --trace-w: 560px; }
+#topbar .actions #btn-agent,
+#topbar .actions #btn-trace {
+  width: auto; min-width: 52px; padding: 0 8px;
+  font-family: var(--mono); font-size: 12.5px;
+}
+#topbar .actions #btn-trace.on {
+  color: var(--gold);
+  border-color: color-mix(in srgb, var(--gold) 45%, transparent);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+.trace {
+  position: fixed; top: 0; bottom: 0; left: var(--col-side);
+  width: var(--trace-w); min-width: 280px; max-width: 96vw; z-index: 13;
+  display: flex; flex-direction: column;
+  background: var(--paper); border-right: 1px solid var(--line);
+  box-shadow: 14px 0 34px rgba(0, 0, 0, .22);
+  clip-path: inset(0 100% 0 0);            /* 收起：从右缘整个裁掉 → 打开时"向右推出" */
+  pointer-events: none;
+  transition: clip-path .22s ease;
+  contain: layout paint;
+}
+.trace.open { clip-path: inset(0 0 0 0); pointer-events: auto; }
+.trace-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; border-bottom: 1px solid var(--line-soft);
+}
+.trace-head b { font-family: var(--serif); font-size: 15px; letter-spacing: .06em; }
+.trace-head .tr-cap { font-size: 10px; color: var(--ink-faint); letter-spacing: .12em; }
+.trace-head .tr-spacer { flex: 1; }
+.trace-head button {
+  width: auto; min-width: 0; height: 24px; padding: 0 10px; font-size: 11px;
+  border-radius: 6px; cursor: pointer;
+}
+.trace-head .trace-x { font-size: 15px; line-height: 1; height: 26px; padding: 0 8px; }
+.trace-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px 16px; }
+.trace-empty { color: var(--ink-faint); font-size: 12px; padding: 14px 4px; line-height: 1.9; }
+.tr-item { margin: 0 0 11px; }
+.tr-item .tr-h {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11.5px; color: var(--ink-dim); margin-bottom: 4px;
+}
+.tr-item .tr-h b { font-weight: 600; color: var(--ink); }
+.tr-item .tr-body {
+  white-space: pre-wrap; word-break: break-word;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6; color: var(--ink-dim);
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  border-left: 2px solid var(--line); border-radius: 0 6px 6px 0;
+  padding: 7px 10px; max-height: 320px; overflow: auto;
+}
+.tr-item.tr-tool .tr-body {
+  color: var(--ink);
+  border-left-color: color-mix(in srgb, var(--gold) 55%, transparent);
+}
+.tr-item.tr-tool.err .tr-body { border-left-color: var(--err); }
+
+/* 主会话界面的「思考」小条：只留思考用时（正文照常显示） */
+.think-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--ink-dim);
+  border: 1px solid var(--line-soft); border-radius: 999px;
+  padding: 1px 9px; margin-bottom: 8px;
+}
+.think-chip em { font-style: normal; font-family: var(--mono); color: var(--ink-faint); }
+.think-chip.live {
+  color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent);
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+/* 玻璃皮肤：轨迹面板也走同一套 */
+html.glass .trace {
+  background: var(--paper);
+  backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+  -webkit-backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
+  box-shadow: 14px 0 34px rgba(0,0,0,.22), inset 0 0 0 1px var(--g-edge);
+}
+html.glass[data-theme="hiru"] .trace { background: var(--g-scrim); }
+html.glass[data-theme="hiru"] .tr-item .tr-body { background: rgba(255,255,255,.06); }
+
+/* ================= 右侧抽屉「重合」→ 页面雾化 =================
+   多个右抽屉同时开，或主内容被压得太窄（抽屉已盖在内容上）时，给页面加一层雾化，
+   一眼就能看出"上面压着东西"。（`syncDrawerOverlap()` 负责判断，见 app.js） */
+html.drawer-overlap #app::after {
+  content: ""; position: fixed; inset: 0; z-index: 6; pointer-events: none;
+  background: rgba(0, 0, 0, .28);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+/* ================= 群聊「＋ 新建会话」 ================= */
+.cc-side-head #cc-new {
+  width: 22px; height: 22px; min-width: 22px; padding: 0;
+  display: grid; place-items: center; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 6px; background: transparent;
+  color: var(--ink-dim); font-size: 14px; line-height: 1;
+}
+.cc-side-head #cc-new:hover {
+  color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent);
+}
+
+/* ================= 原生控件在玻璃皮肤下用**深色**渲染 =================
+   ⚠ 否则 `<select>` 下拉的选项是"系统白底 + 我们设的白字" → 一片白、看不见选项（用户反馈）。
+   `color-scheme: dark` 让 Chromium 用深色渲染原生弹层；再给 option 兜一层显式配色。 */
+html.glass { color-scheme: dark; }
+html.glass select option { background-color: #17171b; color: #f2f2f2; }
 
 
 

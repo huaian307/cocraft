@@ -1,11 +1,11 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="hiru">
+<html lang="zh-CN" data-theme="hiru" class="glass">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft · 絵梨衣</title>
 <link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style.css?v=0.1.30">
+<link rel="stylesheet" href="/style.css?v=0.1.56">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -29,7 +29,6 @@
      停住的那一帧**就是**会话界面的静态背景（直接暂停视频，不再截图） -->
 <div id="static-bg" aria-hidden="true">
   <div class="sb" data-bg="hiru"></div>
-  <div class="sb" data-bg="yoru"></div>
 </div>
 
 <div id="live-bg" aria-hidden="true">
@@ -74,13 +73,17 @@
         <div id="session-meta" class="muted"></div>
       </div>
       <div class="actions">
+        <button id="btn-hub" title="工具（群聊 / 音乐 …）" aria-label="工具">
+          <svg class="ico-hub" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>
+          <span class="hs-label">工具</span>
+        </button>
         <button id="btn-tools" title="工具：面板终端 / 编码模式（VS Code 风格）" aria-label="工具">
           <svg class="ico-wrench" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/></svg>
         </button>
+        <button id="btn-trace" title="轨迹：思考过程 + 工具调用（主界面只留思考用时和正文）" aria-label="轨迹">轨迹</button>
         <button id="btn-agent" class="mdl-btn" title="切换智能体 / 模式（对当前会话生效）" aria-label="切换模式">模式</button>
         <button id="btn-model" class="mdl-btn" title="切换模型（对当前会话生效）" aria-label="切换模型">模型</button>
-        <button id="btn-cfg" title="设置（亮度 / 毛玻璃 / 壁纸 / 落樱 …）" aria-label="设置"><svg class="ico-gear" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.5 7.5 0 0 0 .06-.94 7.5 7.5 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.24-1.12.56-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.7 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.61.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.58-.24 1.12-.56 1.62-.94l2.39.96c.22.08.48 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg></button>
-        <button id="btn-theme" title="昼（白衣绯袴）/ 夜（黑纹付羽织·黄金瞳）" aria-label="切换昼夜">夜</button>
+        <button id="btn-cfg" title="设置（亮度 / 模糊程度 / 壁纸 / 落樱 …）" aria-label="设置"><svg class="ico-gear" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.5 7.5 0 0 0 .06-.94 7.5 7.5 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.24-1.12.56-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.7 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.61.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.58-.24 1.12-.56 1.62-.94l2.39.96c.22.08.48 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg></button>
         <button id="btn-refresh" title="重新加载消息" aria-label="重新加载消息">↻</button>
         <button id="btn-stop" class="danger" title="中断当前生成" aria-label="中断当前生成" disabled>■</button>
       </div>
@@ -88,6 +91,17 @@
         <div id="tm-dir" class="om-dir">—</div>
         <button type="button" data-tool="term" id="tm-term">面板终端</button>
         <button type="button" data-tool="code" id="tm-code">编码模式</button>
+      </div>
+      <div id="hub-menu" class="open-menu hub-grid" hidden>
+        <div class="om-dir">工具（点图标启动）</div>
+        <div class="hub-tools">
+          <button type="button" class="hub-tool" data-tool="chat" id="hm-chat" title="群聊">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg><span>群聊</span>
+          </button>
+          <button type="button" class="hub-tool" data-tool="music" id="hm-music" title="音乐">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg><span>音乐</span>
+          </button>
+        </div>
       </div>
     </header>
 
@@ -158,6 +172,7 @@
         <button id="p-home" title="音乐主页（推荐 / 我的）" aria-label="音乐主页"><svg class="ico-house" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3.1 2.4 11.2l1.2 1.5L5 11.5V21h5.2v-5.6h3.6V21H19v-9.5l1.4 1.2 1.2-1.5z"/></svg></button>
         <button id="p-lyric-btn" title="歌词：展开时在播放条歌名处横向滚动，收起侧栏时居中显示">词</button>
         <button id="p-fold" title="收起 / 展开播放条" aria-label="收起或展开播放条">▾</button>
+        <button id="p-close" title="把播放条从输入框上方隐去（音乐继续播，可在「群聊/音乐」里再打开）" aria-label="隐去播放条">×</button>
       </div>
       <div class="p-seek-row">
         <span id="p-cur" class="p-time">0:00</span>
@@ -230,14 +245,8 @@
   <button id="img-view-close" class="img-x" title="关闭">×</button>
 </div>
 
-<!-- 群聊（cocraft）：右边一条**透明触发带**，点一下从右侧滑出抽屉；抽屉里用 iframe 嵌站点，
-     登录 / 聊天都由站点自己处理（未登录 → 站点显示登录注册页；已登录 → 站点显示谈话界面）。
-     ⚠ 加固（2026-09-28，曾把 WebView2 窗口卡死过）：① **绝不自动打开**（必须用户点触发带）；
-     ② iframe 带 `sandbox`（不含 allow-top-navigation / allow-modals）、不委派任何 allow-* 权限；
-     ③ 抽屉滑入动画走完再导航；④ 12s 没 load 就在抽屉里提示"可点 ↗ 用浏览器打开"。 -->
-<button id="chat-strip" type="button" title="群聊（点击展开 / 收起）" aria-label="群聊" aria-expanded="false">
-  <span class="cs-label">群聊</span>
-</button>
+<!-- 群聊（cocraft）：入口已移到顶栏的「群聊 / 音乐」小抽屉（#btn-hub / #hub-menu）；
+     这里只留从右侧滑出的抽屉本体（登录/会话/消息都是自建 UI）。 -->
 <aside id="cocraft" class="cocraft" aria-label="群聊" aria-hidden="true">
   <div id="cc-resize" class="cc-resize" title="拖动调整宽度"></div>
   <div class="cc-head">
@@ -279,13 +288,16 @@
   <!-- 已登录：左＝会话列表，右＝聊天内容 -->
   <div id="cc-main" class="cc-main" hidden>
     <div class="cc-side">
-      <div class="cc-side-head"><span>会话</span></div>
+      <div class="cc-side-head"><span>会话</span><button type="button" id="cc-new" title="新建会话">＋</button></div>
       <div id="cc-chats" class="cc-chats"></div>
     </div>
     <div class="cc-room">
       <div id="cc-room-head" class="cc-room-head">
-        <div class="cc-room-title" id="cc-room-title">选一个会话</div>
-        <button type="button" id="cc-menu-btn" class="cc-menu-btn" title="会话操作">☰</button>
+        <div class="cc-room-top">
+          <div class="cc-room-title" id="cc-room-title">选一个会话</div>
+          <button type="button" id="cc-menu-btn" class="cc-menu-btn" title="会话操作">☰</button>
+        </div>
+        <div id="cc-room-meta" class="cc-room-meta" hidden></div>
       </div>
       <div id="cc-menu-pop" class="cc-menu-pop" hidden>
         <div class="cc-menu-row">
@@ -302,8 +314,19 @@
             <button type="button" id="cc-remove-go">移出</button>
           </div>
         </div>
+        <div class="cc-menu-row">
+          <span>AI 成员<i>（绑定 ACP agent；被 @ 时自动回）</i></span>
+          <div id="cc-ai-list" class="cc-ai-list"></div>
+          <div class="cc-inline">
+            <input id="cc-ai-name" type="text" placeholder="名字（@它用，英文/数字）">
+            <select id="cc-ai-engine" class="cc-ai-engine" title="用哪个 ACP agent 当大脑"></select>
+            <button type="button" id="cc-ai-add">＋ 建</button>
+          </div>
+        </div>
       </div>
       <div id="cc-msgs" class="cc-msgs"></div>
+      <!-- ★群聊权限申请：**输入框上方的小弹窗**（由 ccPermRender() 填；点按钮 = 在群里发 `@agent 可以`） -->
+      <div id="cc-perm" class="cc-perm" hidden></div>
       <form id="cc-send-form" class="cc-send">
         <textarea id="cc-send" rows="1" placeholder="说点什么……（Enter 发送，Shift+Enter 换行；📎 可发文件）"></textarea>
         <button type="button" id="cc-attach" title="发送文件（图片会直接预览）">📎</button>
@@ -349,7 +372,19 @@
   <div id="code-term-slot" class="code-term-slot" hidden></div>
 </aside>
 
-<div id="cfg" class="cfg" hidden>
+<!-- 轨迹：思考过程 + 工具调用（**从左侧会话列表边界向右推出**，盖住会话区左侧） -->
+<aside id="trace" class="trace" aria-label="轨迹" aria-hidden="true">
+  <div class="trace-head">
+    <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+    <span class="tr-cap">轨迹</span><b>思考 · 工具</b>
+    <span class="tr-spacer"></span>
+    <button type="button" id="trace-close" class="trace-x" title="收起">×</button>
+  </div>
+  <div id="trace-body" class="trace-body"></div>
+</aside>
+
+<div id="cfg" class="cfg">
+  <div id="cfg-resize" class="cfg-resize" title="拖动调整宽度"></div>
   <div class="cfg-box">
     <div class="cfg-head">
       <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
@@ -451,24 +486,23 @@
         <input type="text" id="cfg-hero-credit" maxlength="60" placeholder="同人图 · 仅本地自用，版权归原作者所有">
       </div>
       <div class="cfg-row">
-        <label>背景亮度 · 白昼<i>会话/听歌界面的壁纸亮度，100 = 原样</i></label>
+        <label>背景亮度<i>会话 / 听歌界面的壁纸亮度，100 = 原样</i></label>
         <input type="range" id="cfg-dim-hiru" min="40" max="100" step="1">
         <output id="cfg-dim-hiru-out"></output>
       </div>
       <div class="cfg-row">
-        <label>背景亮度 · 夜晚<i>同上，夜主题单独一份</i></label>
-        <input type="range" id="cfg-dim-yoru" min="40" max="100" step="1">
-        <output id="cfg-dim-yoru-out"></output>
-      </div>
-      <div class="cfg-row">
-        <label>背景毛玻璃<i>会话界面背景的模糊半径，0 = 关</i></label>
-        <input type="range" id="cfg-blur" min="0" max="60" step="2">
+        <label>模糊程度<i>会话界面 / 消息气泡 / 群聊界面共用这一个模糊；0 = 全透明不模糊，越大越磨砂</i></label>
+        <input type="range" id="cfg-blur" min="0" max="100" step="2">
         <output id="cfg-blur-out"></output>
       </div>
       <div class="cfg-row">
         <label>动态壁纸速度<i>收起侧栏时的播放速度（100 = 原速）</i></label>
         <input type="range" id="cfg-rate" min="50" max="130" step="5">
         <output id="cfg-rate-out"></output>
+      </div>
+      <div class="cfg-row">
+        <label>液态玻璃<i>面板变成半透明磨砂玻璃、壁纸从后面透出（关掉 = 回到纸面面板）</i></label>
+        <button id="cfg-glass" class="cfg-toggle">开</button>
       </div>
       <div class="cfg-row">
         <label>收起时播放动态壁纸<i>关掉就用静态壁纸</i></label>
@@ -864,7 +898,7 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/app.js?v=0.1.30"></script>
+<script src="/app.js?v=0.1.56"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

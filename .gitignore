@@ -62,3 +62,6 @@ frontend/refs_q.html
 .idea/
 Thumbs.db
 desktop.ini
+
+# 群聊文件落地目录（agent 工作区里的收件箱，运行期产物）
+cocraft-inbox/

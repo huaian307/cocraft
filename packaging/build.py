@@ -7,15 +7,20 @@ r"""把 cocraft 打包成安装包（Inno Setup）要用的 payload。
     dist/payload/init_state.py             安装后初始化 runtime/state（写 agent 注册表、引擎、干净模板）
     dist/payload/agents/node/node.exe      node 运行时（随包 agent 用）
     dist/payload/agents/codex/…            codex-acp + 依赖 + 原生 codex.exe + 干净的 codex-home 模板
-    dist/payload/components/music/…        可选：音乐服务的 site-packages
-    dist/payload/components/audio/…        可选：音频频谱的 site-packages
+    dist/payload/agents/claude/…           claude-code-acp 适配器（自带 SDK 的 Claude Code CLI）
+    dist/payload/agents/opencode/…        随包 OpenCode（npm opencode-ai；自带的 opencode.exe）
+    dist/payload/components/terminal/…    面板内终端（pywinpty）的 site-packages
+    dist/payload/components/panel/…       原生窗口（pywebview + pythonnet）的 site-packages
     dist/cocraft-setup-<ver>.exe       由 ISCC 编译出来的安装包
 
 用法：
-    python packaging\build.py                 # 默认：核心 + codex agent（可选组件不预置）
-    python packaging\build.py --agents none    # 只出核心包
-    python packaging\build.py --components music,audio   # 顺手把可选组件的 site-packages 也备好
+    python packaging\build.py                  # 默认：核心 + codex/claude/opencode 三个随包 agent + terminal/panel
+    python packaging\build.py --agents none     # 只出核心包（不带任何 agent）
+    python packaging\build.py --components music,audio   # 只有显式指定才会带音乐/频谱（默认不带）
     python packaging\build.py --no-iss          # 只准备 payload，不调 ISCC
+
+⚠ 组件策略（2026-10-12 起）：安装包**不再随包音乐服务 / 音频频谱**；agent（node/codex/claude/opencode）
+   与 terminal/panel 在 cocraft.iss 里全部是**必选（fixed）**，用户没有可勾选项。
 
 ⚠ 绝不随包带任何密钥：`codex-home` 只放**干净模板**（env_key 指向环境变量），
    用户的 API Key 由首次设置向导写进 runtime/state/_acp_agents.json 的 baseline.env。
@@ -49,22 +54,17 @@ CORE_FILES = ("AGENTS.md", "README.md")
 # 核心里的排除项：只去掉参考图画廊页（assets 里的主题素材**必须保留**）
 CORE_SKIP_FILES = ("refs.html", "refs_q.html")
 
-# 可选组件的 site-packages 来源（本机是 venv）
+# 可选组件的 site-packages 来源（本机是 venv）。
+# ⚠ 2026-10-12 起安装包**不再随包 music / audio**（音乐服务 / 频谱），这里也就不再列它们；
+#   仅保留 terminal / panel（它们在 cocraft.iss 里是必选组件）。
 VENV_SITE = {
-    "music": os.path.join(ROOT, "runtime", "venvs", "music", "Lib", "site-packages"),
-    "audio": os.path.join(ROOT, "runtime", "venvs", "audio", "Lib", "site-packages"),
     # 面板内终端（ConPTY / pywinpty）与原生窗口（pywebview / WebView2 + pystray 托盘）
     "terminal": os.path.join(ROOT, "runtime", "venvs", "terminal", "Lib", "site-packages"),
     "panel": os.path.join(ROOT, "runtime", "venvs", "panel", "Lib", "site-packages"),
 }
 # 打包时要踢掉的东西：pip/wheel/缓存/元数据（运行时不看）。
-# ⚠ **每个组件不一样**：`NeteaseCloudMusic` 运行时要 `pkg_resources`（来自 setuptools）——
-#   实测：裁掉 setuptools 后 `import NeteaseCloudMusic` 直接 ModuleNotFoundError。
-#   所以音乐组件必须**保留 setuptools/pkg_resources**（+6.7MB），音频组件可以踢。
 SITE_SKIP_COMMON = ("pip", "pip-*", "wheel", "wheel-*", "__pycache__", "*.dist-info", "*.egg-info")
 SITE_SKIP = {
-    "music": SITE_SKIP_COMMON,
-    "audio": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
     "terminal": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
     "panel": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
 }
@@ -403,9 +403,14 @@ def _npm_install_adapter(pkg: str) -> str:
     log("      npm 安装 %s（联网，首次会慢一点）..." % pkg)
     cmd = [node, npm_cli, "install", "--prefix", prefix, "--omit=dev",
            "--no-audit", "--no-fund", "--loglevel=error", pkg]
+    # ⚠ npm 的 postinstall 会用裸 `node`（如 opencode-ai 是 `node ./postinstall.mjs`）——
+    #   我们的便携 node 不在 PATH 上，必须把它的目录塞进 PATH，否则 postinstall 直接失败
+    #   （实测：opencode-ai 装完 node_modules 是空的）。子进程继承这份 env 即可。
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(node) + os.pathsep + env.get("PATH", "")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=3600, cwd=prefix)
+                           errors="replace", timeout=3600, cwd=prefix, env=env)
     except Exception as exc:  # noqa: BLE001
         log("      [skip] npm 失败：%r" % (exc,))
         return ""
@@ -504,20 +509,54 @@ def _stage_claude() -> None:
     log("      claude %.1f MB" % (tot / 1048576))
 
 
+def _stage_opencode() -> None:
+    """随包 OpenCode（npm 分发 `opencode-ai`，与 codex 同款的 node_modules 布局）。
+
+    ⚠ 与桌面版自带的 `opencode-cli.exe` 是同一款程序、不同分发：
+      - 这里随包的是 npm 包 `opencode-ai`（自包含 `bin/opencode.exe`，可跑 `acp` 子命令）。
+      - **只拷 `opencode-ai` 这一个包**：npm 还会顺带拉 `opencode-windows-x64` /
+        `-baseline`（各 ~172MB）——都是同一份二进制的副本，拷进去会让 payload 三倍膨胀。
+      - 运行时的隔离数据目录（`XDG_DATA_HOME`）由 agents.py / init_state.py 指到
+        `<app>\\runtime\\opencode-data`，**不碰用户自己的 OpenCode 数据**（同 codex 的 `CODEX_HOME`）。
+    """
+    nm = _npm_install_adapter("opencode-ai")
+    if not nm:
+        log("      [skip] 没拿到 opencode-ai（包里就不带随包 OpenCode）")
+        return
+    src = os.path.join(nm, "opencode-ai")
+    if not os.path.isdir(src):
+        log("      [skip] npm 目录里没有 opencode-ai")
+        return
+    dst = os.path.join(PAYLOAD, "agents", "opencode", "node_modules", "opencode-ai")
+    if os.path.isdir(dst):
+        shutil.rmtree(dst, ignore_errors=True)
+    copytree(src, dst, skip_names=("__pycache__",))
+    tot = 0
+    for root, _d, files in os.walk(os.path.join(PAYLOAD, "agents", "opencode")):
+        for f in files:
+            try:
+                tot += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    log("      opencode %.1f MB" % (tot / 1048576))
+
+
 def stage_agent(which: str) -> None:
-    """随包 agent：`codex` / `claude` / `both`（逗号分隔也行）/ `none`。"""
+    """随包 agent：`codex` / `claude` / `opencode`（逗号分隔也行）/ `all` / `none`。"""
     wants = [w.strip().lower() for w in str(which).split(",") if w.strip()]
     if not wants or "none" in wants:
         log("[4/6] 不随包 agent")
         return
-    if "both" in wants:
-        wants = ["codex", "claude"]
+    if "both" in wants or "all" in wants:
+        wants = ["codex", "claude", "opencode"]
     log("[4/6] 收集随包 agent（%s）..." % ",".join(wants))
     _stage_node()
     if "codex" in wants:
         _stage_codex()
     if "claude" in wants:
         _stage_claude()
+    if "opencode" in wants:
+        _stage_opencode()
 
 
 def write_version() -> str:
@@ -621,9 +660,10 @@ COMPONENTS_GLOBAL: list = []
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="打包 cocraft 安装包")
-    ap.add_argument("--agents", default="codex",
-                    help="随包 agent：codex / claude / both（逗号分隔也行）/ none")
-    ap.add_argument("--components", default="", help="顺带准备哪些可选组件：music,audio")
+    ap.add_argument("--agents", default="codex,claude,opencode",
+                    help="随包 agent：codex / claude / opencode（逗号分隔也行）/ all / none")
+    ap.add_argument("--components", default="terminal,panel",
+                    help="准备哪些组件：terminal,panel（默认都带；music,audio 需显式指定）")
     ap.add_argument("--no-iss", action="store_true", help="只准备 payload，不编译安装包")
     ap.add_argument("--no-protect", action="store_true",
                     help="不做「档1 去源码」（调试用，保留 .py 源码）")

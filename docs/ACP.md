@@ -402,14 +402,25 @@ provider 写死成 `deepseek`，换个 agent 就贴错牌子；改成中性又�
 4. **切引擎后没重连 SSE**：`/api/event` 在连接时就绑定了当时的引擎 → 切换后必须 `connectEvents()`。
 5. **SSE 漏 `end_headers()`**：状态行/响应头从没刷出去，客户端把正文当状态行（用裸 socket 才定位到）。
 6. **引擎实例每请求新建** → 会话状态丢失；改成单例缓存。
-7. **dsh 在 Windows 上跑不了 bash**（2026-09-24）：默认 `workspace-write` 沙箱**在 Windows 没有可用后端**
-   （`no sandbox backend is usable on this host`）→ 必须 `_acp.json` 的 `env.DSH_PERMISSION_MODE = "danger-full-access"`。
-   另外它 `spawn bash` 需要 **Git 的 bash 在 PATH**：本机 Git 装在 `D:\Git`，而 PATH 只有 `D:\Git\cmd`。
-   **已改成自动探测**：`process.py` 的 `_git_bin_dirs()`（按 PATH 里的 git.exe 反推 + 常见安装位置）
-   + `_inject_git_path()` 在起子进程时自动把 `D:\Git\bin`、`usr\bin`、`mingw64\bin` 等补进 PATH —— **不用手配**。
-   少了权限模式那项，agent 会**连错几十次 bash**、最后 dsh 内部 `turn/start N while turn N-1 is still open`
-   崩掉（面板表现：满屏 `error bash`）。
-   ⚠ `danger-full-access` = **无沙箱**，仅适合本机自用；`env` 是**叠加**到进程环境的（见 process.py）。
+7. **dsh 在 Windows 上的沙箱 / bash**（2026-09-24 首记，**2026-10-12 更正**）：
+   - 首记说"默认 `workspace-write` 沙箱在 Windows 没有可用后端（`no sandbox backend is usable on this host`）
+     → 必须 `env.DSH_PERMISSION_MODE = "danger-full-access"`"。⚠ **今天实测推翻**：Windows 后端包
+     `@deepseek-ai/dsh-sandbox-windows-acl`（靠 `koffi` 3.3.1 FFI 调 Win32 受限令牌）**在本机可用** ——
+     直接跑它的 runner（read-only 包 `cmd /c exit 0`）**exit 0**；把 dsh 用 `workspace-write` 起一轮也**正常**。
+     那条报错源码仍在（`dsh-sandbox/lib/index.js` 的 `SANDBOX_UNAVAILABLE`，属"绝不静默降级"的设计），当前**不触发**。
+   - **现在的配置 = `workspace-write`**（`_acp_agents.json` → `dsh.env.DSH_PERMISSION_MODE`）。实测行为：
+     **工作区（+ 系统 TEMP）内免问直接做；区外会发 `session/request_permission`（"提高等级"）**，拒了就写不进去
+     ⇒ **面板权限等级 / 群聊拥有者审批管得住 dsh**（2026-10-12 用真实注册表复测：区外写 → 1 次申请 → 拒绝 → 文件未创建）。
+     ⚠ 同一个变量**也**决定审批策略（`cordis.default.yml`：`danger-full-access` → `policy:'never'`）→
+     写 full-access 就等于"永不问"，等级与群审批对它**全部失效**（桥会给这种大脑加 `warn` 红字）。
+     ⚠ 代价：可写集合 = 工作区 + `os.tmpdir()`（**临时目录永远可写**）；Windows ACL 是 **partial enforcement**
+     （受限令牌保留 Everyone、NTFS 硬链接可绕）；fs 工具是**策略层围栏**（README 自己写明"不是安全边界"），
+     bash 才是内核级（受限令牌）。沙箱不可用时它**拒绝执行**、**不会静默降级**（真遇到再切回 full-access）。
+   - `spawn bash` 需要 **Git 的 bash 在 PATH**：本机 Git 装在 `D:\Git`，而 PATH 只有 `D:\Git\cmd`。
+     **已改成自动探测**：`process.py` 的 `_git_bin_dirs()`（按 PATH 里的 git.exe 反推 + 常见安装位置）
+     + `_inject_git_path()` 在起子进程时自动把 `D:\Git\bin`、`usr\bin`、`mingw64\bin` 等补进 PATH —— **不用手配**。
+     （首记把"满屏 `error bash`、dsh 内部 turn 崩"归给权限模式；那更像 **Git bash 不在 PATH** 造成的 —— 两者现在都已修。）
+   - ⚠ `env` 是**叠加**到进程环境的（见 process.py）。
 8. **`bool({})` 是 `False`**（2026-09-26）：Codex 宣告能力用**空对象**（`list: {}`），
    `bool(caps.get("list"))` 会把"支持 session/list"误判成"不支持"→ 只能判 `"list" in caps`。
 9. **`0 == False`**（同上）：拼工具输出尾注时写 `if v2 not in (None, "", False)`，

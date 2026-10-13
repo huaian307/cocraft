@@ -202,6 +202,7 @@ const state = {
   follow: true,         // 是否跟随最新内容自动往下滚
   refreshing: false,
   pendingRefresh: false,
+  openParts: new Set(), // 用户手动展开过的折叠块（key=msgID:idx）—— 重渲染后保留，不再自动展开
 };
 
 /* ---------------- 侧栏：会话列表 ---------------- */
@@ -365,7 +366,7 @@ function renderToolPart(part, key) {
   const cls = st === "completed" ? "ok" : st === "error" ? "err" : "run";
   const input = part.state && part.state.input ? JSON.stringify(part.state.input, null, 2) : "";
   const out = (part.state && (part.state.output || part.state.error)) || "";
-  return `<details class="part" data-k="${esc(key)}">
+  return `<details class="part"${state.openParts.has(key) ? " open" : ""} data-k="${esc(key)}">
     <summary><span class="tag ${cls}">${esc(st)}</span> ${esc(part.name || "tool")}</summary>
     <div class="body">${esc(input)}${out ? "\n\n" + esc(String(out).slice(0, 20000)) : ""}</div>
   </details>`;
@@ -374,17 +375,17 @@ function renderToolPart(part, key) {
 function renderReasoningPart(part, key, msgId) {
   const t = part.text || "";
   const head = t.slice(0, 56).replace(/\s+/g, " ");
-  // ⚠ `auto-open` 只是样式，**不会**把 <details> 打开（要 `open` 属性）——
-  //   以前思考被默认折叠、看着像"没有思考过程"。现在生成中与完成后都默认展开
-  //   （`.body` 有 max-height:420px，长思考内部滚动，不会撑爆版面）。
+  // ★ 思考**默认折叠**（以前一直展开，太占版面）；用户点了才展开，展开状态记在 state.openParts、
+  //   重渲染后保留。折叠时 summary 里有开头一小段预览，想看全文点一下即可。
+  const open = state.openParts.has(key) ? " open" : "";
   if (part.live) {
-    return `<details class="part auto-open" open data-k="${esc(key)}">
+    return `<details class="part auto-open"${open} data-k="${esc(key)}">
       <summary><span class="tag thinking">思考中…</span> ${esc(head)}</summary>
       <div class="body stream"><span data-live-reasoning data-msgid="${esc(msgId)}">${esc(t)}</span></div>
     </details>`;
   }
   if (!t.trim()) return "";
-  return `<details class="part auto-open" open data-k="${esc(key)}">
+  return `<details class="part auto-open"${open} data-k="${esc(key)}">
     <summary><span class="tag">思考</span> ${esc(head)}…</summary>
     <div class="body">${esc(t)}</div>
   </details>`;
@@ -395,6 +396,14 @@ function renderReasoningPart(part, key, msgId) {
 const MODEL_WARN_RE = /^\s*Warning: Model metadata for `[^`]*` not found\.[^\n]*\n+/i;
 function stripModelWarning(t) { return String(t ?? "").replace(MODEL_WARN_RE, ""); }
 
+/** 主界面那条「思考 · Ns」小条（细节在「轨迹」页）。 */
+function thinkChipHtml(m) {
+  const t = m.time || {};
+  if (!t.completed) return `<div class="think-chip live">✦ 思考中…</div>`;
+  const secs = (t.created && t.completed) ? Math.max(0, Math.round((t.completed - t.created) / 1000)) : 0;
+  return `<div class="think-chip">✦ 思考<em>${secs ? " " + secs + "s" : ""}</em></div>`;
+}
+
 function renderMessage(m) {
   const type = m.type || "assistant";
   if (type === "idle") return "";
@@ -404,8 +413,13 @@ function renderMessage(m) {
     const label = type === "synthetic" ? "自动续写"
       : type === "location-switched" ? "工作目录已切换" : "系统";
     const body = (m.text || "").trim();
+    // ★系统消息很长时（AGENTS.md 变更会把整段 diff 打进来）只留**围栏前的一句**，不倒正文。
+    const long = body.length > 180 || body.indexOf("```") >= 0;
+    const text = !body ? ""
+      : long ? "：" + esc(body.split("```")[0].trim().slice(0, 140)) + " …（略）"
+      : "：" + esc(body.slice(0, 160));
     return `<div class="notice"><span class="line"></span>
-      <span class="label">${esc(label)}${body ? "：" + esc(body.slice(0, 160)) : ""}</span>
+      <span class="label">${esc(label)}${text}</span>
       <span class="line"></span></div>`;
   }
 
@@ -418,19 +432,24 @@ function renderMessage(m) {
   }
 
   let parts = "";
-  if (Array.isArray(m.content) && m.content.length) {
-    parts = m.content.map((p, i) => {
+  let hadReasoning = false;
+  const contentArr = Array.isArray(m.content) ? m.content : null;
+  if (contentArr && contentArr.length) {
+    parts = contentArr.map((p, i) => {
       if (!p || typeof p !== "object") return "";
       const key = `${m.id}:${i}`;
       if (p.type === "text") {
+        // ★"边做边说"的旁白（这一段后面还跟着工具调用）**不是最终输出** → 主界面不显示。
+        if (contentArr.slice(i + 1).some((q) => q && q.type === "tool")) return "";
         if (p.live) {
           return `<div class="text"><span data-live-text data-msgid="${esc(m.id)}">`
             + `${renderText(stripModelWarning(p.text))}</span><span class="caret"></span></div>`;
         }
         return `<div class="text">${renderText(stripModelWarning(p.text))}</div>`;
       }
-      if (p.type === "reasoning") return renderReasoningPart(p, key, m.id);
-      if (p.type === "tool") return renderToolPart(p, key);
+      // ★思考过程 / 工具调用**移到顶栏「轨迹」页**：主界面只留「思考用时」+ 最终输出。
+      if (p.type === "reasoning") { hadReasoning = true; return ""; }
+      if (p.type === "tool") return "";
       // 未知 part：兜底显示原始结构，绝不静默丢弃
       return `<details class="part" data-k="${esc(key)}">
         <summary><span class="tag">${esc(p.type || "unknown")}</span> 原始数据</summary>
@@ -446,15 +465,20 @@ function renderMessage(m) {
   const files = renderAttachments((m.files && m.files.length ? m.files : null)
     || (m.metadata && m.metadata.attachments));
 
+  const thinkChip = hadReasoning ? thinkChipHtml(m) : "";
+  const finished = !!(m.time && m.time.completed);
+  const trulyEmpty = !!contentArr && contentArr.length === 0;
+
   if (!parts && !files) {
-    const finished = !!(m.time && m.time.completed);
-    // 助手这一轮 content 为空：**没结束就先别说"没有回答"**（流式还没出字时就是空的）
-    if (type === "assistant" && Array.isArray(m.content) && m.content.length === 0) {
-      if (!finished) {
-        return `<div class="msg assistant"><div class="who"><strong>${esc(type)}</strong></div>
+    if (type === "assistant") {
+      if (!finished) {                       // 还在生成：给个占位，免得空着
+        return `<div class="msg assistant"><div class="who"><strong>助手</strong></div>
           <div class="bubble"><div class="text muted">正在思考…</div></div></div>`;
       }
-      return `<div class="msg assistant"><div class="who"><strong>${esc(type)}</strong></div>
+      // ★已结束、但没有最终输出（只有思考 / 工具 / 旁白）→ **主界面不显示**（细节看「轨迹」）。
+      if (!trulyEmpty) return "";
+      // 整条 content 真的为空（不是被藏起来的）：给个诊断，别静默
+      return `<div class="msg assistant"><div class="who"><strong>助手</strong></div>
         <div class="bubble"><div class="text muted">（这一轮确实没有返回正文。若是 ACP agent：看
         <code>runtime/logs/acp.log</code>，或跑一次「opencode-ui 自检」）</div></div></div>`;
     }
@@ -482,7 +506,7 @@ function renderMessage(m) {
       ${streaming ? `<span class="tag run">生成中</span>` : ""}
       ${!isUser ? `<button type="button" class="copy-btn" data-copy="${esc(m.id)}" title="复制这条回答的正文（不含思考过程）">复制</button>` : ""}
     </div>
-    <div class="bubble">${parts}${files}</div>
+    <div class="bubble">${thinkChip}${parts}${files}</div>
   </div>`;
 }
 
@@ -579,6 +603,94 @@ function initCopy() {
     const msgBtn = t.closest(".copy-btn");
     if (msgBtn) doCopy(msgBtn, copyMessageById(msgBtn.dataset.copy || ""));
   });
+}
+
+/** 记录折叠块的展开状态（details 的 toggle 不冒泡，用捕获）：重渲染后保留用户的选择。 */
+function initPartToggle() {
+  document.addEventListener("toggle", (e) => {
+    const d = e.target;
+    if (!d || d.tagName !== "DETAILS" || !d.classList || !d.classList.contains("part")) return;
+    const k = d.dataset && d.dataset.k;
+    if (!k) return;
+    if (d.open) state.openParts.add(k); else state.openParts.delete(k);
+  }, true);
+}
+
+/** ★选中回答里的任意片段 → 浮出「复制选中」按钮（自由复制片段，不必整条复制）。 */
+function initSelCopy() {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "sel-copy";
+  btn.textContent = "复制选中";
+  btn.hidden = true;
+  document.body.appendChild(btn);
+
+  const hide = () => { btn.hidden = true; btn.classList.remove("copied"); };
+  const selText = () => {
+    const s = window.getSelection();
+    return (s && !s.isCollapsed && s.rangeCount) ? s.toString() : "";
+  };
+  const inMessages = () => {
+    try {
+      const s = window.getSelection();
+      let n = s && s.anchorNode;
+      while (n && n.nodeType !== 1) n = n.parentNode;
+      return !!(n && n.closest && n.closest("#messages"));
+    } catch { return false; }
+  };
+  const placeAt = (x, y) => {
+    btn.style.left = Math.min(Math.max(x, 70), window.innerWidth - 70) + "px";
+    btn.style.top = Math.max(y - 36, 6) + "px";
+  };
+  const placeByRange = () => {
+    const s = window.getSelection();
+    if (!s || !s.rangeCount) return;
+    const r = s.getRangeAt(0).getBoundingClientRect();
+    if (!r || (!r.width && !r.height)) return;
+    placeAt(r.left + r.width / 2, r.top);
+  };
+  const showAt = (x, y) => {
+    placeAt(x, y);
+    btn.hidden = false; btn.classList.remove("copied"); btn.textContent = "复制选中";
+  };
+
+  document.addEventListener("mouseup", (e) => {
+    if (selText().trim() && inMessages()) showAt(e.clientX, e.clientY);   // 贴着鼠标松手的位置
+    else hide();
+  });
+  // 键盘选择（Shift+方向键 / Ctrl+A）没有 mouseup：用 keyup 兜一下
+  document.addEventListener("keyup", (e) => {
+    if (!btn.hidden) return;
+    if ((e.shiftKey || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a"))
+        && selText().trim() && inMessages()) { placeByRange(); btn.hidden = false; }
+  });
+  document.addEventListener("selectionchange", () => { if (!selText().trim()) hide(); });
+  document.addEventListener("mousedown", (e) => { if (e.target !== btn) hide(); }, true);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); });
+  const box = $("messages");
+  if (box) box.addEventListener("scroll", hide, { passive: true });
+  window.addEventListener("resize", hide);
+
+  btn.addEventListener("mousedown", (e) => e.preventDefault());   // 保住选区
+  btn.addEventListener("click", async () => {
+    const t = selText();
+    if (!t.trim()) { hide(); return; }
+    const ok = await copyToClipboard(t);
+    btn.textContent = ok ? "已复制" : "复制失败";
+    btn.classList.toggle("copied", ok);
+    setTimeout(() => { btn.textContent = "复制选中"; hide(); }, 900);
+  });
+}
+
+/** 选区是否落在「生成中」的小块里（用于冻结重绘，别把选区冲掉）。 */
+function selectionInLiveSlot() {
+  try {
+    const s = window.getSelection();
+    if (!s || s.isCollapsed || !s.rangeCount) return false;
+    let n = s.anchorNode;
+    while (n && n.nodeType !== 1) n = n.parentNode;
+    return !!(n && n.closest && n.closest("#live-slot"));
+  } catch { return false; }
 }
 
 /** 内容指纹：只有真的变了才重建 DOM（避免流式期间反复重建大块） */
@@ -762,6 +874,117 @@ function swapHtml(el, html) {
 }
 
 /** 已完成的消息只在内容变化时重建；生成中的部分交给 paintLiveSlot */
+/* ---------------- 轨迹（思考过程 + 工具调用）----------------
+ * 顶栏「轨迹」按钮 → 从左侧会话列表边界向右推出的一块面板（见 style.css 的 .trace）。
+ * 主会话界面只显示「思考用时 + 输出正文」；思考正文与工具明细都在这里。 */
+
+const TRACE = { open: false };
+
+/** 把当前会话里所有「思考 / 工具调用」按顺序收集出来（含正在生成的那一轮）。 */
+function traceItems() {
+  const out = [];
+  const pushMsg = (m) => {
+    if (!m || m.type !== "assistant") return;
+    const content = Array.isArray(m.content) ? m.content : [];
+    for (const p of content) {
+      if (!p || typeof p !== "object") continue;
+      if (p.type === "reasoning") {
+        const t = stripModelWarning(p.text || "");
+        if (t.trim()) out.push({ kind: "think", text: t, live: !!p.live });
+      } else if (p.type === "tool") {
+        out.push({ kind: "tool", name: p.name || "tool", state: p.state || {} });
+      }
+    }
+  };
+  for (const m of state.messages) pushMsg(m);
+  for (const id of pendingLiveIds()) {            // 正在生成、还没落库的那一轮
+    const e = state.live[id];
+    if (!e) continue;
+    const rt = stripModelWarning(joinBucket(e.reasoning || {}));
+    if (rt.trim()) out.push({ kind: "think", text: rt, live: true });
+    for (const t of (e.tools || [])) {
+      out.push({ kind: "tool", name: t.name || "tool", state: { status: t.status, input: t.input } });
+    }
+  }
+  return out;
+}
+
+function traceItemHtml(it) {
+  if (it.kind === "think") {
+    return `<div class="tr-item tr-think">
+      <div class="tr-h"><span class="tag${it.live ? " thinking" : ""}">${it.live ? "思考中…" : "思考"}</span></div>
+      <div class="tr-body">${esc(it.text)}</div>
+    </div>`;
+  }
+  const st = (it.state && it.state.status) || "pending";
+  const cls = st === "completed" ? "ok" : st === "error" ? "err" : "run";
+  const input = it.state && it.state.input ? JSON.stringify(it.state.input, null, 2) : "";
+  const out = (it.state && (it.state.output || it.state.error)) || "";
+  return `<div class="tr-item tr-tool${st === "error" ? " err" : ""}">
+    <div class="tr-h"><span class="tag ${cls}">${esc(st)}</span> <b>${esc(it.name)}</b></div>
+    ${(input || out) ? `<div class="tr-body">${esc(input)}${out ? "\n\n" + esc(String(out).slice(0, 20000)) : ""}</div>` : ""}
+  </div>`;
+}
+
+function renderTrace() {
+  const box = $("trace-body");
+  if (!box) return;
+  if (!state.current) { box.innerHTML = `<div class="trace-empty">还没有会话。</div>`; return; }
+  const all = traceItems();
+  if (!all.length) {
+    box.innerHTML = `<div class="trace-empty">这个会话还没有思考过程 / 工具调用。<br>
+      助手的思考与工具明细都会出现在这里；主界面只留「思考用时 + 正文」。</div>`;
+    return;
+  }
+  const MAX = 250;                                  // 长会话保护：只画最近 N 条
+  const items = all.length > MAX ? all.slice(-MAX) : all;
+  const head = all.length > MAX
+    ? `<div class="trace-empty">（只显示最近 ${MAX} 条，共 ${all.length} 条）</div>` : "";
+  box.innerHTML = head + items.map(traceItemHtml).join("");
+}
+
+function traceOpen() {
+  TRACE.open = true;
+  const t = $("trace");
+  if (t) { t.classList.add("open"); t.setAttribute("aria-hidden", "false"); }
+  const b = $("btn-trace"); if (b) b.classList.add("on");
+  renderTrace();
+  const box = $("trace-body");
+  if (box) box.scrollTop = box.scrollHeight;         // 打开时停在最新一条
+  syncDrawerOverlap();
+}
+function traceClose() {
+  TRACE.open = false;
+  const t = $("trace");
+  if (t) { t.classList.remove("open"); t.setAttribute("aria-hidden", "true"); }
+  const b = $("btn-trace"); if (b) b.classList.remove("on");
+  syncDrawerOverlap();
+}
+function toggleTrace() { if (TRACE.open) traceClose(); else traceOpen(); }
+
+/** 右侧抽屉「重合」检测：**多个右抽屉同时开**、或**主内容被压得太窄**（说明抽屉已盖在内容上）
+ *  → 给页面加一层雾化（`html.drawer-overlap`），一眼看出上面压着东西。 */
+function syncDrawerOverlap() {
+  const isOpen = (id) => { const el = $(id); return !!(el && el.classList.contains("open")); };
+  const widthOf = (id) => { const el = $(id); return (el && el.getBoundingClientRect().width) || 0; };
+  const widths = [];
+  if (isOpen("cfg")) widths.push(widthOf("cfg"));
+  if (isOpen("cocraft")) widths.push(widthOf("cocraft"));
+  if (isOpen("code")) widths.push(widthOf("code"));
+  if (isOpen("trace")) widths.push(widthOf("trace"));
+  const side = $("sidebar");
+  const colSide = (side && side.offsetParent !== null) ? side.getBoundingClientRect().width : 0;
+  const overlap = widths.length > 1
+    || (widths.length === 1 && (window.innerWidth - colSide - widths[0]) < 360);
+  document.documentElement.classList.toggle("drawer-overlap", overlap);
+}
+
+function initTrace() {
+  const b = $("btn-trace"); if (b) b.addEventListener("click", toggleTrace);
+  const x = $("trace-close"); if (x) x.addEventListener("click", traceClose);
+  window.addEventListener("keydown", (e) => { if (e.key === "Escape" && TRACE.open) traceClose(); });
+}
+
 function renderMessages() {
   const pending = pendingLiveIds();
   const empty = !state.messages.length && !pending.length;
@@ -777,6 +1000,7 @@ function renderMessages() {
   else if (!empty && heroShown) { swapHtml($("msg-static"), staticHtml); heroShown = false; }
 
   paintLiveSlot();
+  if (TRACE.open) renderTrace();
 }
 
 /** 只重建「生成中」那一小块：我发的消息（乐观回显）→ 思考 → 回答，一路向下生长 */
@@ -784,6 +1008,9 @@ function paintLiveSlot() {
   const box = $("messages");
   const slot = $("live-slot");
   const ids = pendingLiveIds();
+
+  // ★ 正在选中「生成中」那段文字时先别重绘：否则每帧重建会把选区冲掉（就没法选中复制片段了）
+  if (selectionInLiveSlot()) return;
 
   const shellSig = state.pending.map((p) => `u:${p.id}`).join(",") + "||" + ids.map((id) => {
     const e = state.live[id];
@@ -801,7 +1028,6 @@ function paintLiveSlot() {
       .map((id) => renderMessage(liveToMessage(id, state.live[id], state.reveal[id])))
       .join("");
     slot.innerHTML = pendingHtml + liveHtml;
-    slot.querySelectorAll("details.part.auto-open").forEach((d) => { d.open = true; });
   }
 
   // 内容按打字机进度就位（只改内容、不动结构，光标闪烁不会被打断）
@@ -851,6 +1077,7 @@ function revealStep() {
 function scheduleLiveRender() {
   paintLiveSlot();
   startRevealLoop();
+  if (TRACE.open) renderTrace();          // 轨迹页跟着更新（事件驱动，不是每帧）
 }
 
 /* ---------------- 会话操作 ---------------- */
@@ -1460,7 +1687,7 @@ function syncUiVersion(served) {
     v.classList.add("stale");
     v.title = "界面已更新到 " + served + "，点顶部横幅或按 Ctrl+Shift+R 刷新";
   }
-  setBanner(`界面已更新到 ${served}：点这里刷新（或 Ctrl+Shift+R）`);
+  setBanner(`界面已更新到 ${served}：点这里刷新（或 Ctrl+Shift+R）`, { clickable: true });
   return false;
 }
 
@@ -1477,12 +1704,34 @@ function safeReload() {
   }, 60);
 }
 
-function setBanner(text) {
+let bannerTimer = null;
+
+/** 顶部广播条。
+ *  `opts.clickable` = 可点（更新提示用，永远常驻）；`opts.sticky` = 常驻不自动消失；
+ *  都不加 → **几秒后自己收起**（`opts.ms` 可调）。以前非点击的广播条会一直挂着，用户反馈过。 */
+function setBanner(text, opts) {
   const el = $("banner");
-  if (el) el.classList.toggle("clickable", !!updateReady && !!text);
+  if (!el) return;
+  const o = opts || {};
+  const clickable = !!o.clickable && !!text;
+  el.classList.toggle("clickable", clickable);
+  clearTimeout(bannerTimer);
+  bannerTimer = null;
   if (!text) { el.hidden = true; el.textContent = ""; return; }
   if (el.textContent !== text) el.textContent = text;
   el.hidden = false;
+  if (!o.sticky && !clickable) {
+    bannerTimer = setTimeout(restoreBanner, Math.max(1200, o.ms || 5000));
+  }
+}
+
+/** 广播条自动收起后：有更新提示就把它挂回来，否则清空。 */
+function restoreBanner() {
+  if (updateReady) {
+    setBanner(`界面已更新到 ${updateReady}：点这里刷新（或 Ctrl+Shift+R）`, { clickable: true });
+  } else {
+    setBanner("");
+  }
 }
 
 async function checkHealth() {
@@ -1503,7 +1752,7 @@ async function ensureConnected() {
     if (connected) return;
     connected = true;
     setConn("online", "已连接");
-    setBanner(updateReady ? `界面已更新到 ${updateReady}：按 Ctrl+Shift+R 刷新本页` : "");
+    setBanner(updateReady ? `界面已更新到 ${updateReady}：按 Ctrl+Shift+R 刷新本页` : "", { clickable: true });
     await loadSessions();
     connectEvents();
     if (state.sessions.length) {
@@ -1517,10 +1766,10 @@ async function ensureConnected() {
     connected = false;
     if (es) { es.close(); es = null; }
     setConn("error", "已断开");
-    setBanner("与 OpenCode 的连接已断开，正在重连…（不需要手动刷新）");
+    setBanner("与 OpenCode 的连接已断开，正在重连…（不需要手动刷新）", { sticky: true });
   } else {
     setConn("error", "连接中");
-    setBanner("正在连接 OpenCode…（它可能还在启动，本页面会自动重连）");
+    setBanner("正在连接 OpenCode…（它可能还在启动，本页面会自动重连）", { sticky: true });
   }
 }
 
@@ -1556,11 +1805,10 @@ function startHeartbeat() {
   });
 }
 
-/* ---------------- 昼 / 夜 主题 + 用户主题（主题工坊） ----------------
+/* ---------------- 内置主题 + 用户主题（主题工坊） ----------------
  * 两条属性：
- *   html[data-theme]      = hiru | yoru     —— 「底盘」（明/暗），决定内置样式与背景槽
+ *   html[data-theme]      = hiru            —— 「底盘」（**夜主题已删除，只剩昼**），决定内置样式与背景槽
  *   html[data-theme-user] = <用户主题 id>    —— 用户主题身份（变量 / 图标 / 背景覆盖）
- * 用户主题把自己的 mode 映射到 hiru/yoru 底盘，于是所有既有 [data-theme=...] 规则继续生效；
  * 用户变量注入在 [data-theme-user] 下（特异性更高）覆盖内置变量。详见 docs/THEMES.md。 */
 
 const THEME_KEY = "cocraft.theme";
@@ -1572,7 +1820,7 @@ let _userThemeMode = "";    // 当前用户主题正在用的 mode
 
 const THEME_ICON_SLOTS = {
   sidebar: "#btn-sidebar", tools: "#btn-tools", agent: "#btn-agent", model: "#btn-model",
-  theme: "#btn-theme", refresh: "#btn-refresh", stop: "#btn-stop", home: "#p-home",
+  refresh: "#btn-refresh", stop: "#btn-stop", home: "#p-home",
 };
 
 function themeUser() {
@@ -1588,25 +1836,8 @@ function _setBaseTheme(theme) {
   try { localStorage.setItem(THEME_KEY, theme); } catch { /* 隐私模式忽略 */ }
 }
 
-/** 顶栏「夜/昼」按钮：内置主题 = 切昼夜；双模式用户主题 = 在主题内切；单模式 = 禁用并给理由。 */
-function _syncThemeButton() {
-  const b = $("btn-theme");
-  if (!b) return;
-  const u = themeUser();
-  if (u) {
-    const both = _userThemeModes.length > 1;
-    b.disabled = !both;
-    b.textContent = _userThemeMode === "dark" ? "昼" : "夜";
-    b.title = both
-      ? ("主题「" + u + "」· 点一下切到" + (_userThemeMode === "dark" ? "浅色" : "深色"))
-      : ("主题「" + u + "」只有一种明暗，不能切换（设置 →「主题工坊」回内置）");
-  } else {
-    b.disabled = false;
-    const dark = document.documentElement.dataset.theme === "yoru";
-    b.textContent = dark ? "昼" : "夜";
-    b.title = dark ? "切回：昼（内置白昼）" : "切到：夜（内置夜晚）";
-  }
-}
+/** 顶栏「夜/昼」按钮 —— **夜主题已删除**，这里保留为空实现（按钮也不在了）。 */
+function _syncThemeButton() { /* no-op：夜主题已移除 */ }
 
 function clearThemeIcons() {
   document.querySelectorAll("[data-ico-on]").forEach((el) => {
@@ -1633,16 +1864,12 @@ function setThemeStyle(css) {
   el.textContent = css || "";
 }
 
-/** 主题自带背景：覆盖静态背景槽与 #live-bg 的兜底图（按底盘明/暗）。 */
+/** 主题自带背景：覆盖静态背景槽与 #live-bg 的兜底图。 */
 function _themeBgCss(bg) {
   let css = "";
   if (bg && bg.light) {
     css += '#static-bg .sb[data-bg="hiru"]{background-image:url("' + bg.light + '");}\n';
     css += 'html[data-theme="hiru"] #live-bg{background-image:url("' + bg.light + '");}\n';
-  }
-  if (bg && bg.dark) {
-    css += '#static-bg .sb[data-bg="yoru"]{background-image:url("' + bg.dark + '");}\n';
-    css += 'html[data-theme="yoru"] #live-bg{background-image:url("' + bg.dark + '");}\n';
   }
   return css;
 }
@@ -1666,12 +1893,10 @@ function clearUserTheme() {
   } catch { /* ignore */ }
 }
 
-/** 应用内置主题（并清掉任何用户主题）。 */
-function applyTheme(theme) {
-  theme = theme === "yoru" ? "yoru" : "hiru";
+/** 应用内置主题（并清掉任何用户主题）—— **只有一个「昼」底盘**（夜主题已删除）。 */
+function applyTheme(_theme) {
   clearUserTheme();
-  _setBaseTheme(theme);
-  _syncThemeButton();
+  _setBaseTheme("hiru");
   syncThemesActive();
 }
 
@@ -1683,7 +1908,7 @@ async function applyUserTheme(id, mode) {
   if (!r || !r.ok) throw new Error((r && r.error) || "主题读取失败");
   _userThemeModes = (Array.isArray(r.modes) && r.modes.length) ? r.modes : [r.mode];
   _userThemeMode = r.mode;
-  _setBaseTheme(r.mode === "dark" ? "yoru" : "hiru");
+  _setBaseTheme("hiru");                 // 只有一个「昼」底盘
   document.documentElement.dataset.themeUser = id;
   setThemeStyle(_themeCss(id, r));
   setThemeIcons(r.icons);
@@ -1697,28 +1922,13 @@ async function applyUserTheme(id, mode) {
 }
 
 function initTheme() {
-  let base = "hiru", user = "", umode = "";
+  let user = "", umode = "";
   try {
-    base = localStorage.getItem(THEME_KEY) || "hiru";
     user = localStorage.getItem(THEME_USER_KEY) || "";
     umode = localStorage.getItem(THEME_USER_MODE_KEY) || "";
   } catch { /* ignore */ }
-  applyTheme(base);
-  const b = $("btn-theme");
-  if (b) b.addEventListener("click", () => {
-    const u = themeUser();
-    if (u) {
-      if (_userThemeModes.length > 1) {
-        applyUserTheme(u, _userThemeMode === "dark" ? "light" : "dark")
-          .catch((e) => setBanner("切换失败：" + ((e && e.message) ? e.message : e)));
-      } else {
-        setBanner("主题「" + u + "」只有一种明暗，不能切换（设置 →「主题工坊」可回内置）");
-      }
-      return;
-    }
-    applyTheme(document.documentElement.dataset.theme === "yoru" ? "hiru" : "yoru");
-  });
-  if (user) applyUserTheme(user, umode).catch(() => { clearUserTheme(); _syncThemeButton(); });
+  applyTheme("hiru");                     // 夜主题已删除：只有昼
+  if (user) applyUserTheme(user, umode).catch(() => { clearUserTheme(); });
 }
 
 /* ---------------- 主题工坊（浏览 / 安装 / 套用 / 卸载） ---------------- */
@@ -1946,7 +2156,7 @@ async function themesUpdate(id) {
 function initThemes() {
   const open = $("cfg-themes");
   if (open) open.addEventListener("click", () => {
-    const c = $("cfg"); if (c) c.hidden = true;
+    const c = $("cfg"); if (c) cfgClose();
     openThemes();
   });
   const x = $("th-close"); if (x) x.addEventListener("click", closeThemes);
@@ -1956,7 +2166,7 @@ function initThemes() {
   });
   const rst = $("th-reset");
   if (rst) rst.addEventListener("click", () => {
-    applyTheme(document.documentElement.dataset.theme === "yoru" ? "yoru" : "hiru");
+    applyTheme("hiru");
     setBanner("已恢复内置主题");
     renderThemes();
   });
@@ -2052,6 +2262,35 @@ function initToolsMenu() {
     if (!menu.hidden && !menu.contains(e.target) && !btn.contains(e.target)) menu.hidden = true;
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu.hidden = true; });
+}
+
+/** 顶栏「群聊 / 音乐」小抽屉（取代原来右边那条透明触发带）。 */
+function initHubMenu() {
+  const btn = $("btn-hub"), menu = $("hub-menu");
+  if (!btn || !menu) return;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (menu.hidden) { syncHubBtn(); menu.hidden = false; } else { menu.hidden = true; }
+  });
+  menu.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    e.stopPropagation();
+    const tool = b.dataset.tool || "";
+    if (tool === "chat") { setCocraft(!cocraftIsOpen()); }
+    else if (tool === "music") {
+      const on = !MUSIC.shown;
+      setPlayerShown(on);
+      if (on) { try { setPlayerFold(false); } catch (err) { /* ignore */ } }   // 打开时展开，别只剩个 ▾
+    }
+    menu.hidden = true;
+    syncHubBtn();
+  });
+  document.addEventListener("click", (e) => {
+    if (!menu.hidden && !menu.contains(e.target) && !btn.contains(e.target)) menu.hidden = true;
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu.hidden = true; });
+  syncHubBtn();
 }
 
 /* ---------------- 落樱 + 落水涟漪 ----------------
@@ -2322,9 +2561,15 @@ const CC = {
   token: "",
   me: null,
   users: {},              // 用户信息缓存（见 ccCacheUser / ccUserName）
+  ai: [],                 // AI 成员（/ccagent/list；后端桥）
+  permDone: {},           // 已处理过的权限申请（群消息 id → true；点了按钮就不再显示弹窗）
   chats: [],
   chatID: "",
   msgs: [],
+  msgsTotal: 0,           // 服务端该会话的消息总数（用来算"最后一页"的 offset）
+  members: [],            // 当前会话成员（含 agent；带 presence）
+  floor: null,            // 当前发言权 {holder_agent_id, deadline}
+  floorTimer: null,       // 发言权倒计时（只在有 deadline 时转）
   wsock: null,
   wsPing: null,
   wsRetry: 0,
@@ -2432,17 +2677,17 @@ function setCocraft(open) {
   box.setAttribute("aria-hidden", open ? "false" : "true");
   document.documentElement.classList.toggle("cc-open", !!open);   // ← 分屏：面板内容让位
   if (open) ccApplyWidth(parseInt(ccLoad(CC_W_KEY), 10) || CC_W_DEFAULT, true);  // 打开时把让位宽度同步好
-  const strip = $("chat-strip");
-  if (strip) strip.setAttribute("aria-expanded", open ? "true" : "false");
   try { localStorage.setItem(CC_OPEN_KEY, open ? "1" : "0"); } catch { /* 隐私模式 */ }
+  if (typeof syncHubBtn === "function") syncHubBtn();
   if (open && CC.token && CC.chatID && !CC.msgs.length) ccLoadMsgs();
   // 打开时重算用户名（缓存里可能已经有；没有的就补一次 /users/{id}）——
   // 否则名字可能是在抽屉关着的时候拉回来的，界面还停在「用户 id」。
   if (open) setTimeout(() => {
     ccRefreshUserUI();
     if (CC.me && CC.me.id != null && !((CC.users[String(CC.me.id)] || {}).username)) ccFetchUser(CC.me.id);
-    CC.msgs.forEach((m) => ccUserName(m.sender_id));
+    CC.msgs.forEach((m) => ccSenderName(m));
   }, 0);
+  syncDrawerOverlap();
 }
 
 /** 抽屉顶部的一行提示 */
@@ -2485,6 +2730,9 @@ function ccShowAuth(msg) {
   ccMenuOpen(false);
   ccAuthMsg(msg || "", !!msg);
   CC.me = null;
+  CC.members = [];
+  CC.floor = null;
+  if (CC.floorTimer) { clearInterval(CC.floorTimer); CC.floorTimer = null; }
   ccStopPoll();
   ccCloseWS();
 }
@@ -2544,10 +2792,29 @@ async function ccInit() {
 /* ---- 会话列表 ---- */
 const ccChatName = (c) => c.name || ("会话 #" + c.id);
 
+/** 新建群聊会话：POST /chats（{name?, avatar?, members?}）→ 刷新列表并打开它。 */
+async function ccNewChat() {
+  let name = "新会话";
+  try {
+    const r = prompt("新建会话：给它起个名字（可留空）", "新会话");
+    if (r === null) return;                       // 取消
+    name = String(r).trim().slice(0, 128) || "新会话";
+  } catch { /* prompt 不可用就用默认名 */ }
+  try {
+    const c = await ccFetch("/chats", { method: "POST", body: { name } });
+    await ccLoadChats();
+    if (c && c.id != null) await ccOpenChat(c.id);
+    ccNote("已新建会话：" + (c && (c.name || c.id) ? (c.name || c.id) : name));
+  } catch (e) {
+    ccNote("新建会话失败：" + e.message, true);
+  }
+}
+
 async function ccLoadChats() {
   try {
     const list = await ccFetch("/chats");
-    CC.chats = Array.isArray(list) ? list : ((list && list.data) || []);
+    // 服务端返回形状兼容：裸数组 / {items:[…]}（新 ChatList）/ {data:[…]}（旧）
+    CC.chats = Array.isArray(list) ? list : ((list && (list.items || list.data)) || []);
     ccRenderChats();
     if (!CC.chatID && CC.chats.length) ccOpenChat(CC.chats[0].id);
     else ccRenderRoomHead();
@@ -2572,9 +2839,13 @@ function ccRenderChats() {
 async function ccOpenChat(id) {
   CC.chatID = String(id);
   CC.msgs = [];
+  CC.members = [];
+  CC.floor = null;
   ccMenuOpen(false);
   ccRenderChats();
   ccRenderRoomHead();
+  ccLoadMembers();        // 成员在线状态（不 await：慢也不该挡住消息）
+  ccLoadFloor();          // 当前发言权
   await ccLoadMsgs();
 }
 
@@ -2582,15 +2853,118 @@ function ccRenderRoomHead() {
   const title = ccEl("cc-room-title");
   if (!title) return;
   const c = CC.chats.find((x) => String(x.id) === String(CC.chatID));
-  if (!c) { title.textContent = "选一个会话"; return; }
-  const names = (c.members || []).map((m) => (m && typeof m === "object") ? (m.username || m.id) : m);
-  title.innerHTML = `${esc(ccChatName(c))} <span class="muted">${esc(names.join("、"))}</span>`;
+  if (!c) { title.textContent = "选一个会话"; ccRenderRoomMeta(); return; }
+  title.textContent = ccChatName(c);
+  ccRenderRoomMeta();
 }
+
+/* ---- 成员在线状态（presence）与发言权（floor）----
+   数据来源：GET /chats/{id}/members、GET /chats/{id}/floor，
+   以及 WebSocket **主动推送**的 presence / floor 事件（服务端已恢复推送，见 tools/cocraft_ws_check.py）。 */
+function ccMemberName(m) {
+  return (m && (m.username || m.name || m.display)) || ("用户 " + (m && m.id));
+}
+function ccFloorLeft() {
+  const dl = CC.floor && CC.floor.deadline;
+  if (!dl) return null;
+  const t = Date.parse(dl);
+  if (isNaN(t)) return null;
+  const s = Math.round((t - Date.now()) / 1000);
+  return s > 0 ? s : 0;
+}
+function ccFloorChip() {
+  if (!CC.floor) return "";
+  const hid = CC.floor.holder_agent_id;
+  if (hid == null) return `<span class="cc-floor idle" title="当前无人持有发言权">发言权：空闲</span>`;
+  const m = (CC.members || []).find((x) => x.kind === "agent" && String(x.id) === String(hid));
+  const nm = m ? ccMemberName(m) : ("agent " + hid);
+  const left = ccFloorLeft();
+  return `<span class="cc-floor" title="${esc(CC.floor.deadline || "无期限")}">发言权：${esc(nm)}`
+    + (left != null ? `（${left}s）` : "") + `</span>`;
+}
+function ccRenderRoomMeta() {
+  const box = ccEl("cc-room-meta");
+  if (!box) return;
+  const mem = CC.members || [];
+  if (!CC.chatID || (!mem.length && !CC.floor)) { box.hidden = true; box.innerHTML = ""; return; }
+  const on = mem.filter((m) => m.presence === "online").length;
+  const chips = mem.map((m) => {
+    const isAgent = m.kind === "agent";
+    const onl = m.presence === "online";
+    const fl = isAgent && CC.floor && String(CC.floor.holder_agent_id) === String(m.id);
+    return `<span class="cc-chip${isAgent ? " agent" : ""}${fl ? " floor" : ""}"`
+      + ` title="${esc(ccMemberName(m))}${isAgent ? "（agent）" : ""}${onl ? " · 在线" : " · 离线"}">`
+      + `<i class="cc-dot${onl ? " on" : ""}"></i>${isAgent ? "🤖" : ""}${esc(ccMemberName(m))}</span>`;
+  }).join("");
+  box.innerHTML = `<span class="cc-meta-on">在线 ${on}/${mem.length}</span>` + chips + ccFloorChip();
+  box.hidden = false;
+  ccEnsureFloorTimer();
+}
+/** 发言权倒计时：只在有未到期的 deadline 时每秒重画，到期即清空。 */
+function ccEnsureFloorTimer() {
+  const need = !!CC.floor && ccFloorLeft() > 0;
+  if (need && !CC.floorTimer) {
+    CC.floorTimer = setInterval(() => {
+      const left = ccFloorLeft();
+      if (!CC.floor || left === null || left <= 0) {
+        clearInterval(CC.floorTimer); CC.floorTimer = null;
+        if (CC.floor && CC.floor.deadline && left === 0) CC.floor = { holder_agent_id: null, deadline: null };
+      }
+      ccRenderRoomMeta();
+    }, 1000);
+  } else if (!need && CC.floorTimer) {
+    clearInterval(CC.floorTimer); CC.floorTimer = null;
+  }
+}
+async function ccLoadMembers() {
+  if (!CC.chatID) return;
+  try {
+    const r = await ccFetch("/chats/" + encodeURIComponent(CC.chatID) + "/members");
+    CC.members = (r && r.items) || (Array.isArray(r) ? r : []);
+    ccRenderRoomHead();
+  } catch { /* 头部信息刷新失败不打扰 */ }
+}
+async function ccLoadFloor() {
+  if (!CC.chatID) return;
+  try {
+    const f = await ccFetch("/chats/" + encodeURIComponent(CC.chatID) + "/floor");
+    CC.floor = (f && typeof f === "object") ? f : null;
+    ccRenderRoomHead();
+  } catch { /* 忽略 */ }
+}
+/** WebSocket `presence`：更新某成员的在线状态（没见过的就补进来）。 */
+function ccApplyPresence(d) {
+  if (!d) return;
+  const kind = d.kind || "user";
+  const list = CC.members || (CC.members = []);
+  const i = list.findIndex((m) => (m.kind || "user") === kind && String(m.id) === String(d.id));
+  if (i >= 0) list[i] = Object.assign({}, list[i], { presence: d.presence, name: d.name || list[i].name });
+  else list.push({ kind: kind, id: d.id, name: d.name, display: d.display, presence: d.presence });
+  ccRenderRoomMeta();
+}
+/** WebSocket `floor`：更新当前发言权（只认当前会话）。 */
+function ccApplyFloor(d) {
+  if (!d) return;
+  if (CC.chatID && String(d.chat_id) !== String(CC.chatID)) return;
+  CC.floor = { holder_agent_id: d.holder_agent_id, deadline: d.deadline };
+  ccRenderRoomMeta();
+}
+
+/** 消息页大小。⚠ 服务端 `/chats/{id}/messages` **没有 order 参数**：
+ *  它按 **id 升序、从 `offset` 开始**给（返回 `{items,total,limit,offset}`）。 */
+const CC_MSG_PAGE = 100;
 
 async function ccLoadMsgs(toBottom) {
   if (!CC.chatID) return;
+  const url = (off) => "/chats/" + encodeURIComponent(CC.chatID)
+    + "/messages?limit=" + CC_MSG_PAGE + "&offset=" + off;
   try {
-    const page = await ccFetch("/chats/" + encodeURIComponent(CC.chatID) + "/messages?limit=100&offset=0");
+    // ⚠ 先问 total、再取**最后一页**。直接 `limit=100&offset=0` 只会拿到**最旧**的 100 条 ——
+    //   会话一超过 100 条，新消息就永远看不到（实测 total=115 时面板停在 id 102）。
+    let page = await ccFetch(url(0));
+    const total = (page && page.total) || ((page && page.items) || []).length;
+    CC.msgsTotal = total;
+    if (total > CC_MSG_PAGE) page = await ccFetch(url(Math.max(0, total - CC_MSG_PAGE)));
     CC.msgs = (page && page.items) || [];
     ccRenderMsgs(toBottom !== false);
   } catch (e) {
@@ -2625,19 +2999,203 @@ function ccRenderFileBody(m) {
     + ` title="下载 / 打开">📎 ${esc(name)}</a>`;
 }
 
+/** 某成员是不是 AI（agent）——按当前会话成员表判断。 */
+function ccAgentById(id) {
+  return (CC.members || []).find((x) => x.kind === "agent" && String(x.id) === String(id)) || null;
+}
+/** 消息发送者的显示名：**agent 用它自己的名字**，别再拿 agent id 去当用户查（会和用户 id 撞名）。 */
+function ccSenderName(m) {
+  const kind = (m && m.sender_kind) || "";
+  const id = m && m.sender_id;
+  const isAgent = kind === "agent" || (!kind && !!ccAgentById(id));
+  if (isAgent) {
+    const a = ccAgentById(id);
+    return (a && (a.name || a.display)) || ("agent " + id);
+  }
+  return ccUserName(id);
+}
+function ccIsAgentMsg(m) {
+  const kind = (m && m.sender_kind) || "";
+  return kind === "agent" || (!kind && !!ccAgentById(m && m.sender_id));
+}
+
+/** cocraft 的时间是 **UTC**（ISO 带 `+00:00`）→ 面板要显示**本地时间**。
+ *  ⚠ 以前直接 `replace("T"," ").slice(0,16)` → 比本地慢 8 小时（东八区）。
+ *  没有时区信息的老数据按 UTC 解释；解析不出来就退回原样截断。 */
+function ccLocalTime(iso) {
+  const s = String(iso || "").trim();
+  if (!s) return "";
+  const hasTz = /[zZ]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s);
+  const d = new Date(hasTz ? s : s + "Z");
+  if (isNaN(d.getTime())) return s.replace("T", " ").slice(0, 16);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function ccRenderMsgs(toBottom) {
   const box = ccEl("cc-msgs");
   if (!box) return;
   if (!CC.msgs.length) { box.innerHTML = `<div class="cc-empty">还没有消息</div>`; return; }
   box.innerHTML = CC.msgs.map((m) => {
-    const mine = CC.me && String(m.sender_id) === String(CC.me.id);
-    const who = mine ? "我" : ccUserName(m.sender_id);
-    const t = m.created_at ? String(m.created_at).replace("T", " ").slice(0, 16) : "";
+    const isAgent = ccIsAgentMsg(m);
+    const mine = !isAgent && CC.me && String(m.sender_id) === String(CC.me.id);
+    const who = (isAgent ? "🤖 " : "") + (mine ? "我" : ccSenderName(m));
+    const t = ccLocalTime(m.created_at);
     const body = m.message_type === "file" ? ccRenderFileBody(m) : esc(m.content || "");
-    return `<div class="cc-m${mine ? " me" : ""}"><span class="cc-mt">${esc(who)}${t ? " · " + esc(t) : ""}</span>`
+    return `<div class="cc-m${mine ? " me" : ""}${isAgent ? " agent" : ""}"><span class="cc-mt">${esc(who)}${t ? " · " + esc(t) : ""}</span>`
       + `<div class="cc-mb">${body}</div></div>`;
   }).join("");
-  if (toBottom !== false) box.scrollTop = box.scrollHeight;
+  if (toBottom !== false) ccScrollBottom(box);
+  ccPermRender();                 // ★ 顺手刷新「权限申请」小弹窗（输入框上方那个）
+}
+
+/* ---- ★群聊权限申请：**输入框上方的小弹窗** ----
+   桥在群里发的「🔐 权限申请…」那条消息驱动这个弹窗；点按钮**仍然在群里发同一句**
+   `@<agent> 可以 / 始终可以 / 不行`（行为与手打完全一致，群里留有审计痕迹）。
+   它只是把「手打 @名字 + 记得要说可以」变成一次点击。 */
+
+/** UTC ISO → epoch（没带时区就按 UTC 算；与 ccLocalTime 同一套规则）。 */
+function ccEpoch(iso) {
+  const s = String(iso || "").trim();
+  if (!s) return NaN;
+  return Date.parse(/[zZ]$/.test(s) || /[+-]\d{2}:?\d{2}$/.test(s) ? s : s + "Z");
+}
+
+/** 从申请文案里抠出「动作 / 类型 / 涉及路径 / 等多少秒 / 命令 / 是否破坏性」。 */
+function ccPermParse(text) {
+  const s = String(text || "");
+  const pick = (re) => String((s.match(re) || [])[1] || "").trim();
+  return {
+    title: pick(/权限申请\**：\s*([^\n]+)/) || "请求权限",
+    kind: pick(/类型：\s*([^\n]+)/),
+    paths: pick(/涉及：\s*([^\n]+)/),
+    cmd: pick(/\*\*要执行的命令\*\*：`([^`]+)`/),
+    destructive: /破坏性操作/.test(s),
+    secs: Number(pick(/（(\d+)\s*秒内/) || 90) || 90,
+  };
+}
+
+/** 当前待批准的申请：最近一条「🔐 权限申请」；若其后已有「已允许/已拒绝/超时」→ 视为已结算。 */
+function ccPermPending() {
+  const msgs = CC.msgs || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    const c = String((m && m.content) || "");
+    if (m.sender_kind === "agent" && /已允许|已拒绝|权限申请超时/.test(c)) return null;
+    if (m.sender_kind === "agent" && c.indexOf("权限申请") >= 0 && m.id != null) return m;
+  }
+  return null;
+}
+
+/** 申请来自哪个 AI 成员（要拿它的 **name** 去 @）。 */
+function ccPermAgent(m) {
+  const hit = (CC.ai || []).find((a) => String(a.id) === String(m && m.sender_id));
+  return { name: (hit && hit.name) || "",
+           label: (hit && (hit.display || hit.name)) || ccSenderName(m || {}) };
+}
+
+function ccPermRender() {
+  const box = ccEl("cc-perm");
+  if (!box) return;
+  const m = ccPermPending();
+  if (!m || (CC.permDone || {})[String(m.id)]) {
+    if (!box.hidden) { box.hidden = true; box.innerHTML = ""; }
+    ccPermTimer(false);
+    return;
+  }
+  const info = ccPermParse(m.content);
+  const a = ccPermAgent(m);
+  const left = Math.max(0, Math.round(info.secs - (Date.now() - ccEpoch(m.created_at)) / 1000));
+  if (!(left > 0)) {                    // 到点（或时间戳异常）→ 桥那边会自行拒绝，这里也收起来
+    box.hidden = true; box.innerHTML = ""; ccPermTimer(false); return;
+  }
+  box.hidden = false;
+  const cmdLine = info.cmd
+    ? `<div class="cc-perm-cmd" title="${esc(info.cmd)}">${esc(info.cmd)}</div>` : "";
+  box.innerHTML = `<div class="cc-perm-h${info.destructive ? " danger" : ""}">`
+    + `${info.destructive ? "⚠️" : "🔐"} <b>${esc(a.label)}</b> `
+    + `${info.destructive ? "请求执行破坏性操作" : "请求权限"}`
+    + `<span class="cc-perm-t">${left}s</span></div>`
+    + `<div class="cc-perm-b">${esc(info.title)}${info.kind ? " · " + esc(info.kind) : ""}`
+    + (info.paths ? `<span class="cc-perm-p" title="${esc(info.paths)}">${esc(info.paths)}</span>` : "")
+    + `</div>` + cmdLine
+    + `<div class="cc-perm-a">`
+    + (info.destructive
+        ? `<button type="button" class="danger" data-perm="once">确认执行</button>`
+          + `<button type="button" data-perm="reject">拒绝</button>`
+        : `<button type="button" class="primary" data-perm="once">允许</button>`
+          + `<button type="button" data-perm="always">始终允许</button>`
+          + `<button type="button" data-perm="reject">拒绝</button>`)
+    + `<button type="button" class="cc-perm-x" data-perm="hide" title="先不管（到点自动拒绝）">×</button>`
+    + `</div>`;
+  ccPermTimer(true);
+  // 抽屉没开着 → 用顶部横幅提醒（否则根本看不到这个弹窗）
+  if (!cocraftIsOpen()) setBanner(`群聊：${a.label} 有权限申请待批准 —— 打开群聊，在输入框上方一键「允许」`);
+}
+
+let ccPermT = null;
+function ccPermTimer(on) {
+  if (on && !ccPermT) ccPermT = setInterval(() => ccPermRender(), 1000);   // 每秒刷倒计时，到点自动收
+  if (!on && ccPermT) { clearInterval(ccPermT); ccPermT = null; }
+}
+
+/** 点按钮：在群里发 `@<agent> 可以 / 始终可以 / 不行`（跟手打等价）。 */
+function ccPermAnswer(kind) {
+  const m = ccPermPending();
+  if (!m) return;
+  if (kind === "hide") {
+    (CC.permDone || (CC.permDone = {}))[String(m.id)] = true;
+    ccPermRender();
+    return;
+  }
+  const a = ccPermAgent(m);
+  if (!a.name) { ccNote("拿不到这个 AI 成员的名字，没法回批准", true); return; }
+  const info = ccPermParse(m.content);
+  // ★ 破坏性操作：只有「确认」才算（跟桥那边的判据一致）；「可以」不算
+  const word = kind === "reject" ? "不行"
+    : (info.destructive ? "确认" : (kind === "always" ? "始终可以" : "可以"));
+  if (!ccSend("@" + a.name + " " + word)) return;      // 失败时 ccSend 自己提示过
+  (CC.permDone || (CC.permDone = {}))[String(m.id)] = true;
+  ccNote("已发送：" + (kind === "reject" ? "拒绝"
+    : (info.destructive ? "确认执行" : (kind === "always" ? "始终允许" : "允许"))));
+  ccPermRender();
+}
+
+function initCcPerm() {
+  const box = ccEl("cc-perm");
+  if (!box) return;
+  box.addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-perm]");
+    if (b) ccPermAnswer(b.dataset.perm);
+  });
+}
+
+/** 滚到底部。
+ *  ⚠ 不能只写 `box.scrollTop = box.scrollHeight`：`.cc-m` 曾带 `content-visibility:auto`，
+ *    刚 `innerHTML` 完时屏外那些消息还没布局 → `scrollHeight` 被低估
+ *    → scrollTop 被设成一个很小的值（常常是 0）→ 看起来「一有新消息就跳到最上面」。
+ *  修法：去掉 `content-visibility`（根因）+ 多次补设 scrollTop。 */
+function ccScrollBottom(box) {
+  const go = () => { box.scrollTop = box.scrollHeight; };
+  go();
+  setTimeout(go, 0);      // 布局稳定后补一次（字体/图片到位后 scrollHeight 会变大）
+  setTimeout(go, 80);
+}
+
+/** WS 推来的帧**就是消息本体** → 直接追加（已存在就忽略，防重复）。
+ *  只有"补历史"才交给 `ccLoadMsgs()`（它会取**最后一页**）。 */
+function ccPushMsg(m) {
+  if (!m || m.id == null) return;
+  if ((CC.msgs || []).some((x) => String(x.id) === String(m.id))) return;
+  // 帧里理论上带 created_at；万一没带就用「现在」（推送是实时的，正好对）。
+  if (!m.created_at) m.created_at = new Date().toISOString();
+  const box = ccEl("cc-msgs");
+  // 本来就在底部 → 跟着到底；正在往上翻旧消息 → 不动它
+  const atBottom = !box || (box.scrollHeight - box.scrollTop - box.clientHeight < 80);
+  CC.msgs.push(m);
+  CC.msgsTotal = (CC.msgsTotal || 0) + 1;
+  if (CC.msgs.length > 400) CC.msgs.splice(0, CC.msgs.length - 400);
+  ccRenderMsgs(atBottom);
 }
 
 /** 发文件：POST multipart /chats/{id}/files，字段名 `file`。
@@ -2665,8 +3223,22 @@ async function ccSendFile(file) {
       const d = (data && (data.detail || data.error)) || res.statusText || ("HTTP " + res.status);
       throw new Error(typeof d === "string" ? d : JSON.stringify(d));
     }
-    ccNote(`已发送文件：${ccFileName((data && data.content) || file.name)}`);
+    const sent = ccFileName((data && data.content) || file.name);
     await ccLoadMsgs(true);
+    // ★ 上传接口**不能带说明/@**（只收 file 字段）→ 若输入框里有文字，**紧接着把这段文字也发出去**。
+    //   这样「@yiyi 看下这张图」一步到位：图片先进群，@ 随后发出；agent 被 @ 时会带上刚发的图片。
+    const inp = ccEl("cc-input");
+    const cap = inp ? String(inp.value || "").trim() : "";
+    if (cap) {
+      if (ccSend(cap)) {
+        inp.value = "";
+        ccNote(`已发送文件 + 说明：${sent}`);
+      } else {
+        ccNote(`已发送文件：${sent}（说明没发出去：WebSocket 未就绪，请手动再发一次）`, true);
+      }
+    } else {
+      ccNote(`已发送文件：${sent}`);
+    }
   } catch (e) {
     ccNote("上传失败：" + (e && e.message ? e.message : e), true);
   } finally {
@@ -2681,8 +3253,16 @@ function ccSend(text) {
   const t = String(text || "").trim();
   if (!t || !CC.chatID) return false;
   if (!CC.wsock || CC.wsock.readyState !== 1) { ccNote("还没连上（WebSocket 未就绪），稍等再发", true); return false; }
+  // ★ 解析 `@名字` → `mentions`：服务端**靠 mentions 数组**才知道该推 `mention` 给哪个 agent
+  //   （只写 "@xxx" 文本、不带 mentions，服务端不会推 —— 实测）。@ 后面的名字按「字母/数字/_/-」取。
+  const mentions = [];
+  const re = /@([A-Za-z0-9_\-]+)/g;
+  let m;
+  while ((m = re.exec(t))) { if (mentions.indexOf(m[1]) < 0) mentions.push(m[1]); }
   try {
-    CC.wsock.send(JSON.stringify({ type: "message", chat_id: Number(CC.chatID) || CC.chatID, content: t }));
+    const frame = { type: "message", chat_id: Number(CC.chatID) || CC.chatID, content: t };
+    if (mentions.length) frame.mentions = mentions;
+    CC.wsock.send(JSON.stringify(frame));
     ccNote("");
     return true;
   } catch (e) { ccNote("发送失败：" + e.message, true); return false; }
@@ -2693,6 +3273,136 @@ function ccMenuOpen(open) {
   const pop = ccEl("cc-menu-pop");
   if (!pop) return;
   pop.hidden = !open;
+  if (open) { ccFillAiEngines(); ccLoadAI(); }   // 打开菜单时刷一次「AI 成员」
+}
+
+/* ---- AI 成员（把面板里的 ACP agent 接进群聊；后端 backend/cocraft_agents.py 跑桥）----
+   ⚠ 管理接口在**本地** `/ccagent/*`（不是 /cocraft 代理），要带**用户令牌**。 */
+async function ccAgentFetch(path, opts) {
+  opts = opts || {};
+  const headers = { "Content-Type": "application/json" };
+  if (CC.token) headers["Authorization"] = "Bearer " + CC.token;
+  const res = await fetch("/ccagent" + path, {
+    method: opts.method || "GET", headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined, cache: "no-store",
+  });
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  if (!res.ok) {
+    const d = (data && (data.error || data.detail)) || res.statusText || ("HTTP " + res.status);
+    const err = new Error(typeof d === "string" ? d : JSON.stringify(d));
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+/** 把可用的 ACP agent 填进「用哪个大脑」下拉（只在空的时候填）。 */
+function ccFillAiEngines() {
+  const sel = ccEl("cc-ai-engine");
+  if (!sel) return;
+  if (sel.dataset.filled === "1" && sel.options.length) return;
+  const run = () => {
+    const list = (ACP.list || []).filter((a) => a.available);
+    sel.innerHTML = list.map((a) =>
+      `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`).join("")
+      || `<option value="">（没有可用的 ACP agent）</option>`;
+    sel.dataset.filled = "1";
+  };
+  if ((ACP.list || []).length) run();
+  else loadAcpAgents().then(run).catch(run);
+}
+
+const ccIsInChat = (a) => String(CC.chatID) && (a.chats || []).some((c) => String(c) === String(CC.chatID));
+
+function ccRenderAI() {
+  const box = ccEl("cc-ai-list");
+  if (!box) return;
+  const list = CC.ai || [];
+  if (!list.length) { box.innerHTML = `<div class="cc-ai-empty">还没有 AI 成员</div>`; return; }
+  box.innerHTML = list.map((a) => {
+    const inChat = ccIsInChat(a);
+    return `<div class="cc-ai" data-id="${esc(a.id)}">`
+      + `<span class="cc-ai-name" title="id ${esc(a.id)} · 大脑 ${esc(a.engine)}">`
+      + `<i class="cc-dot${a.enabled && a.running ? " on" : ""}"></i>${esc(a.name)}`
+      + ccAiEngineSelect(a) + `</span>`
+      + `<button type="button" class="cc-ai-b" data-act="join" ${inChat ? "disabled" : ""}>加群</button>`
+      + `<button type="button" class="cc-ai-b" data-act="leave" ${inChat ? "" : "disabled"}>退群</button>`
+      + `<button type="button" class="cc-ai-b${a.enabled ? " on" : ""}" data-act="toggle">`
+      + `${a.enabled ? "应答中" : "已停"}</button>`
+      + `<button type="button" class="cc-ai-b del" data-act="del" title="删除这个 AI 成员">×</button>`
+      + `</div>`
+      + (a.warn ? `<div class="cc-ai-warn" title="权限：${esc(a.warn)}">⚠ ${esc(a.warn)}</div>` : "");
+  }).join("");
+}
+
+async function ccLoadAI() {
+  if (!CC.token) return;
+  try {
+    const r = await ccAgentFetch("/list");
+    CC.ai = (r && r.agents) || [];
+    ccRenderAI();
+  } catch (e) { /* 拿不到就保持 */ }
+}
+
+async function ccAiAdd() {
+  const name = String((ccEl("cc-ai-name") || {}).value || "").trim();
+  const engine = String((ccEl("cc-ai-engine") || {}).value || "");
+  if (!name) { ccNote("给 AI 成员起个名字（@ 它用）", true); return; }
+  if (!engine) { ccNote("没有可用的 ACP agent 当大脑（设置 → ACP 代理里先加一个）", true); return; }
+  try {
+    const r = await ccAgentFetch("/create", { method: "POST", body: { name: name, display: name, engine: engine } });
+    ccEl("cc-ai-name").value = "";
+    const a = r && r.agent;
+    if (a && CC.chatID) {
+      try { await ccAgentFetch("/join", { method: "POST", body: { id: a.id, chat_id: CC.chatID } }); } catch { /* ignore */ }
+      try { await ccAgentFetch("/enabled", { method: "POST", body: { id: a.id, on: true } }); } catch { /* ignore */ }
+    }
+    CC.ai = (r && r.agents) || CC.ai;
+    ccRenderAI();
+    ccNote("已建 AI 成员：" + name + "（用 " + engine + " 当大脑）");
+  } catch (e) { ccNote("建 AI 成员失败：" + e.message, true); }
+}
+
+/** 每行的「大脑」下拉：列出可用的 ACP agent，当前绑定的即使不可用也保留。 */
+function ccAiEngineSelect(a) {
+  const list = (ACP.list || []).filter((x) => x.available);
+  const opts = list.map((x) =>
+    `<option value="${esc(x.id)}"${String(x.id) === String(a.engine) ? " selected" : ""}>${esc(x.label || x.id)}</option>`).join("");
+  const extra = (a.engine && !list.some((x) => String(x.id) === String(a.engine)))
+    ? `<option value="${esc(a.engine)}" selected>${esc(a.engine)}</option>` : "";
+  return `<select class="cc-ai-eng" data-act="engine" title="换大脑（用哪个 ACP agent 生成回复）">${extra}${opts}</select>`;
+}
+
+async function ccAiEngine(id, engine) {
+  const a = (CC.ai || []).find((x) => String(x.id) === String(id)) || {};
+  try {
+    await ccAgentFetch("/update", { method: "POST", body: { id: id, engine: engine } });
+    ccNote("已把 " + (a.name || id) + " 的大脑换成 " + engine);
+    await ccLoadAI();
+  } catch (e) { ccNote("换大脑失败：" + e.message, true); }
+}
+
+async function ccAiAct(id, act) {
+  const a = (CC.ai || []).find((x) => String(x.id) === String(id)) || { id: id };
+  try {
+    if (act === "join") {
+      await ccAgentFetch("/join", { method: "POST", body: { id: id, chat_id: CC.chatID } });
+      await ccAgentFetch("/enabled", { method: "POST", body: { id: id, on: true } });
+      ccNote("已把 " + a.name + " 拉进本群并开始应答");
+    } else if (act === "leave") {
+      await ccAgentFetch("/leave", { method: "POST", body: { id: id, chat_id: CC.chatID } });
+      await ccAgentFetch("/enabled", { method: "POST", body: { id: id, on: false } });
+      ccNote(a.name + " 已退出本群");
+    } else if (act === "toggle") {
+      await ccAgentFetch("/enabled", { method: "POST", body: { id: id, on: !a.enabled } });
+    } else if (act === "del") {
+      if (!window.confirm("删除 AI 成员「" + a.name + "」？（同时从 cocraft 服务端删掉这个 agent）")) return;
+      await ccAgentFetch("/remove", { method: "POST", body: { id: id, hard: true } });
+      ccNote("已删除 " + a.name);
+    }
+    await ccLoadAI();
+  } catch (e) { ccNote("操作失败：" + e.message, true); }
 }
 
 function ccParseIds(s) {
@@ -2754,7 +3464,7 @@ async function ccRefreshAll() {
       return;
     }
     await ccLoadChats();
-    if (CC.chatID) { await ccLoadMsgs(); await ccRefreshChat(); }
+    if (CC.chatID) { await ccLoadMsgs(); await ccRefreshChat(); ccLoadMembers(); ccLoadFloor(); }
     ccNote("已刷新");
     setTimeout(() => { if (ccEl("cc-note").textContent === "已刷新") ccNote(""); }, 1500);
   } catch (e) {
@@ -2786,8 +3496,13 @@ function ccConnectWS() {
     let d = null; try { d = JSON.parse(ev.data); } catch { return; }
     const t = d && d.type;
     if (t === "message") {
-      if (String(d.chat_id) === String(CC.chatID)) ccLoadMsgs();
+      // ★ 推送帧**本身就是消息本体** → 直接追加（省一次往返；也不会再"只看得到最旧的 100 条"）
+      if (String(d.chat_id) === String(CC.chatID)) ccPushMsg(d);
       ccLoadChats();
+    } else if (t === "presence") {
+      ccApplyPresence(d);                       // agent/用户上线、下线
+    } else if (t === "floor") {
+      ccApplyFloor(d);                          // 发言权变更
     } else if (t === "chat_invite" || t === "chat_removed" || t === "chat_deleted") {
       ccLoadChats();
     } else if (t === "error") {
@@ -2805,14 +3520,16 @@ function ccConnectWS() {
   sock.onerror = () => { /* onclose 会跟来 */ };
 }
 
-/* ---- 兜底轮询（WS 漏了也能补上） ---- */
+/* ---- 兜底轮询（WS 已恢复主动推送 → 只在**连接断了**时做慢速兜底） ---- */
 function ccStartPoll() {
   ccStopPoll();
   CC.poll = setInterval(() => {
     if (!CC.token || !cocraftIsOpen()) return;
+    const wsUp = CC.wsock && CC.wsock.readyState === 1;
+    if (wsUp) return;                     // WebSocket 正常 → 完全靠推送，不轮询
     ccLoadChats();
     if (CC.chatID) ccLoadMsgs(false);
-  }, 15000);
+  }, 30000);
 }
 function ccStopPoll() { clearInterval(CC.poll); CC.poll = null; }
 
@@ -2869,8 +3586,7 @@ function ccInitResize() {
 }
 
 function initCocraft() {
-  if (!$("cocraft") || !$("chat-strip")) return;
-  $("chat-strip").addEventListener("click", toggleCocraft);
+  if (!$("cocraft")) return;
   $("cc-close").addEventListener("click", () => setCocraft(false));
   const _mid = ccEl("cc-myid");
   if (_mid) _mid.addEventListener("click", () => ccCopyMyId(_mid));
@@ -2916,12 +3632,25 @@ function initCocraft() {
     const row = e.target.closest && e.target.closest(".cc-chat");
     if (row) ccOpenChat(row.dataset.chat);
   });
+  $("cc-new").addEventListener("click", (e) => { e.stopPropagation(); ccNewChat(); });
   $("cc-menu-btn").addEventListener("click", (e) => {
     e.stopPropagation();
     ccMenuOpen(ccEl("cc-menu-pop").hidden);
   });
   $("cc-invite-go").addEventListener("click", ccInvite);
   $("cc-remove-go").addEventListener("click", ccRemoveMember);
+  $("cc-ai-add").addEventListener("click", ccAiAdd);
+  initCcPerm();                         // ★ 权限申请小弹窗（输入框上方）：按钮 → 发 `@agent 可以`
+  $("cc-ai-list").addEventListener("click", (e) => {
+    const b = e.target.closest && e.target.closest(".cc-ai-b");
+    const row = e.target.closest && e.target.closest(".cc-ai");
+    if (b && row && !b.disabled) ccAiAct(row.dataset.id, b.dataset.act);
+  });
+  $("cc-ai-list").addEventListener("change", (e) => {
+    const sel = e.target.closest && e.target.closest(".cc-ai-eng");
+    const row = e.target.closest && e.target.closest(".cc-ai");
+    if (sel && row) ccAiEngine(row.dataset.id, sel.value);
+  });
   document.addEventListener("click", (e) => {
     const pop = ccEl("cc-menu-pop");
     if (!pop || pop.hidden) return;
@@ -3058,7 +3787,7 @@ function outgoingFiles() {
 const MUSIC = {
   // lyrWanted：歌词浮层的「用户意愿」三态 —— null=自动（收起侧栏才显示）/ true=强制显示 / false=明确关闭
   //（以前只有 true/false，收起侧栏时被 collapsed-focus 强制显示且「词」按钮被隐藏 → 关不掉）
-  on: false, qqRunning: false, real: false, folded: false, panel: null, panelError: "", lyrWanted: null,
+  on: false, qqRunning: false, real: false, folded: false, shown: false, panel: null, panelError: "", lyrWanted: null,
   seekDragging: false, cur: 0, dur: 0,
   state: {}, lyrics: [], lyrKey: "", lyIdx: -1,
   posAt: 0, posStale: false, vol: 100, volDragging: false, volTimer: null,
@@ -3118,13 +3847,31 @@ function setPlayerFold(folded) {
   try { localStorage.setItem("cocraft.player.folded2", MUSIC.folded ? "1" : "0"); } catch { /* 隐私模式 */ }
 }
 
+/** 顶栏「群聊 / 音乐」按钮：任一开着就高亮；菜单项也标一下。 */
+function syncHubBtn() {
+  const b = $("btn-hub");
+  const chatOn = (typeof cocraftIsOpen === "function") && cocraftIsOpen();
+  if (b) b.classList.toggle("on", !!(chatOn || MUSIC.shown));
+  const c = $("hm-chat"), m = $("hm-music");
+  if (c) c.classList.toggle("on", !!chatOn);
+  if (m) m.classList.toggle("on", !!MUSIC.shown);
+}
+
+/** 播放条是否显示：默认**隐藏**，从顶栏「群聊 / 音乐」里选「音乐」才出现在输入框上方；× 可隐去。 */
+function setPlayerShown(on) {
+  MUSIC.shown = !!on;
+  try { localStorage.setItem("cocraft.player.shown", MUSIC.shown ? "1" : "0"); } catch { /* 隐私模式 */ }
+  renderPlayer();
+  syncHubBtn();
+}
+
 function renderPlayer() {
   const st = MUSIC.state || {};
   const bar = $("player");
   const audio = $("mus-audio");
   const panel = MUSIC.panel;                       // 面板内播放（网易云/QQ 搜索）优先显示
   const playing = panel ? !!(audio && !audio.paused) : musicPlaying();
-  bar.classList.add("on");                     // 播放条常驻（折叠时只剩 ▾ 箭头）
+  bar.classList.toggle("on", !!MUSIC.shown);   // 默认不显示：选「音乐」才出现（见 setPlayerShown）
   bar.classList.toggle("folded", !!MUSIC.folded);
   bar.classList.toggle("playing", playing);
   if (panel) {
@@ -3575,6 +4322,10 @@ function initMusic() {
   try { MUSIC.folded = localStorage.getItem("cocraft.player.folded2") !== "0"; } catch { MUSIC.folded = true; }
   setPlayerFold(MUSIC.folded);
   $("p-fold").addEventListener("click", () => setPlayerFold(!MUSIC.folded));
+  try { MUSIC.shown = localStorage.getItem("cocraft.player.shown") === "1"; } catch { MUSIC.shown = false; }
+  renderPlayer();
+  const _pc = $("p-close");
+  if (_pc) _pc.addEventListener("click", () => setPlayerShown(false));
 
   // 进度条：拖动即跳（面板内播放）；QQ SMTC 只显示
   const seek = $("p-seek");
@@ -3825,7 +4576,7 @@ function collectAnswer(form) {
 function askMsg(text, isErr) {
   const msg = $("ask-msg");
   if (msg) { msg.textContent = text; msg.classList.toggle("err", !!isErr); }
-  if (isErr) { ASK.banner = text; setBanner(text); }
+  if (isErr) { ASK.banner = text; setBanner(text, { sticky: true }); }
   return text;
 }
 
@@ -3954,14 +4705,19 @@ function permMenuToggle() {
     document.addEventListener("pointerdown", close, true);
   }, 0);
 }
+/** 资源是不是都在当前工作区内。
+ *  ⚠ **没给路径 → false（范围未知，不能算"区内"）** —— 与后端 `_in_dir` 逐条一致。
+ *    2026-10-13 改：以前 fail-open（空=区内），codex 从不带路径 → 连"删桌面"都被当成区内自动放行。 */
 function inWorkspace(paths) {
+  if (!paths || !paths.length) return false;        // 范围未知 → 不算区内（未知就去问）
   const root = (typeof currentDir === "function" ? currentDir() : "") || "";
-  if (!root) return true;
+  if (!root) return false;
   const norm = (p) => String(p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
   const r = norm(root);
-  for (const p of (paths || [])) {
+  for (const p of paths) {
     const n = norm(p);
-    if (n && !(n === r || n.startsWith(r + "/"))) return false;
+    if (!n) return false;
+    if (!(n === r || n.startsWith(r + "/"))) return false;
   }
   return true;
 }
@@ -3970,13 +4726,18 @@ function permAllowedByLevel(pm) {
   if (!lv || lv === "ask") return false;
   if (lv === "all") return true;
   const hay = (String(pm.kind || "") + " " + String(pm.action || "") + " " + String(pm.message || "")).toLowerCase();
+  // ★联网：**独立能力**（引擎无关）—— 只看文本里的网络字样 / 资源里带 `://`；不受工作区约束
+  const isNet = /network|internet|联网|网络|外网|上网|域名|domain|\bhost\b|\burl\b|http|socket|\bproxy\b|\bweb\b|fetch|dns|curl|wget/.test(hay)
+    || (pm.resources || []).some((x) => String(x || "").indexOf("://") >= 0);
+  if (isNet) return true;                       // 等级不是 ask → 联网放行（与后端 allowed_by_level 一致）
   const isRead = /read|search|fetch|think|list|glob|grep|view|cat|ls\b|dir\b/.test(hay);
   const isWrite = /edit|write|create|delete|move|rename|patch|mkdir|rm\b|touch|save/.test(hay);
   const isExec = /execute|exec|bash|shell|run\b|command|terminal|powershell|cmd/.test(hay);
-  const ws = inWorkspace(pm.resources);
-  if (lv === "read") return isRead && !isWrite && !isExec;
-  if (lv === "edit") return (isRead || isWrite) && !isExec && ws;
-  if (lv === "exec") return (isRead || isWrite || isExec) && ws;
+  const pureRead = isRead && !isWrite && !isExec;
+  const ws = inWorkspace(pm.resources);          // ★ 现在"没给路径"→ false（未知就问）
+  if (lv === "read") return pureRead;
+  if (lv === "edit") return pureRead || ((isRead || isWrite) && !isExec && ws);
+  if (lv === "exec") return pureRead || ((isRead || isWrite || isExec) && ws);
   return false;
 }
 
@@ -4105,9 +4866,10 @@ let liveApply = null;           // initLiveBg 里赋值：设置一变就立刻�
 
 const SET_KEY = "cocraft.settings";
 const SET_DEFAULT = {
-  dimHiru: 100, dimYoru: 80, blur: 18, rate: 80,
+  dimHiru: 100, blur: 28, rate: 80,
   live: true, taskbar: true, spectrumSides: true, spectrumSidesH: 100, spectrumSidesGain: 120,
   petals: true, zh: true,
+  glass: true,                       // ★液态玻璃皮肤（面板半透明磨砂 + 壁纸透出）
   // 空会话首屏那几行文案（留空 = 用自带的）
   heroL1: "", heroL2: "", heroCredit: "",
 };
@@ -4148,12 +4910,12 @@ function syncTaskbarPref() {
 /** 把设置写进页面：亮度变量 / 播放速度 / 落樱 / 动态壁纸 / 任务栏开关 */
 function applySettings() {
   const root = document.documentElement;
-  root.style.setProperty("--bg-dim-hiru", (SET.dimHiru / 100).toFixed(2));
-  root.style.setProperty("--bg-dim-yoru", (SET.dimYoru / 100).toFixed(2));
-  root.style.setProperty("--bg-blur", Math.max(0, SET.blur) + "px");
-  root.classList.toggle("bg-blurred", SET.blur > 0);   // 开模糊时把背景层撑出视口，避免四边糊边
+  root.style.setProperty("--bg-dim", (SET.dimHiru / 100).toFixed(2));
+  // ★统一的「模糊程度」—— 会话界面 / 消息气泡 / 群聊界面共用这一个值（0 = 全透明不模糊）
+  root.style.setProperty("--g-blur", Math.max(0, SET.blur) + "px");
   liveRate = Math.min(1.3, Math.max(0.5, SET.rate / 100));
   document.body.classList.toggle("no-petals", !SET.petals);
+  root.classList.toggle("glass", !!SET.glass);               // ★液态玻璃皮肤：整页开关
   document.body.classList.toggle("no-lyrics-zh", !SET.zh);   // 歌词翻译：关掉就不显示小字译文
   document.documentElement.classList.toggle("spec-sides", !!SET.spectrumSides);
   root.style.setProperty("--spec-side-h", Math.max(20, Math.min(100, Number(SET.spectrumSidesH) || 100)) + "%");
@@ -5266,15 +6028,15 @@ async function detectAgents() {
 
 let AGENTS_BACK_TO_CFG = false;
 function openAgents() {
-  AGENTS_BACK_TO_CFG = !$("cfg").hidden;      // 从设置里进来的 → 把设置收起，专心选 agent
-  $("cfg").hidden = true;
+  AGENTS_BACK_TO_CFG = cfgIsOpen();          // 从设置里进来的 → 把设置收起，专心选 agent
+  cfgClose();
   $("agents").hidden = false;
   renderAgents();
   loadAcpAgents();
 }
 function closeAgents() {
   $("agents").hidden = true;
-  if (AGENTS_BACK_TO_CFG) $("cfg").hidden = false;   // 关掉 agentlist 回到设置
+  if (AGENTS_BACK_TO_CFG) cfgOpen();         // 关掉 agentlist 回到设置
   AGENTS_BACK_TO_CFG = false;
 }
 
@@ -5421,13 +6183,12 @@ function renderSettings() {
     el.title = p || "默认（自带素材）";
   });
   put("cfg-dim-hiru", SET.dimHiru, SET.dimHiru + "%");
-  put("cfg-dim-yoru", SET.dimYoru, SET.dimYoru + "%");
   put("cfg-blur", SET.blur, SET.blur + "px");
   put("cfg-rate", SET.rate, (SET.rate / 100).toFixed(2) + "×");
   put("cfg-spec-h", SET.spectrumSidesH, SET.spectrumSidesH + "%");
   put("cfg-spec-gain", SET.spectrumSidesGain, SET.spectrumSidesGain + "%");
   [["cfg-live", SET.live], ["cfg-taskbar", SET.taskbar], ["cfg-spec-sides", SET.spectrumSides],
-   ["cfg-petals", SET.petals], ["cfg-zh", SET.zh]].forEach(([id, on]) => {
+   ["cfg-petals", SET.petals], ["cfg-zh", SET.zh], ["cfg-glass", SET.glass]].forEach(([id, on]) => {
     const b = $(id);
     if (!b) return;
     b.classList.toggle("on", !!on);
@@ -5459,10 +6220,23 @@ async function loadWindowPref() {
   }
 }
 
+/** 设置抽屉：跟群聊一样的展开形式（右滑入 + 分屏让位；左边缘可拖宽）。 */
+function cfgIsOpen() { return $("cfg").classList.contains("open"); }
+function cfgOpen() {
+  $("cfg").classList.add("open");
+  document.documentElement.classList.add("cfg-open");
+  syncDrawerOverlap();
+}
+function cfgClose() {
+  $("cfg").classList.remove("open");
+  document.documentElement.classList.remove("cfg-open");
+  syncDrawerOverlap();
+}
+
 function initSettings() {
-  const close = () => { $("cfg").hidden = true; };
+  const close = () => cfgClose();
   const open = () => {
-    $("cfg").hidden = false;
+    cfgOpen();
     renderSettings();
     musicStatus();
     musicComponent();                       // 音乐服务是可选项：没装就明说
@@ -5471,10 +6245,38 @@ function initSettings() {
     loadEngineStatus();                     // 可用引擎 / 当前引擎（老后端会优雅降级）
     loadWindowPref();                       // 面板窗口形态（原生 / 浏览器）
   };
-  $("btn-cfg").addEventListener("click", () => ($("cfg").hidden ? open() : close()));
+  $("btn-cfg").addEventListener("click", () => (cfgIsOpen() ? close() : open()));
   $("cfg-close").addEventListener("click", close);
-  $("cfg").addEventListener("click", (e) => { if (e.target === $("cfg")) close(); });
-  window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("cfg").hidden) close(); });
+  window.addEventListener("keydown", (e) => { if (e.key === "Escape" && cfgIsOpen()) close(); });
+
+  // 宽度记忆 + 左边缘拖拽（跟群聊一致的展开形式）
+  try {
+    const w = localStorage.getItem("cocraft.cfgWidth");
+    if (w) document.documentElement.style.setProperty("--cfg-w", w);
+  } catch { /* 隐私模式忽略 */ }
+  (function initCfgResize() {
+    const grip = $("cfg-resize"), box = $("cfg");
+    if (!grip || !box) return;
+    let dragging = false;
+    grip.addEventListener("pointerdown", (e) => {
+      dragging = true; box.classList.add("resizing");
+      document.documentElement.classList.add("cfg-resizing");
+      try { grip.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    });
+    grip.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const w = Math.max(320, Math.min(window.innerWidth - 300, window.innerWidth - e.clientX));
+      document.documentElement.style.setProperty("--cfg-w", w + "px");
+    });
+    const stop = () => {
+      if (!dragging) return;
+      dragging = false; box.classList.remove("resizing");
+      document.documentElement.classList.remove("cfg-resizing");
+      try { localStorage.setItem("cocraft.cfgWidth", document.documentElement.style.getPropertyValue("--cfg-w")); } catch { /* ignore */ }
+    };
+    grip.addEventListener("pointerup", stop);
+    grip.addEventListener("pointercancel", stop);
+  })();
 
   $("cfg-brand").addEventListener("input", (e) => applyBrandName(e.target.value));
   $("cfg-brand-sub").addEventListener("input", (e) => applyBrandSub(e.target.value));
@@ -5579,7 +6381,6 @@ function initSettings() {
     if (!$("agents").hidden) closeAgents();
   });
   $("cfg-dim-hiru").addEventListener("input", (e) => setSetting("dimHiru", Number(e.target.value)));
-  $("cfg-dim-yoru").addEventListener("input", (e) => setSetting("dimYoru", Number(e.target.value)));
   $("cfg-blur").addEventListener("input", (e) => setSetting("blur", Number(e.target.value)));
   $("cfg-rate").addEventListener("input", (e) => setSetting("rate", Number(e.target.value)));
   $("cfg-live").addEventListener("click", () => setSetting("live", !SET.live));
@@ -5600,6 +6401,7 @@ function initSettings() {
   $("cfg-spec-h").addEventListener("input", (e) => setSetting("spectrumSidesH", Number(e.target.value)));
   $("cfg-spec-gain").addEventListener("input", (e) => setSetting("spectrumSidesGain", Number(e.target.value)));
   $("cfg-petals").addEventListener("click", () => setSetting("petals", !SET.petals));
+  $("cfg-glass").addEventListener("click", () => setSetting("glass", !SET.glass));
   $("cfg-zh").addEventListener("click", () => {
     setSetting("zh", !SET.zh);
     MUSIC.lyrKey = "";                       // 开关变了要重新取一次歌词（tr=0/1 不同）
@@ -5637,7 +6439,7 @@ async function initLiveBg() {
   let rampTimer = null;
   let fadeTimer = null;
 
-  const themeNow = () => (root.dataset.theme === "yoru" ? "yoru" : "hiru");
+  const themeNow = () => "hiru";      // 夜主题已删除
   const urlOf = (t) => ((urls && urls[t]) || "");
   const other = (v) => (v === A ? B : A);
 
@@ -5792,7 +6594,7 @@ async function initLiveBg() {
 function initStaticBg() {
   const root = document.documentElement;
   const apply = () => {
-    const t = root.dataset.theme === "yoru" ? "yoru" : "hiru";
+    const t = "hiru";                    // 夜主题已删除：静态背景只有一个槽
     document.querySelectorAll("#static-bg .sb").forEach((el) => el.classList.toggle("on", el.dataset.bg === t));
   };
   new MutationObserver(apply).observe(root, { attributes: true, attributeFilter: ["data-theme"] });
@@ -5876,7 +6678,6 @@ function renderWallpapers() {
     return it ? (it.title || it.id) : id;
   };
   $("wp-cur").textContent = "当前：白昼 " + (pick.hiru ? nameOf(pick.hiru) : "（默认）")
-    + "　｜　夜晚 " + (pick.yoru ? nameOf(pick.yoru) : "（默认）")
     + "　｜　共 " + all.length + " 张"
     + (q ? "（筛出 " + items.length + " 张）" : "");
   if (!items.length) {
@@ -5891,12 +6692,11 @@ function renderWallpapers() {
     const thumb = it.preview
       ? `<img class="wp-thumb" src="${esc(it.preview)}" alt="" loading="lazy">`
       : `<video class="wp-thumb" muted preload="metadata" playsinline src="${esc(it.url)}#t=1"></video>`;
-    return `<div class="wp-it${on("hiru")}${on("yoru")}">` + thumb
+    return `<div class="wp-it${on("hiru")}">` + thumb
       + `<div class="wp-meta"><b>${esc(it.title || it.id)}</b>`
       + `<i>${it.size_mb} MB · ${esc(String(it.file).slice(0, 26))}</i></div>`
       + `<div class="wp-act">`
-      + `<button data-slot="hiru" data-id="${esc(it.id)}"${sel("hiru")}>白昼</button>`
-      + `<button data-slot="yoru" data-id="${esc(it.id)}"${sel("yoru")}>夜晚</button>`
+      + `<button data-slot="hiru" data-id="${esc(it.id)}"${sel("hiru")}>用这张</button>`
       + `</div></div>`;
   }).join("");
 }
@@ -5928,7 +6728,7 @@ function initWallpaperPicker() {
       .catch((err) => alert("设置壁纸失败：" + err.message));
   });
   $("wp-reset").addEventListener("click", () => {
-    Promise.all([pickWallpaper("hiru", null), pickWallpaper("yoru", null)])
+    pickWallpaper("hiru", null)
       .catch((err) => alert("恢复默认失败：" + err.message));
   });
   window.addEventListener("keydown", (e) => {
@@ -6302,6 +7102,7 @@ async function musicPlay(id, opts = {}) {
     id,
   };
   MUSIC.panelError = "";
+  if (!MUSIC.shown) { MUSIC.shown = true; try { localStorage.setItem("cocraft.player.shown", "1"); } catch (e) { /* ignore */ } }
   if (MUS.homeOpen) hideBarResults();
   else renderBarResults();
   renderHome();
@@ -7063,6 +7864,17 @@ function termCsi(body) {
       TERM.grid[TERM.cur.r].splice(TERM.cur.c, 0, ...new Array(P(0, 1)).fill(null));
       break;
     }
+    // ★ 终端查询必须应答：DA（`CSI c`）不回，pwsh/PSReadLine 会等 ~3.5s 超时才画提示符
+    //   —— 这就是"终端启动慢"的真凶（实测 3.75s → 0.28s）。
+    case "c":                                            // DA（设备属性）
+      termReply(priv === ">" ? "\x1b[>0;95;0c" : "\x1b[?1;2c");
+      break;
+    case "n": {                                          // DSR（设备状态 5n / 光标位置 6n）
+      const q = P(0, 0);
+      if (q === 5) termReply("\x1b[0n");
+      else if (q === 6) termReply(`\x1b[${TERM.cur.r + 1};${TERM.cur.c + 1}R`);
+      break;
+    }
     // h / l（私有模式：光标显隐、备用屏、括号粘贴…）基础实现直接忽略
     default: break;
   }
@@ -7212,6 +8024,9 @@ function termSendInput(data) {
   if (!TERM.id || TERM.dead || !data) return;
   api(`/pty/${TERM.id}/input`, { method: "POST", body: JSON.stringify({ data }) }).catch(() => {});
 }
+
+/** 回应终端的查询序列（DA/DSR）。⚠ 不回应的话 pwsh 会等 ~3.5s 超时才画提示符（"启动慢"的真凶）。 */
+function termReply(seq) { termSendInput(seq); }
 
 function termConnect() {
   if (TERM.es) { try { TERM.es.close(); } catch { /* ignore */ } TERM.es = null; }
@@ -7687,6 +8502,7 @@ function codeOpen() {
   syncToolsBtn();
   { const ml = $("code-menu-list"); if (ml) ml.hidden = true; }   // 收起上次没关的合并菜单
   codeResetTo(root);       // 每次打开都从「当前会话目录」开始（可用「打开文件夹」临时换）
+  syncDrawerOverlap();
 }
 
 /** 把编码模式切到某个根目录：清空文件树 / 编辑器状态，重新列目录。 */
@@ -7739,6 +8555,7 @@ async function codeClose() {
   CODE.open = false;
   syncToolsBtn();
   { const ml = $("code-menu-list"); if (ml) ml.hidden = true; }   // 关抽屉顺手收起菜单
+  syncDrawerOverlap();
 }
 
 /* ---- 内嵌终端：在编码抽屉底部嵌入终端（宽度 = 抽屉宽度，高度可拖） ---- */
@@ -8209,6 +9026,7 @@ async function updReportStatus() {
 
   initTheme();
   initToolsMenu();
+  initHubMenu();
   initTerm();
   initCode();
   initUpdate();
@@ -8226,6 +9044,10 @@ async function updReportStatus() {
   initBrandName();
   initAttachments();
   initCopy();
+  initPartToggle();                      // 折叠块展开状态记忆
+  initSelCopy();                         // 选中片段 → 浮出「复制选中」
+  initTrace();                           // 顶栏「轨迹」：思考 / 工具调用
+  window.addEventListener("resize", () => { try { syncDrawerOverlap(); } catch { /* ignore */ } });
   initMusic();
   initLiveBg();
   initStaticBg();

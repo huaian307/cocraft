@@ -63,40 +63,38 @@ DisableWelcomePage=no
 Name: "chinese"; MessagesFile: "compiler:Default.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
-; —— 可选组件的 payload 只有 build.py --components 备了才存在，这里按需声明 ——
-#define HaveMusic DirExists(AddBackslash(PayloadDir) + "components\music\site-packages")
-#define HaveAudio DirExists(AddBackslash(PayloadDir) + "components\audio\site-packages")
+; —— 各目录的 payload 只有 build.py 备了才存在，这里按需声明 ——
+; ⚠ 2026-10-12 起：不再有 music / audio 组件；agent 与 terminal / panel 全部是**必选组件**。
 #define HaveTerminal DirExists(AddBackslash(PayloadDir) + "components\terminal\site-packages")
 #define HavePanelDir DirExists(AddBackslash(PayloadDir) + "components\panel\site-packages")
 #define HaveAgent FileExists(AddBackslash(PayloadDir) + "agents\node\node.exe")
 #define HaveCodex DirExists(AddBackslash(PayloadDir) + "agents\codex\node_modules")
 #define HaveClaude DirExists(AddBackslash(PayloadDir) + "agents\claude\node_modules")
+#define HaveOpencode DirExists(AddBackslash(PayloadDir) + "agents\opencode\node_modules\opencode-ai")
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: checkedonce
 
 [Components]
+; ⚠ 2026-10-12 起：**全部必选（Flags: fixed）** —— 安装包不再提供可选组件，装即全带，用户不可取消。
 Name: "core";    Description: "核心（面板 + 后端 + 嵌入式 Python）"; Types: full compact custom; Flags: fixed
 #if HaveAgent
-Name: "agent_node";   Description: "Node 运行时（两个 agent 适配器共用）"; Types: full
+Name: "agent_node";   Description: "Node 运行时（agent 适配器 / 随包 OpenCode 共用）"; Types: full compact custom; Flags: fixed
 #endif
 #if HaveCodex
-Name: "agent_codex";  Description: "Codex 适配器 + 自带 codex CLI（较大）"; Types: full
+Name: "agent_codex";  Description: "Codex 适配器 + 自带 codex CLI"; Types: full compact custom; Flags: fixed
 #endif
 #if HaveClaude
-Name: "agent_claude"; Description: "Claude Code 适配器（不含 Claude 本体；也可后装）"; Types: full
+Name: "agent_claude"; Description: "Claude Code 适配器（自带 SDK 的 Claude Code CLI）"; Types: full compact custom; Flags: fixed
 #endif
-#if HaveMusic
-Name: "music";   Description: "可选：音乐服务（网易云/QQ 搜歌放歌）"; Types: custom
-#endif
-#if HaveAudio
-Name: "audio";   Description: "可选：音频频谱（真频谱可视化）"; Types: custom
+#if HaveOpencode
+Name: "agent_opencode"; Description: "随包 OpenCode（npm opencode-ai）"; Types: full compact custom; Flags: fixed
 #endif
 #if HaveTerminal
-Name: "terminal"; Description: "可选：面板内终端（ConPTY / pywinpty）"; Types: custom
+Name: "terminal"; Description: "面板内终端（ConPTY / pywinpty）"; Types: full compact custom; Flags: fixed
 #endif
 #if HavePanelDir
-Name: "panel";   Description: "可选：原生软件窗口（WebView2 / pywebview + 托盘）"; Types: custom
+Name: "panel";   Description: "原生软件窗口（WebView2 / pywebview + 托盘）"; Types: full compact custom; Flags: fixed
 #endif
 
 [Files]
@@ -115,19 +113,29 @@ Source: "{#PayloadDir}\agents\codex\*";   DestDir: "{app}\agents\codex";  Flags:
 #ifdef HaveClaude
 Source: "{#PayloadDir}\agents\claude\*";  DestDir: "{app}\agents\claude"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: agent_claude
 #endif
-; —— 可选组件（纯 site-packages；由 _component_python() 用自带解释器 + PYTHONPATH 跑）——
-#if HaveMusic
-Source: "{#PayloadDir}\components\music\site-packages\*"; DestDir: "{app}\runtime\site-packages\music"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: music
+#ifdef HaveOpencode
+Source: "{#PayloadDir}\agents\opencode\*"; DestDir: "{app}\agents\opencode"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: agent_opencode
 #endif
-#if HaveAudio
-Source: "{#PayloadDir}\components\audio\site-packages\*"; DestDir: "{app}\runtime\site-packages\audio"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: audio
-#endif
+; —— 组件（纯 site-packages；由 _component_python() 用自带解释器 + PYTHONPATH 跑）——
+; ⚠ 不再有 music / audio。
 #if HaveTerminal
 Source: "{#PayloadDir}\components\terminal\site-packages\*"; DestDir: "{app}\runtime\site-packages\terminal"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: terminal
 #endif
 #if HavePanelDir
 Source: "{#PayloadDir}\components\panel\site-packages\*"; DestDir: "{app}\runtime\site-packages\panel"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: panel
 #endif
+
+[InstallDelete]
+; ★ 覆盖安装前**先清掉旧的「代码/页面」目录**，再整份铺新包 —— 避免"残留旧文件"类问题。
+;   真事故：0.1.9 的安装目录里是 .py **源码**；0.1.30 的包改成只发 .pyc（档1 去源码）。
+;   覆盖安装时 Inno 默认**不删**旧文件 → 旧的 base.py/fsview.py/updater.py 还在 →
+;   Python 导入**优先 .py**（源码 > .pyc）→ 旧 .py 盖住新 .pyc → ImportError → 面板起不来。
+;   这些目录在新包里都会整份重发（[Files] 的 app\*），所以"先删后铺"永远干净。
+Type: filesandordirs; Name: "{app}\backend"
+Type: filesandordirs; Name: "{app}\launchers"
+Type: filesandordirs; Name: "{app}\tools"
+Type: filesandordirs; Name: "{app}\scripts"
+Type: filesandordirs; Name: "{app}\frontend"
 
 [Icons]
 Name: "{group}\cocraft 面板";     Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\launchers\launch_opencode.py"""; WorkingDir: "{app}"; Comment: "打开 cocraft 面板"
@@ -148,10 +156,14 @@ Filename: "{app}\python\python.exe"; Parameters: """{app}\backend\cleanup.py""";
 Filename: "{app}\python\python.exe"; Parameters: """{app}\backend\taskbar.py"" restore"; Flags: runhidden; RunOnceId: "taskbar"
 
 [UninstallDelete]
-; 运行时产物（日志/状态/浏览器 profile/缓存）随卸载删掉；用户自己的文件不在里面
-Type: filesandordirs; Name: "{app}\runtime"
-; 随包 codex 运行后自己生成的 state（config.toml / sqlite / logs）也要清掉
-Type: filesandordirs; Name: "{app}\agents\codex\codex-home"
+; ★ 2026-10-13 改：**卸载保留用户数据**（用户反馈「更新把我的主题和壁纸设置覆盖了」）。
+;   以前这里整删 `{app}\runtime` → "卸载旧版再装新版"式升级会把：
+;     · 壁纸/主题/外观/权限等级（`runtime\state`）
+;     · 用户自己装的主题（`runtime\themes`）
+;     · WebView2 / Edge 的 profile（**localStorage 里的主题与界面设置**）
+;   全部清掉。现在只清**纯缓存/日志/字节码**；用户数据留着（真要清空，手动删目录即可）。
+Type: filesandordirs; Name: "{app}\runtime\logs"
+Type: filesandordirs; Name: "{app}\runtime\cache"
 ; 音乐服务用 diskcache 落的缓存（实测卸载后会留 cache\cache.db*）
 Type: filesandordirs; Name: "{app}\cache"
 ; Python 运行时产生的字节码目录（启动器也设了 PYTHONDONTWRITEBYTECODE，这里是双保险）

@@ -777,14 +777,37 @@ WALLPAPER_ROOT_FILE = os.path.join(STATE_DIR, "_wallpaper_root.json")  # 用户�
 
 
 def _steam_roots() -> list:
-    """Steam 根目录候选：注册表 + 各库的 libraryfolders.vdf。"""
+    """Steam 根目录候选：注册表（多处）+ 各库的 libraryfolders.vdf。"""
     roots = []
+
+    def _add(p):
+        p = str(p or "").strip()
+        if not p:
+            return
+        p = os.path.normpath(p.replace("\\\\", "\\"))
+        if os.path.isdir(p) and p not in roots:
+            roots.append(p)
+
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
-            p = winreg.QueryValueEx(k, "SteamPath")[0]
-        if p:
-            roots.append(os.path.normpath(p))
+        # HKCU\Software\Valve\Steam → SteamPath / SteamExe（新版常只写 SteamExe）
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+                for name in ("SteamPath", "SteamExe"):
+                    try:
+                        v = winreg.QueryValueEx(k, name)[0]
+                    except OSError:
+                        continue
+                    _add(os.path.dirname(v) if name == "SteamExe" else v)
+        except OSError:
+            pass
+        # HKLM → InstallPath（32 位视图优先；Steam 是 32 位程序）
+        for sub in (r"SOFTWARE\WOW6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub) as k:
+                    _add(winreg.QueryValueEx(k, "InstallPath")[0])
+            except OSError:
+                pass
     except Exception:  # noqa: BLE001
         pass
     for r in list(roots):                      # 别的库（D:\SteamLibrary 之类）
@@ -792,10 +815,29 @@ def _steam_roots() -> list:
         try:
             with open(vdf, "r", encoding="utf-8", errors="replace") as fh:
                 for m in re.finditer(r'"path"\s+"([^"]+)"', fh.read()):
-                    roots.append(os.path.normpath(m.group(1).replace("\\\\", "\\")))
+                    _add(m.group(1))
         except Exception:  # noqa: BLE001
             pass
     return roots
+
+
+def _fixed_drives() -> list:
+    """本机固定盘（跳过 A:/B: 与网络盘）—— 注册表也读不到时的兜底扫描用。"""
+    out = []
+    try:
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(2, 26):                 # C: 起（跳过 A/B）
+            if mask & (1 << i):
+                name = chr(65 + i) + ":\\"
+                try:
+                    if ctypes.windll.kernel32.GetDriveTypeW(name) == 3:   # DRIVE_FIXED
+                        out.append(name)
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        out = [d + ":\\" for d in "CDEFGHIJ" if os.path.isdir(d + ":\\")]
+    return out
 
 
 def read_wallpaper_root_override() -> str:
@@ -900,12 +942,46 @@ def write_appearance_image(key: str, path: str) -> tuple:
     return True, msg
 
 
+def _we_log(msg: str) -> None:
+    """动态壁纸相关的一行诊断日志（安装版没有控制台，靠这个排查）。"""
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        with open(os.path.join(LOGS_DIR, "wallpaper.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def auto_we_root():
-    """自动找创意工坊 431960 目录；找不到返回 None。"""
+    """自动找创意工坊 431960 目录；找不到返回 None。
+    除了注册表 / libraryfolders.vdf，再兜底扫「常见安装位置 + 各固定盘」—— 提高陌生机器上的命中率
+    （安装版反馈过"读不到 video 壁纸"，多半就是目标机上 Steam / 创意工坊不在默认位置、注册表也读不到）。"""
+    def _hit(root):
+        c = os.path.join(root, "steamapps", "workshop", "content", WE_APPID)
+        return os.path.normpath(c) if os.path.isdir(c) else None
+
     for r in _steam_roots():
-        cand = os.path.join(r, "steamapps", "workshop", "content", WE_APPID)
-        if os.path.isdir(cand):
-            return os.path.normpath(cand)
+        got = _hit(r)
+        if got:
+            return got
+
+    guesses = []
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if base:
+            guesses.append(os.path.join(base, "Steam"))
+    for drive in _fixed_drives():
+        for sub in ("Steam", "SteamLibrary", "SteamLibrary2",
+                    os.path.join("Games", "Steam"),
+                    os.path.join("Program Files (x86)", "Steam"),
+                    os.path.join("Program Files", "Steam")):
+            guesses.append(os.path.join(drive, sub))
+    for g in guesses:
+        got = _hit(g)
+        if got:
+            _we_log("自动找到创意工坊目录：%s（兜底扫描命中）" % got)
+            return got
+
+    _we_log("没找到创意工坊 431960 —— Steam 根：%r ；固定盘：%r" % (_steam_roots(), _fixed_drives()))
     return None
 
 
@@ -922,9 +998,13 @@ def we_root(max_age: float = 60.0):
 
 
 def _we_titles(root: str) -> dict:
-    """{文件夹名: project.json 里的标题}"""
+    """{文件夹名: project.json 里的标题}（目录读不到就返回空，别让一条坏数据带崩整个列表）"""
     out = {}
-    for d in os.listdir(root):
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return out
+    for d in names:
         p = os.path.join(root, d)
         if not os.path.isdir(p):
             continue
@@ -1059,28 +1139,31 @@ def list_video_wallpapers() -> list:
         return []
     out = []
     for d, t in _we_titles(root).items():
-        folder = os.path.join(root, d)
-        if we_project_kind(folder) != "video":
-            continue
-        p = _pick_media(folder)
-        if not p:
-            continue
-        preview = ""
-        for name in ("preview.gif", "preview.jpg", "preview.png"):
-            if os.path.isfile(os.path.join(folder, name)):
-                preview = "/we/" + quote(d) + "/" + quote(name)
-                break
-        rel = os.path.relpath(p, root).replace("\\", "/")
         try:
-            size = os.path.getsize(p)
-        except OSError:
-            size = 0
-        out.append({
-            "id": d, "title": t, "kind": "video",
-            "file": os.path.basename(rel), "size_mb": round(size / 1048576.0, 1),
-            "url": "/we/" + "/".join(quote(seg) for seg in rel.split("/")),
-            "preview": preview,
-        })
+            folder = os.path.join(root, d)
+            if we_project_kind(folder) != "video":
+                continue
+            p = _pick_media(folder)
+            if not p:
+                continue
+            preview = ""
+            for name in ("preview.gif", "preview.jpg", "preview.png"):
+                if os.path.isfile(os.path.join(folder, name)):
+                    preview = "/we/" + quote(d) + "/" + quote(name)
+                    break
+            rel = os.path.relpath(p, root).replace("\\", "/")
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                size = 0
+            out.append({
+                "id": d, "title": t, "kind": "video",
+                "file": os.path.basename(rel), "size_mb": round(size / 1048576.0, 1),
+                "url": "/we/" + "/".join(quote(seg) for seg in rel.split("/")),
+                "preview": preview,
+            })
+        except Exception:  # noqa: BLE001
+            continue                                    # 单个壁纸出问题就跳过它
     out.sort(key=lambda x: -x["size_mb"])
     return out
 
@@ -1402,6 +1485,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"base": _base, "ws": _ws})
             elif path.startswith("/cocraft/"):
                 self._cocraft_proxy(method, path)
+            elif path.startswith("/ccagent"):
+                # 本地路由（**不走上游代理**）：群聊「AI 成员」的管理 + 运行时
+                self._ccagent(method, path)
             elif path == "/skills/preview":
                 self._skills_preview(method)
             elif path == "/skills/install":
@@ -2043,6 +2129,8 @@ class Handler(BaseHTTPRequestHandler):
                 "override": read_wallpaper_root_override(),
                 "auto": auto_we_root() or "",
                 "effective": we_root() or "",
+                "steamRoots": _steam_roots(),     # 诊断：识别到的 Steam 根目录
+                "drives": _fixed_drives(),        # 诊断：兜底扫过的固定盘
             })
             return
         if method != "POST":
@@ -2482,6 +2570,58 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
 
+    def _ccagent(self, method: str, path: str):
+        """面板**本地**路由：群聊「AI 成员」（建/加/移/启停/换大脑）。
+
+        ⚠ 不走上游代理（`/cocraft/*` 才是）；管理操作用**用户令牌**（从 Authorization 取），
+        运行时（连 WS、被 @ 生成回复）由 `backend/cocraft_agents.py` 的后台线程负责。
+        """
+        import cocraft_agents as ca
+        auth = self.headers.get("Authorization") or ""
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        ca.remember_token(token)      # ★ 内存里记一份（桥的心跳要用 owner 身份发）
+        sub = path[len("/ccagent"):].strip("/")
+        if method == "GET" and sub in ("", "list"):
+            self._send_json(200, {"ok": True, "base": ca.BASE, "agents": ca.list_agents()})
+            return
+        body = self._read_json_body() or {}
+        try:
+            if method == "POST" and sub == "create":
+                a = ca.create_agent(token, body.get("name"), body.get("display") or "",
+                                    body.get("engine") or "")
+                self._send_json(200, {"ok": True, "agent": a, "agents": ca.list_agents()})
+                return
+            if method == "POST" and sub == "join":
+                a = ca.join(token, body.get("id"), body.get("chat_id"))
+                self._send_json(200, {"ok": True, "agent": a, "agents": ca.list_agents()})
+                return
+            if method == "POST" and sub == "leave":
+                a = ca.leave(token, body.get("id"), body.get("chat_id"))
+                self._send_json(200, {"ok": True, "agent": a, "agents": ca.list_agents()})
+                return
+            if method == "POST" and sub == "enabled":
+                a = ca.set_enabled(body.get("id"), bool(body.get("on")))
+                self._send_json(200, {"ok": True, "agent": a, "agents": ca.list_agents()})
+                return
+            if method == "POST" and sub == "update":
+                a = ca.update_agent(body.get("id"), body)
+                self._send_json(200, {"ok": True, "agent": a, "agents": ca.list_agents()})
+                return
+            if method == "POST" and sub == "remove":
+                ca.remove_agent(token, body.get("id"), hard=bool(body.get("hard", True)))
+                self._send_json(200, {"ok": True, "agents": ca.list_agents()})
+                return
+        except KeyError as e:
+            self._send_json(404, {"ok": False, "error": str(e)})
+            return
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+        except Exception as e:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+            return
+        self._send_json(404, {"ok": False, "error": "unknown ccagent path: %s" % sub})
+
     def _cocraft_proxy(self, method: str, path: str):
         """把 `/cocraft/*` 代理到 cocraft（Chatser）后端 —— 顺带避开浏览器跨域。
 
@@ -2500,6 +2640,13 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization")
         if auth:
             headers["Authorization"] = auth
+            try:
+                # ★ 顺手把用户令牌记进内存：群聊「AI 成员」的心跳要用 owner 身份发
+                #   （agent 自己的令牌会 403 "you do not own this agent"）。**只存内存，不落盘。**
+                import cocraft_agents as ca
+                ca.remember_token(auth)
+            except Exception:  # noqa: BLE001
+                pass
         ctype = self.headers.get("Content-Type")
         if ctype:
             headers["Content-Type"] = ctype
@@ -2627,6 +2774,15 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
 
+    # 群聊「AI 成员」：把**已启用**的成员桥拉起来（拿 agent_token 连 WS、待命应答被 @）
+    try:
+        import cocraft_agents as _ca
+        _started = _ca.ensure_workers()
+        if _started:
+            print("  群聊AI  已启动 %d 个成员：%s" % (len(_started), ",".join(str(x) for x in _started)))
+    except Exception as _e:  # noqa: BLE001
+        print("[!] 群聊AI 成员启动失败：%r" % (_e,))
+
     print("cocraft 已启动")
     print(f"  界面    http://{args.host}:{args.port}")
     print(f"  引擎    {eng.id}")
@@ -2638,6 +2794,11 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n已停止")
     finally:
+        try:                                     # 停掉群聊 AI 成员的桥（线程 + 独立 ACP 子进程）
+            import cocraft_agents as _ca
+            _ca.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         stop_music_daemon()
         stop_spectrum()
         stop_music_service()

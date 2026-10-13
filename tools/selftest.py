@@ -126,6 +126,41 @@ def _check_codex_runtime(app: str, base_env: dict) -> None:
         check("★随包 codex 能跑", False, repr(exc), warn_only=True)
 
 
+# 允许以 .py 形式存在的源码（入口启动壳 + 保留源码；对应 packaging/build.py 的 PYC_ENTRIES / PYC_LEAVE）
+_ALLOWED_PY = {
+    "backend/server.py", "backend/watch.py", "backend/panel_window.py",
+    "backend/tray_host.py", "backend/pty_host.py",
+    "launchers/launch_opencode.py", "scripts/heal_opencode_link.py",
+    "tools/spectrum.py", "tools/music_service.py", "tools/selftest.py",
+    "backend/cleanup.py", "backend/taskbar.py", "backend/acp_mock_agent.py",
+    "init_state.py",
+}
+
+
+def _check_stale_sources(app: str) -> None:
+    """扫「旧 .py 盖住新 .pyc」的残留：覆盖安装（Inno 默认不删旧文件）升级时最容易出。
+
+    只把「**有同名 .pyc**、又不在允许清单里」的 .py 判为残留（开发目录没有这种并排的 .pyc，不会误报）。
+    """
+    stale = []
+    for d in ("backend", "launchers", "tools", "scripts"):
+        base = os.path.join(app, d)
+        if not os.path.isdir(base):
+            continue
+        for root, _dd, files in os.walk(base):
+            for f in files:
+                if not f.endswith(".py"):
+                    continue
+                full = os.path.join(root, f)
+                if not os.path.isfile(full + "c"):
+                    continue
+                rel = os.path.relpath(full, app).replace("\\", "/")
+                if rel not in _ALLOWED_PY:
+                    stale.append(rel)
+    check("无「旧 .py 盖住新 .pyc」的残留（覆盖升级干净）", not stale, warn_only=True,
+          extra=("发现 %d 个残留 .py：%s" % (len(stale), ", ".join(stale[:8]))) if stale else "干净")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--app-dir", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -152,13 +187,13 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             check("解释器能跑", False, repr(exc))
 
-    print("\n[3] 可选组件（不装不算失败，面板会自己降级/提示）")
-    music = os.path.join(app, "runtime", "site-packages", "music")
-    audio = os.path.join(app, "runtime", "site-packages", "audio")
-    check("音乐服务 site-packages（可选）", os.path.isdir(music), warn_only=True,
-          extra="" if os.path.isdir(music) else "未安装 → 面板显示「音乐服务未安装」")
-    check("音频频谱 site-packages（可选）", os.path.isdir(audio), warn_only=True,
-          extra="" if os.path.isdir(audio) else "未安装 → 退回 CSS 合成动画")
+    print("\n[3] 组件（安装包随包必带；2026-10-12 起不再带 music / audio）")
+    term = os.path.join(app, "runtime", "site-packages", "terminal")
+    panel = os.path.join(app, "runtime", "site-packages", "panel")
+    check("面板内终端 site-packages（terminal）", os.path.isdir(term), warn_only=True,
+          extra="" if os.path.isdir(term) else "未装 → 「面板内终端」入口只给提示")
+    check("原生窗口 site-packages（panel）", os.path.isdir(panel), warn_only=True,
+          extra="" if os.path.isdir(panel) else "未装 → 退回 Edge --app 浏览器窗口")
 
     print("\n[4] 随包 ACP agent")
     node = os.path.join(app, "agents", "node", "node.exe")
@@ -170,6 +205,10 @@ def main() -> int:
     check("codex-acp 入口", os.path.isfile(acp), warn_only=True)
     check("claude-code-acp 入口", os.path.isfile(claude), warn_only=True,
           extra="" if os.path.isfile(claude) else "未随包 → 面板里 claude 档会显示缺适配器")
+    opencode = os.path.join(app, "agents", "opencode", "node_modules",
+                            "opencode-ai", "bin", "opencode.exe")
+    check("随包 OpenCode 入口", os.path.isfile(opencode), warn_only=True,
+          extra="" if os.path.isfile(opencode) else "未随包 → 面板里没有「OpenCode（随包）」agent")
     if os.path.isfile(claude):
         # 有登录态或 API Key 才能真的用起来；这里只提示，不算失败
         home = os.path.expanduser("~")
@@ -240,6 +279,9 @@ def main() -> int:
              r"C:\Program Files\Google\Chrome\Application\chrome.exe"]
     check("找到 Edge/Chrome", any(os.path.isfile(p) for p in edges),
           "" if any(os.path.isfile(p) for p in edges) else "会退回默认浏览器打开")
+
+    print("\n[7] 升级残留（覆盖安装是否留下旧源码）")
+    _check_stale_sources(app)
 
     print("\n合计 %d 项通过，%d 项警告，%d 项失败" % (PASSES, len(WARNS), len(FAILS)))
     if WARNS:

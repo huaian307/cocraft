@@ -30,6 +30,24 @@ CLIENT_CAPABILITIES = {"elicitation": {"form": {}},
                        "_meta": {"terminal_output_delta": True}}
 # Codex 在自定义 provider 下会把这段告警当正文/想法输出；弹窗"背景"里没必要带它
 _MODEL_WARN_RE = re.compile(r"^\s*Warning: Model metadata for `[^`]*` not found\.[^\n]*\n+", re.I)
+
+
+def _hook_arity(fn) -> int:
+    """外部 `auto_permission` 钩子收几个位置参数（老实现的 4 个 / 新的 5 个）。
+
+    ⚠ 不用 try/except TypeError 探：钩子**内部**抛 TypeError 会被误判成"参数不对"从而重复调用。
+    """
+    try:
+        import inspect
+        n = 0
+        for p in inspect.signature(fn).parameters.values():
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
+                n += 1
+            elif p.kind == p.VAR_POSITIONAL:
+                return 99
+        return n
+    except Exception:  # noqa: BLE001
+        return 4
 ANSWER_TIMEOUT = 1800.0      # 等用户答复的上限（秒）；超时按拒绝处理
 TURN_TIMEOUT = 24 * 3600.0   # 等 agent 跑完一轮的上限（秒）。模型一轮可能很久，
 #                            ⚠ 绝不能用 AcpClient 的默认 60s：真实 agent 会被超时掐断，
@@ -903,6 +921,33 @@ class AcpService:
                     "toolCallId": tc.get("toolCallId")}})
                 return {"outcome": {"outcome": "selected", "optionId": oid}}
 
+        # ★ 外部（群聊 AI 成员的桥）可以挂一个「自动应答」策略：
+        #   命中（返回 once/always）→ 直接放行；返回 "reject" → **立刻拒绝**（别让桥等 1800s 才拒）。
+        #   ★ 2026-10-13：把 `info`（含**命令原文** rawInput/command）也传给钩子 —— 否则桥只能看到
+        #     "Run command" 这种标题，等于**盲签**（桌面被清空那次就是盲签 + 自动放行）。
+        hook = getattr(self, "auto_permission", None)
+        if callable(hook):
+            raw = tc.get("rawInput") if isinstance(tc.get("rawInput"), dict) else {}
+            cmd = str(raw.get("command") or raw.get("cmd") or raw.get("script") or "").strip()
+            info = {"kind": kind, "title": title, "locations": locations, "options": options,
+                    "command": cmd, "toolCallId": tc.get("toolCallId"), "rawInput": raw}
+            try:
+                verdict = None
+                if _hook_arity(hook) >= 5:
+                    verdict = hook(kind, title, locations, options, info)
+                else:
+                    verdict = hook(kind, title, locations, options)
+            except Exception:  # noqa: BLE001
+                verdict = None
+            if verdict:
+                oid2 = pick_option_id(options, verdict)
+                if oid2 is None and verdict in ("always", "once"):
+                    oid2 = pick_option_id(options, "once")   # 对方没给 always 就退 once
+                if oid2 is not None:
+                    self._emit({"type": "permission.auto", "data": {
+                        "sessionID": sid, "action": title, "verdict": str(verdict)}})
+                    self._log("[acp] 自动应答权限（%s）：%s" % (verdict, title))
+                    return {"outcome": {"outcome": "selected", "optionId": oid2}}
         detail = _perm_detail(tc)
         with self._lock:
             s = self._sessions.get(sid)

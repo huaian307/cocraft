@@ -362,6 +362,18 @@ _BUNDLED_OPENCODE = {
 BUNDLED_OPENCODE_DIR = os.path.join(ROOT_DIR, "agents", "opencode")
 
 
+def bundled_opencode_env() -> dict:
+    """随包 OpenCode 的**隔离数据目录**（同 codex 的 `CODEX_HOME`）。
+
+    ⚠ 必须隔离：随包的 OpenCode 版本不一定和用户自己装的 OpenCode 同版，共用
+      `~/.local/share/opencode` 会撞「Database is not empty and has no session table」
+      （实测：npm `opencode-ai` 1.19.0 去读桌面版 2.0.13 建的库直接崩）。
+      OpenCode 认 `XDG_DATA_HOME`（实测它会在这里建 `opencode\\opencode.db`），
+      指到 `<app>\\runtime\\opencode-data` 就与用户的 OpenCode 互不干扰。
+    """
+    return {"XDG_DATA_HOME": os.path.join(ROOT_DIR, "runtime", "opencode-data")}
+
+
 def _is_bundled_opencode_path(p) -> bool:
     """这个路径是不是「随包 OpenCode」目录里的（用来把它和"本机客户端"区分开）。"""
     try:
@@ -422,7 +434,7 @@ def ensure_bundled_opencode_agent() -> str:
         "builtin": True,
         "command": list(cmd),
         "cwd": "",
-        "env": {},
+        "env": bundled_opencode_env(),
         "note": _BUNDLED_OPENCODE["note"],
         "mode": _BUNDLED_OPENCODE["mode"],
     }

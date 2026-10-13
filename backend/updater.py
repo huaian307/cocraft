@@ -136,6 +136,30 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def _backup_state(app: str) -> str:
+    """更新前把**用户数据**备份到 `%TEMP%\\cocraft-state-backup\\`。
+
+    ★ 2026-10-13 扩展：不只 `runtime/state`，还包含 **`runtime/themes`（用户自己装的主题）**。
+      备份完由安装脚本在**装完后自动恢复**（见 `_build_apply_ps` 的 robocopy 步骤）——
+      以前只备份、**从不恢复**，等于白备；而 `init_state.py` 又会硬写 baseline
+      （清掉 API Key），用户看到的就是"更新把我的设置覆盖了"。
+    """
+    pairs = [("state", os.path.join(app, "runtime", "state")),
+             ("themes", os.path.join(app, "runtime", "themes"))]
+    dst_root = os.path.join(tempfile.gettempdir(), "cocraft-state-backup")
+    done = []
+    try:
+        if os.path.isdir(dst_root):
+            shutil.rmtree(dst_root, ignore_errors=True)
+        for name, src in pairs:
+            if os.path.isdir(src):
+                shutil.copytree(src, os.path.join(dst_root, name))
+                done.append(name)
+        return dst_root if done else ""
+    except OSError:
+        return dst_root if done else ""
+
+
 def current_version() -> str:
     v = (os.environ.get("COCRAFT_VERSION") or os.environ.get("OPENCODE_UI_VERSION") or "").strip()
     if v:
@@ -222,14 +246,20 @@ def _relaunch_command(app: str) -> list:
 
 
 def _build_apply_ps(app: str, setup: str, log: str, latest: str, cur: str, relaunch: list) -> str:
-    """生成「静默安装 → 记录结果 → 重启面板」的 PowerShell 脚本。
+    """生成「静默安装 → **恢复用户数据** → 记录结果 → 重启面板」的 PowerShell 脚本。
 
     ⚠ 保持**纯 ASCII**：PS5.1 按 ANSI 读无 BOM 的 .ps1，中文会让换行错位、语句串行
     （见 AGENTS.md 踩坑 #9；所以安装失败的文案在这里只用英文，中文由面板侧补）。
+
+    ★ 2026-10-13：装完后用 `robocopy` 把 `%TEMP%\\cocraft-state-backup\\{state,themes}`
+      **盖回** `<app>\\runtime\\{state,themes}` —— 这样即使安装器/init_state 动了用户设置，
+      更新完也自动回到用户原来的主题/壁纸/外观/权限等级/API Key。
+      `/E /IS /IT`：包含子目录、**连"看起来一样"的也覆盖**（保证用户的旧值赢）。
     """
     def sq(s):
         return str(s).replace("'", "''")
 
+    backup = os.path.join(tempfile.gettempdir(), "cocraft-state-backup")
     lines = [
         "$ErrorActionPreference = 'SilentlyContinue'",
         "$statePath = '%s'" % sq(_status_path(app)),
@@ -246,6 +276,16 @@ def _build_apply_ps(app: str, setup: str, log: str, latest: str, cur: str, relau
         "$p = Start-Process -FilePath '%s' -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS','/LOG=%s' -PassThru -Wait"
         % (sq(setup), sq(log)),
         "$code = if ($p) { $p.ExitCode } else { -1 }",
+        # ★ 恢复用户数据（装成功装失败都恢复）
+        "$bk = '%s'" % sq(backup),
+        "foreach ($n in @('state','themes')) {",
+        "  $src = Join-Path $bk $n",
+        "  $dst = Join-Path '%s' ('runtime\\' + $n)" % sq(app),
+        "  if (Test-Path $src) {",
+        "    if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }",
+        "    robocopy $src $dst /E /IS /IT /NFL /NDL /NJH /NJS /NP | Out-Null",
+        "  }",
+        "}",
         "if ($code -eq 0) { Write-UpdateState 'done' $true '' } else { Write-UpdateState 'failed' $false ('installer exit code ' + $code + ' (log: %s)') }"
         % sq(log),
         "Start-Sleep -Seconds 2",
@@ -272,6 +312,7 @@ def apply_update(app_dir: str = "") -> dict:
     app = app_dir or ROOT
     tmp = os.path.join(tempfile.gettempdir(), "cocraft-update")
     os.makedirs(tmp, exist_ok=True)
+    backup = _backup_state(app)          # ★ 更新前先备份 runtime/state（装挂了好捞）
     name = os.path.basename(asset["name"]) or "cocraft-setup.exe"
     setup = os.path.join(tmp, name)
     latest = info.get("latest") or ""
@@ -326,7 +367,7 @@ def apply_update(app_dir: str = "") -> dict:
 
     # 写一个隐藏 PowerShell：静默装 → 记录结果（成功/退出码）→ 装完重启面板。
     # ⚠ 它不在 {app} 下，安装器的 KillOurProcesses 按路径杀不到它，所以能"活过"安装。
-    write_status(app, phase="installing", ok=None, version=latest, fromVersion=cur, error="")
+    write_status(app, phase="installing", ok=None, version=latest, fromVersion=cur, error="", backup=backup)
     relaunch = _relaunch_command(app)
     ps = os.path.join(tmp, "apply.ps1")
     with open(ps, "w", encoding="utf-8", newline="\n") as fh:
@@ -342,5 +383,5 @@ def apply_update(app_dir: str = "") -> dict:
         return fail("启动更新程序失败：%s" % exc)
 
     return {"ok": True, "message": "已开始静默更新，安装完成后面板会自动重启",
-            "latest": latest, "setup": setup, "size": size,
+            "latest": latest, "setup": setup, "size": size, "backup": backup,
             "willRestart": bool(relaunch)}
