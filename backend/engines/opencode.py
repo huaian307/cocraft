@@ -21,6 +21,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import netsafe                                   # ★ 连本机服务要走 local_urlopen（绕过系统代理）
+
 from .base import Engine, EngineError, HOP_BY_HOP
 
 _NO_WINDOW = 0x08000000
@@ -171,7 +173,7 @@ def _upstream_json(method: str, path: str, body=None, timeout: float = 60.0):
         headers["Authorization"] = auth
     req = urllib.request.Request(url + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with netsafe.local_urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw.decode("utf-8")) if raw else None)
     except urllib.error.HTTPError as exc:
@@ -236,7 +238,7 @@ class OpenCodeEngine(Engine):
         try:
             url, auth, version = read_service()
             req = urllib.request.Request(url + "/api/info", headers={"Authorization": auth or ""})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with netsafe.local_urlopen(req, timeout=5) as resp:
                 info = json.loads(resp.read().decode("utf-8"))
             return 200, {"ok": True, "upstream": url, "version": info.get("version", version)}
         except Exception as exc:  # noqa: BLE001
@@ -259,7 +261,7 @@ class OpenCodeEngine(Engine):
 
         req = urllib.request.Request(url + handler.path, data=body, headers=headers, method=method)
         try:
-            upstream = urllib.request.urlopen(req, timeout=None)
+            upstream = netsafe.local_urlopen(req, timeout=None)   # ★ 本机上游：别走系统代理
         except urllib.error.HTTPError as exc:
             upstream = exc
         except Exception as exc:  # noqa: BLE001

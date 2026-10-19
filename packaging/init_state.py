@@ -323,6 +323,9 @@ def main() -> int:
         log("[OK] agent 注册表已写入：%s（active=%s，baseline 只补缺不覆盖）" % (agents_file, reg["active"]))
     else:
         log("[!] 没找到随包 agent，也没找到本机 OpenCode：保持向导模式（首次启动会让你选/加 agent）")
+        log("    · 想用**随包**的 Codex / Claude / OpenCode：重跑本安装包，把缺的那个 agent 组件勾上"
+            "（覆盖安装会保留 runtime\\，设置/会话/密钥都不丢）")
+        log("    · 想用**本机已装**的客户端：面板 → 设置 → ACP 代理 →「扫描本机 Agent」")
 
     # 引擎默认值：**总是**写成 acp（面板独立运行）。用户在设置里随时能切回 opencode。
     eng = read_json(engine_file)

@@ -23,6 +23,7 @@ r"""群聊「AI 成员」—— 把面板里的 ACP agent 接进 cocraft 群聊�
 from __future__ import annotations
 
 import base64
+import collections
 import datetime
 import json
 import os
@@ -39,6 +40,7 @@ import urllib.parse
 import urllib.request
 
 import netsafe
+import snapshots
 from engines import STATE_DIR
 from engines.acp import agents as acp_agents
 from engines.acp.engine import acp_log
@@ -75,6 +77,248 @@ _RE_DESTRUCTIVE = re.compile(
     r"\bformat\b|diskpart|shutdown|taskkill|stop-process|kill\b|reg\s+delete|"
     r"清空|删除|格式化|抹掉|重置|卸载", re.I)
 _CONFIRM = re.compile(r"确认|確定|确定|confirm|我确认|真的删|确定执行", re.I)
+
+# ---------------- ★主动编排（方向 2）：角色预设 ----------------
+# 一个"角色"= 一段**只注入给这个成员自己**的职责说明（别的成员看不到 → 不污染群聊上下文）。
+# ⚠ 角色的作用域是「这个 AI 成员」，不是「这次派活」：换派活场景就改角色。
+ROLES = {
+    "implementer": {
+        "label": "实现者",
+        "brief": ("职责：**动手改**。直接改代码 / 文件，改完给一句结论（改了哪些文件、为什么这么改）。"
+                  "不要长篇解释，不要替别的角色去写测试或做审查。"),
+    },
+    "reviewer": {
+        "label": "审查者",
+        "brief": ("职责：**只挑错，不改代码**。指出具体文件 / 位置、说明为什么有问题、给最小修复建议。"
+                  "输出格式：先给「结论：通过 / 不通过」，再列问题（每条：位置 → 问题 → 建议）；"
+                  "没发现问题就直接说「没发现问题」。"),
+    },
+    "tester": {
+        "label": "测试者",
+        "brief": ("职责：**验证行为**。写 / 跑测试或给复现步骤，**贴真实命令与输出**。"
+                  "输出格式：先给「结论：通过 / 失败」，再列用例（用例 → 预期 → 实际）；**别编输出**。"),
+    },
+    "researcher": {
+        "label": "调研者",
+        "brief": ("职责：**先查清楚再下结论**。给依据（文件路径 / 行号 / 命令输出 / 文档）。"
+                  "不确定的地方明说不确定；**不要改代码**；用要点式，别写散文。"),
+    },
+}
+
+
+def norm_role(role) -> str:
+    """角色 id 归一：认得的才留，其余当空（＝普通成员）。"""
+    r = str(role or "").strip().lower()
+    return r if r in ROLES else ""
+
+
+def role_line(role) -> str:
+    """给 `_handle_event` 用：把角色职责拼成一段提示词（没有角色 → 空串）。"""
+    r = norm_role(role)
+    if not r:
+        return ""
+    meta = ROLES[r]
+    return ("\n\n【你的角色：%s（%s）】\n%s\n"
+            "（群里可能有别的角色同时在干同一件事 —— **只做你这个角色该做的**，别抢别人的活。）"
+            % (meta["label"], r, meta["brief"]))
+
+
+def roles_public() -> dict:
+    """给前端渲染下拉 / 小标用。"""
+    return {k: {"label": v["label"]} for k, v in ROLES.items()}
+
+
+# ---------------- ★主动编排：一键建组 ----------------
+# 一个"组"= 几个角色 + 各自的**大脑（ACP agent）** + 自动进群 + 打开应答。
+# 名字必须是 `@` 能解析的字符（前端 `ccSend` 用 `@([A-Za-z0-9_\-]+)`）。
+TEAM_PRESETS = {
+    "dev": {"label": "开发 + 审查 + 测试",
+            "rows": [{"role": "implementer", "name": "impl"},
+                     {"role": "reviewer", "name": "rev"},
+                     {"role": "tester", "name": "test"}]},
+    "review": {"label": "实现 + 审查（对拍）",
+               "rows": [{"role": "implementer", "name": "impl"},
+                        {"role": "reviewer", "name": "rev"}]},
+    "research": {"label": "调研 + 审查",
+                 "rows": [{"role": "researcher", "name": "scan"},
+                          {"role": "reviewer", "name": "rev"}]},
+}
+
+
+def _custom_presets() -> dict:
+    """用户自定义的组预设（存在 `_cocraft_agents.json` 的 `teamPresets` 里）。
+
+    ⚠ 这是**用户数据**，不是安装包内容：跟着 runtime/state 走，覆盖安装也会保留。
+    """
+    v = _load().get("teamPresets")
+    return dict(v) if isinstance(v, dict) else {}
+
+
+def _save_custom_presets(m: dict) -> None:
+    with _LOCK:
+        d = _load()
+        d["teamPresets"] = m
+        _save(d)
+
+
+def _preset_rows_public(rows) -> list:
+    return [{"role": r.get("role"), "name": r.get("name"),
+             "roleLabel": (ROLES.get(norm_role(r.get("role"))) or {}).get("label") or ""}
+            for r in (rows or [])]
+
+
+def team_presets() -> list:
+    """内置 3 个 + 用户自定义（`builtin` 标出来：内置不能删/改，只能「另存一份」）。"""
+    out = [{"id": k, "label": v["label"], "builtin": True,
+            "rows": _preset_rows_public(v["rows"])}
+           for k, v in TEAM_PRESETS.items()]
+    for k, v in _custom_presets().items():
+        if k in TEAM_PRESETS:            # 防御：内置 id 不许被影子覆盖
+            continue
+        out.append({"id": k, "label": v.get("label") or k, "builtin": False,
+                    "rows": _preset_rows_public(v.get("rows") or [])})
+    return out
+
+
+def _slug_id(text) -> str:
+    """预设 id：小写、非文字字符变 `-`（**保留中文**，用户在界面上不直接看到它）。"""
+    s = re.sub(r"[\W]+", "-", str(text or "").strip().lower()).strip("-_")
+    return (s or "custom")[:32]
+
+
+def save_team_preset(label, rows, preset_id: str = "") -> dict:
+    """★自定义组预设：把「当前这几行角色/名字」存下来（以后一键复用）。
+
+    * `rows` = `[{role, name}]`（1~8 行；角色必须认得）；
+    * `preset_id` 有 = 覆盖那个自定义预设；没有 = 按 label 造 id（撞了自动 `-2`）；
+    * **内置 id 一律不许占用**（`dev` / `review` / `research`）。
+    """
+    label = str(label or "").strip()[:40]
+    if not label:
+        raise ValueError("给预设起个名字")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("预设至少要有一个角色")
+    if len(rows) > 8:
+        raise ValueError("一个组最多 8 个人（再多并行也没人看得过来）")
+    clean = []
+    for r in rows:
+        role = norm_role((r or {}).get("role"))
+        if not role:
+            raise ValueError("有不认识的角色：%s" % ((r or {}).get("role"),))
+        nm = _uniq_name((r or {}).get("name") or role, set())     # 只做字符清洗（重名留给建组时处理）
+        clean.append({"role": role, "name": nm})
+    pid = _slug_id(preset_id or label)
+    customs = _custom_presets()
+    if pid in TEAM_PRESETS:
+        raise ValueError("「%s」是内置预设的 id，换个名字" % pid)
+    if pid not in customs:                                        # 新建时撞 id → 加 -2 / -3
+        base, n = pid, 2
+        while pid in customs or pid in TEAM_PRESETS:
+            pid = "%s-%d" % (base, n)
+            n += 1
+    customs[pid] = {"label": label, "rows": clean, "updated": int(time.time())}
+    _save_custom_presets(customs)
+    return {"id": pid, "label": label, "builtin": False,
+            "rows": _preset_rows_public(clean)}
+
+
+def delete_team_preset(preset_id) -> dict:
+    """删一个**自定义**预设（内置的不许删 → ValueError；不存在 → KeyError）。"""
+    pid = str(preset_id or "").strip()
+    if pid in TEAM_PRESETS:
+        raise ValueError("内置预设不能删（可以「存为预设」另存一份再改）")
+    customs = _custom_presets()
+    if pid not in customs:
+        raise KeyError("没有这个预设：%s" % pid)
+    customs.pop(pid)
+    _save_custom_presets(customs)
+    return {"deleted": pid}
+
+
+def _uniq_name(base: str, taken: set) -> str:
+    """`@` 友好的名字：只留 `[A-Za-z0-9_-]`；重名就加 `-2` / `-3`…"""
+    s = re.sub(r"[^A-Za-z0-9_-]+", "", str(base or "").strip())[:24] or "ai"
+    if s.lower() not in taken:
+        return s
+    n = 2
+    while ("%s-%d" % (s, n)).lower() in taken and n < 99:
+        n += 1
+    return "%s-%d" % (s, n)
+
+
+def team_plan(preset: str = "dev", engines: dict = None, names: dict = None,
+              rows: list = None) -> list:
+    """把「预设 + 每个角色选的大脑/名字」算成一张**要建什么**的清单（纯函数，好测）。
+
+    * `rows`：前端**当前面板里那几行**（`[{role, name, engine}]`）—— 传了就以它为准，
+      这样用户临时改过角色/名字也能直接建（不必先存成预设）；也天然支持**同一个角色出现两次**；
+    * `engines`：`{role: agent_id}`（也认 `{"default": id}` 兜底）——**空就留空**（用基线默认）；
+    * `names`：`{role: 名字}`（留空用预设名 / 行里的名字）；
+    * **重名自动加后缀**（同一批内部 + 已有的成员都算）；
+    * 角色不认识 → 抛 ValueError（别静默建出一个没有角色的人）。
+    """
+    engines = engines or {}
+    names = names or {}
+    if isinstance(rows, list) and rows:
+        src = rows
+        names = {}          # ⚠ 行模式：每行自带名字/引擎，别让按角色的 dict 覆盖（同角色多人时它会串）
+        engines = {}
+    else:
+        pid = str(preset or "dev")
+        p = TEAM_PRESETS.get(pid) or _custom_presets().get(pid)
+        if not p:
+            raise ValueError("不认识的组预设：%s" % preset)
+        src = p["rows"]
+    taken = {str(a.get("name") or "").lower() for a in _entries()}
+    out = []
+    for row in src:
+        role = norm_role((row or {}).get("role"))
+        if not role:
+            raise ValueError("组预设里有不认识的角色：%s" % ((row or {}).get("role"),))
+        nm = _uniq_name(names.get(role) or (row or {}).get("name") or role, taken)
+        taken.add(nm.lower())
+        eng = str((row or {}).get("engine") or engines.get(role)
+                  or engines.get("default") or engines.get("") or "").strip()
+        out.append({"role": role, "roleLabel": (ROLES.get(role) or {}).get("label") or "",
+                    "name": nm, "display": nm, "engine": eng})
+    return out
+
+
+def create_team(user_token, chat_id, preset: str = "dev", engines=None, names=None,
+                rows: list = None) -> dict:
+    """按 `team_plan()` 真去建：**建 agent → 进群 → 打开应答**。一个失败不影响其它（逐条报结果）。"""
+    plan = team_plan(preset, engines, names, rows)
+    chat = str(chat_id or "").strip()
+    if not chat:
+        raise ValueError("要先选一个群（会话）")
+    created, failed = [], []
+    for row in plan:
+        try:
+            a = create_agent(user_token, row["name"], row["display"], row["engine"], row["role"])
+            aid = (a or {}).get("id")
+            if not aid:
+                raise RuntimeError("建 agent 没回 id")
+            try:
+                join(user_token, aid, chat)
+            except Exception as exc:                 # noqa: BLE001
+                failed.append({"name": row["name"], "id": aid, "stage": "进群",
+                               "error": "%s: %s" % (type(exc).__name__, exc)})
+                continue
+            try:
+                set_enabled(aid, True)
+            except Exception as exc:                 # noqa: BLE001
+                failed.append({"name": row["name"], "id": aid, "stage": "启用",
+                               "error": "%s: %s" % (type(exc).__name__, exc)})
+                continue
+            created.append({"id": aid, "name": row["name"], "role": row["role"],
+                            "roleLabel": row["roleLabel"], "engine": row["engine"]})
+            acp_log("[cocraft-agents] 建组：%s（%s / %s）已进群并开应答"
+                    % (row["name"], row["role"], row["engine"] or "(默认引擎)"))
+        except Exception as exc:                     # noqa: BLE001
+            failed.append({"name": row["name"], "stage": "建 agent",
+                           "error": "%s: %s" % (type(exc).__name__, exc)})
+    return {"ok": bool(created), "created": created, "failed": failed,
+            "agents": list_agents()}
 
 
 def _is_destructive(*texts) -> bool:
@@ -179,6 +423,9 @@ def allowed_by_level(level, kind, action, message, resources, workspace) -> bool
 ASK_TIMEOUT = 90.0          # 在群里等拥有者批准的秒数（默认值）
 _ASK_MIN, _ASK_MAX = 30.0, 900.0
 _ASK_LOCK = threading.Lock()   # 同一时刻只处理一个权限申请
+# ★ 建桥 / agent 冷启动那一刻，perm_ctx（WS + 群）往往还没就绪（`start_worker` 起 WS 线程的
+#   同时**并发**建桥）。以前这里直接静默拒绝 → agent 的第一步动作莫名失败。现在**等一会儿**再问。
+PERM_CTX_WAIT = 20.0        # 等 perm_ctx 就绪的上限（秒）
 
 
 def ask_timeout() -> float:
@@ -253,8 +500,152 @@ def _mentions_agent(m: dict, a: dict) -> bool:
     return False
 
 
+def _perm_ctx_now(aid, net=True):
+    """当前能用来『把权限申请发到群里』的 `(owner, ws, chat)`。
+
+    ★ 建桥那一刻 `perm_ctx` 还没写、成员的 WS 也可能还没连上 —— 这里做三路兜底：
+      WS 取成员的活连接、群取成员配置的 `chats[0]`、owner 先读本地记录（读不到再问上游）。
+
+    `net=False` = 不发起网络请求（owner 只读本地记录）—— 给等待循环用，别每 0.5s 打一次上游。
+    """
+    ctx = (_bridges.get(str(aid)) or {}).get("perm_ctx") or {}
+    ws = ctx.get("ws")
+    if not ws or getattr(ws, "closed", False):
+        ws = ((_workers.get(str(aid)) or {}).get("ws"))
+    if ws and getattr(ws, "closed", False):
+        ws = None
+    chat = ctx.get("chat")
+    a = find(aid) or {}
+    if chat is None:
+        cs = list(a.get("chats") or [])
+        chat = cs[0] if cs else None
+    try:
+        owner = int(ctx.get("owner") or a.get("owner_user_id") or 0)
+    except Exception:  # noqa: BLE001
+        owner = 0
+    if not owner and net:
+        owner = _owner_id(aid)
+    return owner, ws, chat
+
+
+def _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root) -> dict:
+    """★ 可逆执行：破坏性操作**放行前**，把要动的目标复制进面板隔离区。
+
+    为什么不用 OS 回收站：2026-10-13 那次事故里，回收站 `$I` 元数据说删了 62 项，
+    但**没有任何 `$R` 内容实体** → 21 项真没了、救不回来。所以这里**自己复制一份**。
+
+    目标来源两路：① agent 报的 `locations`（有的 agent 会带，有的从不带）；② 从**命令原文**里猜。
+    范围未知 / 猜不出来 → **如实告诉拥有者"这次没保住"**，不假装成功、也不因此拦下已确认的操作。
+    """
+    out = {"items": 0, "missed": 0, "unresolved": []}
+    try:
+        root = os.path.realpath(ws_root) if ws_root and os.path.isdir(ws_root) else ""
+        cands, unresolved = [], []
+        if cmd:
+            try:
+                g = snapshots.guess_targets(cmd, root)
+                cands.extend(g.get("targets") or [])
+                unresolved.extend(g.get("unresolved") or [])
+            except Exception as e:  # noqa: BLE001
+                acp_log("[cocraft-agents] %s 隔离：解析命令失败 %r" % (aid, e))
+        for x in (locations or []):                 # agent 自己报的路径（能带就更准）
+            s = str(x or "").strip()
+            if not s or "://" in s:
+                continue
+            try:
+                p = os.path.realpath(s if os.path.isabs(s) else os.path.join(root, s))
+            except Exception:  # noqa: BLE001
+                continue
+            if os.path.exists(p):
+                cands.append(p)
+            else:
+                unresolved.append(s[:200])
+        targets, seen = [], set()
+        for p in cands:
+            rp = os.path.realpath(p)
+            if rp not in seen:
+                seen.add(rp)
+                targets.append(rp)
+        rec = snapshots.quarantine_paths(
+            root, targets, scope=("chat-%s" % chat) if chat not in (None, "") else ("agent-%s" % aid),
+            note="破坏性操作放行前隔离：%s" % title, cmd=cmd)
+        n = len(rec.get("items") or [])
+        missed = len(rec.get("skipped") or [])
+        out.update({"items": n, "missed": missed, "id": rec.get("id"), "unresolved": unresolved[:8]})
+        if n:
+            names = "、".join(os.path.basename(str(it.get("src") or "")) for it in rec["items"][:6])
+            msg = ("🛡 **已隔离（可恢复）**：%d 项已备份进面板隔离区 —— %s%s\n"
+                   "（面板「工具 → 隔离区」可**一键恢复**；隔离只是备份，命令仍照常执行）"
+                   % (n, names, "…" if n > 6 else ""))
+        else:
+            msg = ("⚠️ **这次没能预先隔离**：命令里没能识别出要动的文件（通配符 / 变量 / 工作区外…），"
+                   "**执行后可能找不回来**。")
+        if missed:
+            msg += "\n⚠️ 另 %d 项没保住（不存在 / 太大 / 范围过大）。" % missed
+        _send_message(aid, chat, msg)
+        _act_add(chat, str((find(aid) or {}).get("name") or ""), "隔离备份",
+                 ("%d 项" % n), "completed" if n else "error",
+                 detail=("、".join(str(it.get("src") or "") for it in (rec.get("items") or [])[:6])
+                         or msg))
+        acp_log("[cocraft-agents] %s 隔离：%d 项已备份（未保住 %d，识别不出 %d）dest=%s"
+                % (aid, n, missed, len(unresolved), rec.get("id")))
+    except Exception as e:  # noqa: BLE001 - 隔离失败**绝不能**打断已确认的操作
+        acp_log("[cocraft-agents] %s 隔离失败：%r" % (aid, e))
+        try:
+            _send_message(aid, chat, "⚠️ 隔离失败（%s）—— 已确认的操作仍会继续，但**这次不可恢复**。" % e)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+# ---------------- ★对比带上「文件改动」：轮快照（只记路径+哈希，不存内容） ----------------
+
+def _ws_root(aid) -> str:
+    """这个成员干活的工作目录（与 `_build_bridge` 里判定的**同一个来源**）。"""
+    a = find(aid)
+    eng = str(a.get("engine") or "")
+    if not eng:
+        return ""
+    try:
+        entry = acp_agents.find_agent(acp_agents.load_registry(), eng) or {}
+        b = acp_agents.baseline() or {}
+        return str(entry.get("cwd") or b.get("cwd") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _turn_scope(aid, chat) -> str:
+    return "cc-%s-%s" % (chat, aid)
+
+
+def _snap_before_turn(aid, chat) -> str:
+    """★群聊派活：在 agent **动手之前**记一份快照（只记路径 + 哈希 → 不占磁盘）。"""
+    root = _ws_root(aid)
+    if not root or not os.path.isdir(root):
+        return ""
+    scope = _turn_scope(aid, chat)
+    try:
+        snapshots.take_turn_snapshot(root, scope, label="群聊派活")
+        return scope
+    except Exception as exc:                     # noqa: BLE001 - 快照失败绝不能挡住回帖
+        acp_log("[cocraft-agents] %s 轮快照失败：%r" % (aid, exc))
+        return ""
+
+
+def changes(chat, aid) -> dict:
+    """「派活之前 → 现在」这个成员改了哪些文件（**文件级**，没有行级 diff）。"""
+    root = _ws_root(aid)
+    if not root:
+        return {"ok": False, "error": "这个成员没有工作目录（没绑 agent 或没配 cwd）", "files": 0}
+    if not os.path.isdir(root):
+        return {"ok": False, "error": "工作目录不存在：%s" % root, "files": 0}
+    res = snapshots.changes_since_latest(root, _turn_scope(aid, chat))
+    res["root"] = res.get("root") or root
+    return res
+
+
 def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
-                    cmd="", destructive=False) -> str:
+                    cmd="", destructive=False, ws_root="") -> str:
     """把权限申请发到群里，**只等 agent 拥有者**回复。
 
     返回 "once" / "always" / "reject"（拒绝或超时或认不出拥有者）。
@@ -262,16 +653,28 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
 
     ★ `destructive=True`（破坏性/不可逆）：**必须拥有者回「确认」**才放行（回「可以」不算），
       并且申请里带上**命令原文** —— 不做盲签。
+    ★ 拥有者确认后、**放行前**先做一次「**先隔离再放行**」（`_quarantine_before_allow`）：
+      把这条命令要动的目标复制进面板隔离区 `runtime/quarantine/`，之后可一键恢复（不走 OS 回收站）。
     """
-    owner = _owner_id(aid)
-    bridge = _bridges.get(str(aid)) or {}
-    ctx = bridge.get("perm_ctx") or {}
-    ws, chat = ctx.get("ws"), ctx.get("chat")
     if level_ok and not destructive:
         return "always"                       # 等级已放行 → 不打扰拥有者（破坏性除外：永远要问）
+    # ★ 建桥 / 冷启动太早 → **等 perm_ctx 就绪**（WS 连上、群已知），别静默拒绝。
+    owner, ws, chat = _perm_ctx_now(aid)
+    t_w = time.time()
+    last_owner_try = t_w
+    while time.time() - t_w < PERM_CTX_WAIT and (not owner or not ws or chat is None):
+        time.sleep(0.5)
+        _net = (time.time() - last_owner_try) >= 2.0    # owner 每 ~2s 才查一次上游
+        if _net:
+            last_owner_try = time.time()
+        owner, ws, chat = _perm_ctx_now(aid, net=_net)
     if not owner or not ws or chat is None:
-        acp_log("[cocraft-agents] %s 权限：拿不到 owner/ws → 保守拒绝" % aid)
+        acp_log("[cocraft-agents] %s 权限：等了 %.0fs 仍拿不到 owner/ws → 保守拒绝"
+                % (aid, time.time() - t_w))
         return "reject"
+    if time.time() - t_w >= 0.5:
+        acp_log("[cocraft-agents] %s 权限：等到 perm_ctx 就绪（%.1fs）后发到群里"
+                % (aid, time.time() - t_w))
     paths = "、".join(str(x) for x in (locations or [])[:4])
     budget = ask_timeout()
     a = find(aid) or {}
@@ -289,6 +692,11 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
                  if not destructive else ""), int(budget)))
     if not _send_message(aid, chat, tip):
         return "reject"
+    # ★C1：权限申请也进活动流（前端画「正在申请权限」那张卡）
+    _ptcid = "perm-%d" % int(time.time() * 1000)
+    _act_add(chat, aname, "破坏性操作" if destructive else "权限申请",
+             (cmdtxt or " ".join(str(title or "").split())[:120]), "asking",
+             detail=" ".join(str(title or "").split())[:300], tcid=_ptcid)
     t0 = time.time()
     leftovers = []
     got_lock = _ASK_LOCK.acquire(timeout=5.0)   # 串行化：同时刻只处理一个申请
@@ -315,10 +723,15 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
                         _seen_push(fr.get("id"))       # 这条算“已处理”：别再被当成 @ 回一遍
                         _send_message(aid, chat, ("✅ 已确认，开始执行：" if destructive
                                                   else "✅ 已允许：") + title)
+                        if destructive:
+                            # ★ 可逆执行：**放行前**先隔离（不信 OS 回收站）
+                            _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root)
+                        _act_finish(chat, _ptcid, "allowed", detail="拥有者回复：%s" % c[:120])
                         return v
                     if _DENY.search(c):
                         _seen_push(fr.get("id"))
                         _send_message(aid, chat, "⛔ 已拒绝：" + title)
+                        _act_finish(chat, _ptcid, "denied", detail="拥有者回复：%s" % c[:120])
                         return "reject"
             leftovers.append(fr)           # 别人说的 / 别的会话 → 留给主循环
     finally:
@@ -329,6 +742,7 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
             try: ws.q.put(fr)
             except Exception: pass
     _send_message(aid, chat, "⌛ 权限申请超时（%d 秒无人批准），已拒绝：%s" % (int(budget), title))
+    _act_finish(chat, _ptcid, "timeout")
     return "reject"
 
 
@@ -420,6 +834,8 @@ def public(a: dict) -> dict:
             "engine": a.get("engine") or "", "chats": list(a.get("chats") or []),
             "enabled": bool(a.get("enabled")), "running": bool(w and w.get("running")),
             "warn": guard_note(a.get("engine")),
+            "role": norm_role(a.get("role")),
+            "roleLabel": (ROLES.get(norm_role(a.get("role"))) or {}).get("label") or "",
             "created": a.get("created") or 0}
 
 
@@ -454,7 +870,7 @@ def _api(user_token, method, path, body=None, timeout=20):
 
 # ---------------- 管理操作 ----------------
 
-def create_agent(user_token, name, display="", engine="") -> dict:
+def create_agent(user_token, name, display="", engine="", role="") -> dict:
     """建上游 agent 并记进本地。返回 public 视图（**不含 token**）。"""
     name = "".join(ch for ch in str(name or "").strip() if ch not in " \t\r\n")
     if not name:
@@ -481,6 +897,7 @@ def create_agent(user_token, name, display="", engine="") -> dict:
             owner = 0
     entry = {"id": ag.get("id"), "name": name, "display": display or name,
              "agent_token": js.get("agent_token"), "engine": str(engine or ""),
+             "role": norm_role(role),
              "owner_user_id": owner,
              "chats": [], "enabled": False, "created": int(time.time())}
     with _LOCK:
@@ -543,9 +960,11 @@ def set_enabled(aid, on) -> dict:
 
 
 def update_agent(aid, patch: dict) -> dict:
-    allow = {k: v for k, v in (patch or {}).items() if k in ("engine", "display")}
+    allow = {k: v for k, v in (patch or {}).items() if k in ("engine", "display", "role")}
     if not allow:
         return public(find(aid))
+    if "role" in allow:
+        allow["role"] = norm_role(allow["role"])
     if "engine" in allow:                      # 换大脑 → 丢掉旧桥（下次重建）
         _drop_bridge(aid)
     return public(_patch(aid, **allow))
@@ -588,7 +1007,8 @@ def _build_bridge(aid) -> dict:
         # ★ 破坏性：**永不自动放行**（等级再宽也要拥有者回「确认」）
         ok = (not destructive) and ((net and allow_network())
                                     or allowed_by_level(_level, kind, title, cmd, locations, _ws_root))
-        verdict = _perm_ask_group(aid, kind, title, locations, ok, cmd=cmd, destructive=destructive)
+        verdict = _perm_ask_group(aid, kind, title, locations, ok, cmd=cmd,
+                                  destructive=destructive, ws_root=_ws_root)
         acp_log("[cocraft-agents] %s 权限 -> %s（等级=%s%s%s，%s）"
                 % (aid, verdict, _level,
                    "，联网放行" if (net and allow_network() and not destructive) else "",
@@ -666,7 +1086,106 @@ def _clean(text: str) -> str:
     return t.strip()
 
 
-def _ask(aid, prompt: str, files=None, timeout: float = 240.0) -> str:
+# ---------------- C1：进行中活动卡（内存环形缓冲，**不落盘 / 不往群里发消息**） ----------------
+# 面板用 `GET /ccagent/activity?chat=<id>&since=<rev>` 增量拉；桥跑在独立线程 → 读写都加锁。
+# 设计口径见 docs/群聊存在感-方案.md §12.1。
+# ⚠ 每条活动有**两个**序号，别混：
+#   · `id`  稳定标识（工具的 toolCallId / 权限卡片）—— 前端按它**替换**同一条
+#   · `rev` 单调自增的**修改版本**—— 每次新增/收尾都 +1，`since` 比的就是它
+#   · `seq` 创建顺序（不可变）—— 只用来排序，收尾后那一行不会乱跳
+#   为什么必须这样：收尾是**原地改**原本那条（runnging → completed），
+#   如果 `since` 比的是它自己的 seq，客户端就永远收不到"变化"（踩过）。
+_ACT_LOCK = threading.Lock()
+_ACT = collections.deque(maxlen=200)         # 上限自然淘汰，不清理
+_ACT_REV = [0]                               # 全局修改版本（每次新增/收尾都 +1）
+
+# 工具 → 中文动词（与轨迹页 `TOOL_META` 同口径；ACP 给的是 ToolKind，名字兜底）
+_TOOL_ZH = {
+    "execute": "运行命令", "edit": "修改文件", "write": "写入文件", "read": "读取文件",
+    "search": "搜索内容", "fetch": "抓取网页", "think": "思考", "list": "列出目录",
+    "move": "移动文件", "delete": "删除文件", "other": "工具",
+}
+
+
+def _act_label(name, kind) -> str:
+    return _TOOL_ZH.get(str(kind or "").strip().lower()) or (" ".join(str(name or "工具").split())[:60])
+
+
+def _act_agent_name(aid) -> str:
+    """活动卡上显示谁在干活（用成员表里的显示名，跟群里一致）。"""
+    try:
+        a = find(aid) or {}
+        return str(a.get("display") or a.get("name") or aid)
+    except Exception:  # noqa: BLE001
+        return str(aid)
+
+
+def _act_summary(name, kind, inp) -> str:
+    """一行中文摘要：命令首行 / 文件名 / 搜索词 / 网址 / 兜底工具名（沿用轨迹页口径）。"""
+    d = inp if isinstance(inp, dict) else {}
+    cmd = d.get("command") or d.get("cmd") or ""
+    if cmd:
+        first = " ".join(str(cmd).strip().splitlines()[0].split())
+        return first[:160]
+    for k in ("filePath", "file_path", "path", "notebook_path", "target_file"):
+        if d.get(k):
+            return str(d[k]).replace("\\", "/").rsplit("/", 1)[-1][:120]
+    for k in ("pattern", "query", "q"):
+        if d.get(k):
+            return "「%s」" % str(d[k])[:80]
+    if d.get("url"):
+        return str(d["url"])[:120]
+    return " ".join(str(name or "").split())[:80]
+
+
+def _act_add(chat, agent, tool, summary, status="running", detail="", tcid="") -> dict:
+    global _ACT_REV
+    with _ACT_LOCK:
+        _ACT_REV[0] += 1
+        rev = _ACT_REV[0]
+        rec = {"id": str(tcid) or ("a%d" % rev), "seq": rev, "rev": rev,
+               "chat": "" if chat is None else str(chat),
+               "agent": str(agent or ""), "tool": str(tool or ""),
+               "summary": str(summary or ""), "status": str(status or ""),
+               "detail": str(detail or "")[:2000],
+               "ts": time.time()}
+        _ACT.append(rec)
+        return dict(rec)
+
+
+def _act_finish(chat, tcid, status="completed", detail="") -> None:
+    """给某次活动收尾（**原地改**那条：`status`/`detail` 变，`rev` 变大 → 客户端下次就收到）。"""
+    if not tcid:
+        return
+    key = "" if chat is None else str(chat)
+    with _ACT_LOCK:
+        for rec in reversed(_ACT):
+            if rec.get("id") == str(tcid) and rec.get("chat") == key:
+                _ACT_REV[0] += 1
+                rec["rev"] = _ACT_REV[0]
+                rec["status"] = str(status or "completed")
+                rec["ts"] = time.time()
+                if detail:
+                    rec["detail"] = str(detail)[:2000]
+                return
+
+
+def activity(since: float = 0, chat=None) -> dict:
+    """面板用：`since` 之后**有过修改**的活动（含被收尾的那条）+ 当前最大 rev。
+    `chat` 为空 = 全部会话。"""
+    try:
+        since_f = float(since or 0)
+    except Exception:  # noqa: BLE001
+        since_f = 0.0
+    with _ACT_LOCK:
+        items = [dict(r) for r in _ACT
+                 if float(r.get("rev") or 0) > since_f
+                 and (chat in (None, "") or r.get("chat") == str(chat))]
+        mx = _ACT_REV[0]
+    return {"items": items, "max": mx}
+
+
+def _ask(aid, prompt: str, files=None, timeout: float = 240.0, chat=None) -> str:
     """用绑定的 ACP agent 生成回复。
 
     ★ 事件驱动（不是轮询 messages()）：prompt() 是异步的，_run_turn 收尾会 emit
@@ -708,6 +1227,16 @@ def _ask(aid, prompt: str, files=None, timeout: float = 240.0) -> str:
             t = ev.get("type")
             if t == "session.step.started":
                 turn_id = d.get("assistantMessageID")
+            elif t == "session.tool.called":
+                # ★C1：工具一开跑就记一条「进行中活动」（面板据此画活动卡）
+                kind = str(d.get("kind") or "")
+                if kind.lower() != "think":        # 「思考」太碎，不当活动卡
+                    _act_add(chat, _act_agent_name(aid), _act_label(d.get("name"), kind),
+                             _act_summary(d.get("name"), kind, d.get("input")),
+                             "running", tcid=d.get("toolCallId"))
+            elif t in ("session.tool.success", "session.tool.error"):
+                _act_finish(chat, d.get("toolCallId"),
+                            "completed" if t.endswith("success") else "error")
             elif t in ("session.step.ended", "session.step.failed"):
                 mid = d.get("assistantMessageID") or turn_id
                 txt = _assistant_text(svc, sid, mid)
@@ -999,26 +1528,28 @@ def _handle_event(aid, frame) -> None:
                         + ("\n完整清单（含群里更早的文件）：`%s`" % os.path.join(d, "_files.md")))
         attach_note += _inline_texts(inbox, d)
         acp_log("[cocraft-agents] %s 已落地 %d 个文件到 %s" % (aid, len(inbox), d))
-    base_prompt = ("%s\n\n下面是**最近的群聊记录**（从早到晚，`HH:MM 谁: 内容`），"
+    base_prompt = ("%s%s\n\n下面是**最近的群聊记录**（从早到晚，`HH:MM 谁: 内容`），"
                    "最后一条是刚 @ 你的消息。请结合上下文用中文简短回答，不要复述指令、不要寒暄。\n\n"
                    "【最近的群聊记录】\n%s\n\n【你要回应的】%s: %s"
-                   % (me_line, hist or "（暂无）", who, content))
+                   % (me_line, role_line(a.get("role")), hist or "（暂无）", who, content))
     plain_prompt = base_prompt + (("\n\n（群里有 %d 个文件（%s），但这轮没读进来 —— 只能按文件名回答。）"
                                   % (len(files), "、".join(f.get("name") or "?" for f in files))) if files else "")
     prompt = base_prompt + attach_note
     try:
-        reply = _ask(aid, prompt, files=files)
+        _snap_before_turn(aid, chat)          # ★派活前记一份（之后能并排看"谁改了哪些文件"）
+        reply = _ask(aid, prompt, files=files, chat=chat)
         if files and not str(reply or "").strip():
             # ★ 有些“大脑/模型”不吃图片：带附件那一轮会**空回复**（实测 text_parts=0）。
             #   这时去掉附件重试一次 —— 宁可它按文字/文件名答，也别在群里沉默。
             acp_log("[cocraft-agents] %s 带附件这一轮没出正文 → 去掉附件重试一次" % aid)
-            reply = _ask(aid, plain_prompt, files=None)
+            reply = _ask(aid, plain_prompt, files=None, chat=chat)
         if not str(reply or "").strip():
             # ★ 还是空的（实测：`text_parts=1` 且那 1 条就是被剥掉的 "Model metadata" 警告 →
             #   模型只给了思考、没给正文）→ **再试一次**，把要求说死。否则群里看着就是"它不回复"。
             acp_log("[cocraft-agents] %s 空回复 → 重试一次" % aid)
             reply = _ask(aid, plain_prompt + "\n\n（刚才那一轮你没有输出正文。"
-                                           "请**只用中文回一句话**，不要输出思考过程。）", files=None)
+                                           "请**只用中文回一句话**，不要输出思考过程。）",
+                         files=None, chat=chat)
     except Exception as e:  # noqa: BLE001
         acp_log("[cocraft-agents] %s 生成失败：%r" % (aid, e))
         reply = ""

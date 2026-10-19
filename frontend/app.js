@@ -199,9 +199,18 @@ const state = {
   attachments: [],      // 待发送附件
   named: {},            // 已经自动命名过的会话 { id: true } —— 每个会话最多命名一次
   detailOpen: {},       // 侧栏会话详情展开状态 { id: true }
+  // ★会话列表里的「项目文件树」（按会话展开；数据按**根目录**缓存 → 同项目共用，不重复请求）
+  treeOpen: {},         // { [sessionID]: true }  哪些会话的树展开了
+  treeData: {},         // { [root]: { [path]: items } }  /fs/list 的结果
+  treeExp: {},          // { [root]: { [path]: true } }   目录展开状态
+  treeErr: {},          // { [root]: { [path]: "原因" } } 读目录失败（在树里显示，别误报"空目录"）
   follow: true,         // 是否跟随最新内容自动往下滚
   refreshing: false,
   pendingRefresh: false,
+  msgCursor: null,      // ★往上翻页：更早一页的游标（两个引擎形状不同，见 msgCursorOf）
+  msgDone: true,        // 没有更早的消息了
+  msgLoading: false,    // 正在加载更早的一页
+  msgOlder: false,      // 已经往上翻过（用来显示"没有更早的消息了"）
   openParts: new Set(), // 用户手动展开过的折叠块（key=msgID:idx）—— 重渲染后保留，不再自动展开
 };
 
@@ -246,9 +255,120 @@ function sessionDetailHtml(s) {
   if (tok.reasoning != null) parts.push(`思考 ${fmtNum(tok.reasoning)}`);
   if (cache.read != null) parts.push(`缓存读 ${fmtNum(cache.read)}`);
   row("Token", esc(parts.join(" · ")));
+  if (s.context && Number(s.context.size) > 0) {
+    const cu = Number(s.context.used) || 0, cs = Number(s.context.size);
+    const left = Math.max(0, Math.round((1 - cu / cs) * 100));
+    row("上下文", esc(`${fmtTok(cu)} / ${fmtTok(cs)}（剩 ${left}%）`));
+  }
   if (s.cost != null) row("花费", esc(Number(s.cost).toFixed(6)));
   row("结果", esc(s.outcome));
   return rows.join("") || '<div><b>详情</b><span>暂无</span></div>';
+}
+
+/* ---- ★上下文长度（“还够用多少”）—— 引擎无关 ----
+   * **ACP**：agent 主动上报 `usage_update {used,size}`（codex / opencode-acp 会发；dsh 等不发）
+     → `state.current.context` + 事件 `session.usage.update`；
+   * **OpenCode**：`/api/model` 的 `limit.context` 是窗口上限；上一条 assistant 的
+     `tokens.input + tokens.cache.read + tokens.cache.write` ≈ 本轮实际占用的上下文；
+   * 两个都拿不到就显示「上下文 —」并说明**为什么**（不编数字）。 */
+const CTX = { used: 0, size: 0, src: "", model: "" };
+
+function fmtTok(n) {
+  n = Math.max(0, Number(n) || 0);
+  if (n >= 1e8) return (n / 1e8).toFixed(1).replace(/\.0$/, "") + " 亿";
+  if (n >= 1e4) return (n / 1e4).toFixed(n >= 1e6 ? 0 : 1).replace(/\.0$/, "") + " 万";
+  return String(Math.round(n));
+}
+
+/** 模型窗口上限（`limit.context`）。OpenCode 给；ACP 的模型清单没有这一项 → 返回 0。 */
+function ctxLimitOf(ref) {
+  const id = String((ref && (ref.id || ref.modelID)) || "");
+  if (!id) return 0;
+  const prov = String((ref && ref.providerID) || "");
+  const hit = (MODEL.list || []).find((m) => String(m.id) === id
+    && (!prov || !m.providerID || String(m.providerID) === prov));
+  const n = Number((hit && hit.limit && hit.limit.context) || 0);
+  return n > 0 ? n : 0;
+}
+
+/** 从最近一条 assistant 消息推上下文占用（优先 agent 上报的 context，其次 OpenCode 的 tokens）。 */
+function ctxFromMessages() {
+  const msgs = state.messages || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m || m.type !== "assistant") continue;
+    if (m.context && Number(m.context.size) > 0) {
+      return { used: Number(m.context.used) || 0, size: Number(m.context.size) || 0,
+               src: "agent", model: String((m.model && m.model.id) || "") };
+    }
+    const t = m.tokens;
+    if (!t) continue;
+    const used = Number(t.input || 0) + Number((t.cache && t.cache.read) || 0)
+      + Number((t.cache && t.cache.write) || 0);
+    if (!used) continue;
+    const ref = (state.current && state.current.model && state.current.model.id)
+      ? state.current.model : (m.model || {});
+    const size = ctxLimitOf(ref);
+    return { used: used, size: size, src: size ? "model" : "used",
+             model: String((ref && ref.id) || "") };
+  }
+  return null;
+}
+
+function ctxCompute() {
+  if (!state.current) return { used: 0, size: 0, src: "", model: "" };
+  const sc = state.current.context;
+  if (sc && Number(sc.size) > 0) {
+    return { used: Number(sc.used) || 0, size: Number(sc.size) || 0, src: "agent",
+             model: String((state.current.model && state.current.model.id) || "") };
+  }
+  return ctxFromMessages() || { used: 0, size: 0, src: "", model: "" };
+}
+
+function ctxTitle() {
+  if (!CTX.used && !CTX.size) {
+    return "上下文用量：这个 agent 还没上报\n"
+      + "（ACP 里 codex / opencode-acp 会发 usage_update；dsh 等不发，OpenCode 走模型清单 + 上一条回答的 tokens）";
+  }
+  const bits = ["已用 " + fmtTok(CTX.used) + (CTX.size ? " / " + fmtTok(CTX.size) : "") + " tokens"];
+  if (CTX.size) bits.push("剩余 " + Math.max(0, Math.round((1 - CTX.used / CTX.size) * 100)) + "%");
+  if (CTX.model) bits.push("模型 " + CTX.model);
+  bits.push(CTX.src === "agent" ? "来源：agent 上报的 usage_update"
+    : CTX.src === "model" ? "来源：模型窗口上限 + 上一条回答的 tokens"
+    : "窗口上限未知（模型清单没给 limit.context）");
+  return bits.join("\n");
+}
+
+/** 同步输入框左下角那个「上下文 …」小条（选会话 / 刷新消息 / usage 事件 / 换模型都会调）。 */
+function ctxSync() {
+  const b = $("ctx-chip");
+  if (!b) return;
+  if (!state.current) { b.hidden = true; return; }
+  // 模型清单还没拉过 → 补一次（拿到 limit.context 才能算“剩多少”）
+  if (MODEL.list == null && !MODEL.loading) { loadModels().then(() => ctxSync()).catch(() => {}); }
+  const c = ctxCompute();
+  CTX.used = c.used; CTX.size = c.size; CTX.src = c.src; CTX.model = c.model;
+  b.hidden = false;
+  if (CTX.size) {
+    const left = Math.max(0, Math.min(100, Math.round((1 - CTX.used / CTX.size) * 100)));
+    b.textContent = "上下文 剩 " + left + "%";
+  } else {
+    b.textContent = CTX.used ? ("上下文 " + fmtTok(CTX.used)) : "上下文 —";
+  }
+  b.title = ctxTitle();
+  const pct = CTX.size ? CTX.used / CTX.size : 0;
+  b.classList.toggle("warn", pct >= 0.8 && pct < 0.95);
+  b.classList.toggle("danger", pct >= 0.95);
+  b.dataset.src = CTX.src || "";
+}
+
+function ctxShowInfo() {
+  if (!state.current) return;
+  if (!CTX.used && !CTX.size) {
+    setBanner("这个 agent 还没上报上下文用量（不支持 usage_update）", { ms: 6000 });
+    return;
+  }
+  setBanner(ctxTitle().replace(/\n/g, " · "), { ms: 9000 });
 }
 
 /** 会话属于哪个项目：取工作目录的最后一段当项目名（拿不到就留空）。
@@ -258,6 +378,97 @@ function projectNameOf(dir) {
   if (!d) return "";
   const parts = d.split(/[\\/]/);
   return parts[parts.length - 1] || d;
+}
+
+/* ---------------- ★会话列表里的「项目文件树」（2026-10-16） ----------------
+   数据走**编码模式同一套后端**：`/fs/list?root=&path=`（引擎无关、`realpath` 越界校验、跳过重目录）。
+   ⚠ 数据按**根目录**缓存（`state.treeData[root]`）—— 同一个项目常有多条会话，
+     展开第二条同项目会话**不会重复请求**（缓存命中直接画）。
+   点文件 → 交给 `codeOpenAt()` 在「编码模式」右侧抽屉里打开（可编辑 / 可一键运行）。 */
+/** ★文件树里的图标：**目录用标准文件夹**（合上 / 打开两种形状，SVG、随主题上色）。
+ *  ⚠ 别改用 emoji 📁/📂 —— 实测 Segoe UI Emoji 里这两个**看不出区别**，会丢掉「展开/合上」的信息。
+ *  会话列表的树与编码模式的树**共用**这一个口径，别再各写一套符号。文件本轮先不配图标（保持干净）。 */
+function treeIco(isDir, open) {
+  if (!isDir) return "";
+  const d = open
+    ? "m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2"
+      + " 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"
+    : "M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2"
+      + " 0 0 0-2 2v13a2 2 0 0 0 2 2Z";
+  return `<svg class="fold${open ? " open" : ""}" viewBox="0 0 24 24" width="13" height="13" fill="none"`
+    + ` stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+    + `<path d="${d}"/></svg>`;
+}
+
+function sessionTreeHtml(root) {
+  const d = state.treeData[root];
+  const errs = state.treeErr[root] || {};
+  if (errs[root]) return `<div class="empty">读目录失败：${esc(errs[root])}</div>`;
+  if (!d || d[root] === undefined) return `<div class="empty">加载中…</div>`;
+  const exp = state.treeExp[root] || {};
+  let html = "";
+  const walk = (list, depth) => {
+    for (const it of list) {
+      const pad = 4 + depth * 12;
+      if (it.dir) {
+        const open = !!exp[it.path];
+        html += `<div class="tn" data-sdir="${esc(it.path)}" style="padding-left:${pad}px" title="${esc(it.path)}">`
+          + `<span class="tw ico">${treeIco(true, open)}</span><span class="nm">${esc(it.name)}</span></div>`;
+        if (open) {
+          if (errs[it.path]) {
+            html += `<div class="empty" style="padding-left:${pad + 12}px">读目录失败：${esc(errs[it.path])}</div>`;
+          } else {
+            const kids = d[it.path];
+            if (kids) walk(kids, depth + 1);
+            else html += `<div class="empty" style="padding-left:${pad + 12}px">…</div>`;
+          }
+        }
+      } else {
+        const on = (typeof CODE !== "undefined" && CODE.root === root && CODE.sel === it.path) ? " on" : "";
+        html += `<div class="tn${on}" data-sfile="${esc(it.path)}" style="padding-left:${pad}px" title="${esc(it.path)}">`
+          + `<span class="tw"></span><span class="nm">${esc(it.name)}</span></div>`;
+      }
+    }
+  };
+  walk(d[root], 0);
+  return html || `<div class="empty">空目录</div>`;
+}
+
+/** 就地刷新所有已展开的树（**不重画整个列表** → 不把左侧列表的滚动位置弹回去）。 */
+function renderSessionTrees() {
+  const list = document.getElementById("session-list");
+  if (!list) return;
+  list.querySelectorAll(".session-tree").forEach((el) => {
+    el.innerHTML = sessionTreeHtml(el.dataset.root);
+  });
+}
+
+/** 拉一个目录（结果按 root 缓存）；拉完就地刷新。 */
+async function sessionTreeLoad(root, path) {
+  const box = (state.treeData[root] = state.treeData[root] || {});
+  const errs = (state.treeErr[root] = state.treeErr[root] || {});
+  delete errs[path];
+  try {
+    const r = await api(`/fs/list?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`);
+    box[path] = (r.data && r.data.items) || [];
+  } catch (err) {
+    // ⚠ 别把"读不了"显示成"空目录"（目录被删 / 盘没挂 / 没权限时很容易误导）
+    errs[path] = String((err && err.message) || err);
+    box[path] = [];
+    setBanner("读目录失败：" + errs[path]);
+  }
+  renderSessionTrees();
+}
+
+/** 展开 / 收起某条会话的文件树（**首次展开**才拉根目录）。 */
+function sessionTreeToggle(id) {
+  state.treeOpen[id] = !state.treeOpen[id];
+  renderSessions();
+  if (!state.treeOpen[id]) return;
+  const s = state.sessions.find((x) => String(x.id) === String(id));
+  const root = (s && s.location && s.location.directory) || "";
+  const d = state.treeData[root];
+  if (root && !(d && d[root] !== undefined)) sessionTreeLoad(root, root);
 }
 
 function renderSessions() {
@@ -282,17 +493,22 @@ function renderSessions() {
     const dir = (s.location && s.location.directory) || "";
     const proj = projectNameOf(dir);
     const tip = open ? "收起详细信息" : "展开详细信息";
+    const tOpen = !!state.treeOpen[s.id];                 // ★项目文件树是否展开
     return `<div class="session${active}" data-id="${esc(s.id)}" title="${esc(s.title || "(无标题)")}">
       <button type="button" class="info" data-info="${esc(s.id)}"
               title="${tip}" aria-label="${tip}">${open ? "▾" : "▸"}</button>
       <button type="button" class="del" data-del="${esc(s.id)}"
               title="删除这个会话" aria-label="删除会话">×</button>
+      ${dir ? `<button type="button" class="tree-btn${tOpen ? " on" : ""}" data-tree="${esc(s.id)}"
+              title="${tOpen ? "收起项目文件树" : "展开项目文件树（" + esc(proj) + "）"}"
+              aria-label="项目文件树" aria-expanded="${tOpen ? "true" : "false"}">${treeIco(true, false)}</button>` : ""}
       <span class="t">${esc(s.title || "(无标题)")}</span>
       <span class="s-row">
         <span class="s">${esc(when)}${s.outcome ? " · " + esc(s.outcome) : ""}</span>
         ${proj ? `<span class="proj" title="项目：${esc(proj)}">${esc(proj)}</span>` : ""}
       </span>
       <div class="det"${open ? "" : " hidden"}>${sessionDetailHtml(s)}</div>
+      ${tOpen && dir ? `<div class="session-tree" data-root="${esc(dir)}">${sessionTreeHtml(dir)}</div>` : ""}
     </div>`;
   }).join("");
 }
@@ -323,6 +539,7 @@ async function deleteSession(id, title) {
     staticSig = null;
     liveShellSig = null;
     heroShown = false;
+    resetMsgPaging();
     renderAttachRow();
     $("session-title").textContent = "未选择会话";
     $("session-meta").textContent = "";
@@ -396,40 +613,187 @@ function renderReasoningPart(part, key, msgId) {
 const MODEL_WARN_RE = /^\s*Warning: Model metadata for `[^`]*` not found\.[^\n]*\n+/i;
 function stripModelWarning(t) { return String(t ?? "").replace(MODEL_WARN_RE, ""); }
 
-/** 主界面那条「思考 · Ns」小条（细节在「轨迹」页）。 */
+/** 人类可读时长：45 → `45s`、95 → `1m35s`、3900 → `1h5m`。
+ *  （整轮动辄几分钟，原来的 `671s` 没法读。） */
+function fmtDur(secs) {
+  const s = Math.max(0, Math.round(secs || 0));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60 ? (s % 60) + "s" : "");
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h + "h" + (m ? m + "m" : "");
+}
+
+/** 每条消息 → 它所在「那一轮」的信息（由 renderMessages 预先算好，见 buildTurnMap）。 */
+let TURNMAP = new Map();
+
+/** 一轮（turn）= 一条用户消息之后、到下一条用户消息之前的**所有助手消息**。
+ *  预先算好每条的「整轮起点时间 / 这一轮有没有思考 / 是不是这一轮最后一条」。
+ *  ⚠ 主界面那条「思考 Ns」要的是**整轮总时长**（从你发问那一刻算到这一条完成），
+ *    而不是单条消息自己的时长 —— 一个回合里助手常常拆成十几条消息（每步一条，中间还夹着系统通知），
+ *    只看单条会把"等了五分钟"显示成「思考 14s」。 */
+function buildTurnMap() {
+  const msgs = state.messages || [];
+  const map = new Map();
+  let turnStart = null, from = 0;
+  const flush = (to) => {
+    if (turnStart == null || to < from) return;
+    let last = -1, hasThink = false;
+    for (let i = from; i <= to; i++) {
+      const m = msgs[i]; if (!m) continue;
+      if (m.type === "assistant") last = i;
+      if (!hasThink && Array.isArray(m.content)
+          && m.content.some((p) => p && p.type === "reasoning" && String(p.text || "").trim())) {
+        hasThink = true;
+      }
+    }
+    if (last < 0) return;
+    for (let i = from; i <= to; i++) {
+      const m = msgs[i]; if (!m) continue;
+      map.set(m.id, { start: turnStart, last: i === last, hasThink });
+    }
+  };
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i] || {};
+    if (m.type === "user") {
+      flush(i - 1);
+      turnStart = ((m.time || {}).created) || null;      // ★整轮从"你发问那一刻"算起
+      from = i + 1;
+    } else if (turnStart == null) {                      // 会话开头没有用户消息的兜底
+      turnStart = ((m.time || {}).created) || null;
+      from = i;
+    }
+  }
+  flush(msgs.length - 1);
+  return map;
+}
+
+/** 主界面那条「思考 · 时长」小条（细节在「轨迹」页）。
+ *  时长是**整轮**的（从你发问算到这条完成），不是这条消息自己的。 */
 function thinkChipHtml(m) {
   const t = m.time || {};
   if (!t.completed) return `<div class="think-chip live">✦ 思考中…</div>`;
-  const secs = (t.created && t.completed) ? Math.max(0, Math.round((t.completed - t.created) / 1000)) : 0;
-  return `<div class="think-chip">✦ 思考<em>${secs ? " " + secs + "s" : ""}</em></div>`;
+  const info = TURNMAP.get(m.id);
+  const start = (info && info.start) || t.created;
+  const secs = (start && t.completed) ? Math.max(0, (t.completed - start) / 1000) : 0;
+  const title = info ? "整轮用时（从你发问算到最后一条）" : "这一条的用时";
+  return `<div class="think-chip" title="${title}">✦ 思考<em>${secs ? " " + fmtDur(secs) : ""}</em></div>`;
+}
+
+/** 会话内的一行中文小条（自动续写 / 目录切换 / 注入技能 / 切换模式…）。
+ *  `inner` 必须是**已经转义好**的 HTML。 */
+function noticeHtml(inner) {
+  return `<div class="notice"><span class="line"></span>
+    <span class="label">${inner}</span>
+    <span class="line"></span></div>`;
+}
+
+/** `Model.Ref` → 一行文字（`id · variant`）。
+ *  实测上游的 `providerID` 常是面板自己的中性占位 `acp` —— 只在**没有 id** 时才拿它兜底，
+ *  免得显示成 `acp/deepseek/deepseek-flash` 这种名字。 */
+function modelRefText(ref) {
+  if (!ref) return "默认";
+  const id = ref.id || ref.modelID || ref.name || "";
+  const v = (ref.variant && ref.variant !== "default") ? ` · ${ref.variant}` : "";
+  const base = id || ref.providerID || "";
+  return base ? base + v : "默认";
+}
+
+/** 结构化错误（OpenCode 的 `Session.StructuredError`）→ 一行人话，绝不把 JSON 倒给用户。 */
+function textOfError(e) {
+  if (!e) return "";
+  if (typeof e === "string") return oneLine(e, 300);
+  const head = e.type ? `[${e.type}] ` : "";
+  let msg = e.message || e.name || "";
+  if (!msg && typeof e.data === "string") msg = e.data;
+  const body = e.response && (e.response.body || e.response.statusText);
+  return oneLine(head + msg + (body ? " · " + String(body) : ""), 400);
+}
+
+/** ★OpenCode 的上下文压缩（`compaction` 消息）→ 「会话已压缩」小条 + 可折叠的摘要。
+ *  上游字段：`status` running|completed|failed · `reason` auto|manual ·
+ *  `summary`（压缩出来的上下文摘要，很长的 Markdown）· `recent` · `tokens{input,output}` · `cost` · `error`。
+ *  以前没处理 → 主界面只剩「未知结构 · 原始数据」。 */
+function renderCompactionMsg(m) {
+  const st = String(m.status || "completed");
+  const auto = (m.reason || "auto") !== "manual";
+  const tok = m.tokens || {};
+  const bits = [auto ? "自动" : "手动"];
+  const usage = [];
+  if (tok.input != null) usage.push("输入 " + fmtNum(tok.input));
+  if (tok.output != null) usage.push("输出 " + fmtNum(tok.output));
+  if (usage.length) bits.push(usage.join(" / "));
+  if (m.time && m.time.created) bits.push(fmtTime(m.time.created));
+  const label = st === "running" ? "正在压缩会话…" : (st === "failed" ? "会话压缩失败" : "会话已压缩");
+  const cls = st === "running" ? " run" : (st === "failed" ? " err" : " ok");
+  const icon = st === "running" ? "✻" : (st === "failed" ? "⚠" : "⇲");
+  const err = st === "failed" ? textOfError(m.error) : "";
+  const summary = (typeof m.summary === "string" ? m.summary : "").trim();
+  const sumKey = "cp:" + String(m.id || "");
+  const sumHtml = summary
+    ? `<details class="part cp-sum"${state.openParts.has(sumKey) ? " open" : ""} data-k="${esc(sumKey)}">
+        <summary><span class="tag">摘要</span> 压缩出的上下文摘要（${fmtNum(summary.length)} 字）</summary>
+        <div class="body cp-md">${renderText(summary)}</div>
+      </details>`
+    : "";
+  return `<div class="notice compact${cls}"><span class="line"></span>
+    <span class="label"><span class="tag${cls}">${icon} ${label}</span>
+      <span class="cp-sub">${esc(bits.join(" · "))}</span></span>
+    <span class="line"></span></div>`
+    + (err ? `<div class="cp-err">${esc(err)}</div>` : "") + sumHtml;
+}
+
+/** 会话里的 `shell` 消息（在客户端用 `!命令` 跑过的那种）：命令 + 状态 + 可折叠输出。 */
+function renderShellMsg(m) {
+  const st = String(m.status || "");
+  const stZh = { running: "运行中", exited: "已完成", timeout: "超时", killed: "已终止" }[st] || st;
+  const cls = st === "running" ? " run" : (st === "exited" || !st ? " ok" : " err");
+  const cmd = oneLine(m.command || "", 240) || "(空命令)";
+  const exitTxt = (m.exit != null && m.exit !== "") ? `exit ${m.exit}` : "";
+  const out = (m.output && typeof m.output.output === "string") ? m.output.output : "";
+  const outHtml = out.trim()
+    ? `<details class="part cp-sum cp-out"><summary><span class="tag">输出</span> 标准输出（${fmtNum(out.length)} 字）</summary>
+        <div class="body">${esc(out.slice(0, 20000))}</div></details>`
+    : "";
+  return `<div class="notice compact"><span class="line"></span>
+    <span class="label"><span class="tag${cls}">命令</span>
+      <span class="cp-sub">${esc(cmd)}</span>
+      ${stZh ? `<span class="cp-sub">${esc(stZh)}</span>` : ""}
+      ${exitTxt ? `<span class="cp-sub">${esc(exitTxt)}</span>` : ""}
+      ${m.time && m.time.created ? `<span class="cp-sub">${esc(fmtTime(m.time.created))}</span>` : ""}
+    </span><span class="line"></span></div>${outHtml}`;
 }
 
 function renderMessage(m) {
   const type = m.type || "assistant";
   if (type === "idle") return "";
 
-  // 系统类提示：做成细分隔线
-  if (type === "system" || type === "location-switched" || type === "synthetic") {
-    const label = type === "synthetic" ? "自动续写"
-      : type === "location-switched" ? "工作目录已切换" : "系统";
+  // ★系统注入通知（AGENTS.md 指令变更 / 日期 / 运行环境…）**不进主界面** —— 整条归「轨迹」页。
+  //   一个回合里它会出现十几次（每一轮工具调用后都可能来一条），把消息区刷满。
+  if (type === "system") return "";
+  // 会话内的少量提示仍留在主界面：工作目录切换 / 自动续写
+  if (type === "location-switched" || type === "synthetic") {
+    const label = type === "synthetic" ? "自动续写" : "工作目录已切换";
     const body = (m.text || "").trim();
-    // ★系统消息很长时（AGENTS.md 变更会把整段 diff 打进来）只留**围栏前的一句**，不倒正文。
-    const long = body.length > 180 || body.indexOf("```") >= 0;
-    const text = !body ? ""
-      : long ? "：" + esc(body.split("```")[0].trim().slice(0, 140)) + " …（略）"
-      : "：" + esc(body.slice(0, 160));
-    return `<div class="notice"><span class="line"></span>
-      <span class="label">${esc(label)}${text}</span>
-      <span class="line"></span></div>`;
+    const text = !body ? "" : "：" + esc(body.slice(0, 160));
+    return noticeHtml(esc(label) + text);
   }
 
   // 技能注入：OpenCode 与 ACP 都可能有这种消息，只显示"装了哪个技能"，不倒正文
   if (type === "skill") {
     const nm = m.name || m.skill || "技能";
-    return `<div class="notice"><span class="line"></span>
-      <span class="label">已注入技能：${esc(String(nm))}</span>
-      <span class="line"></span></div>`;
+    return noticeHtml("已注入技能：" + esc(String(nm)));
   }
+
+  // ★上下文压缩（OpenCode 的 `compaction` 消息）：客户端里是一条「会话已压缩」小条 + 可折叠摘要。
+  //   `ui 0.1.69` 以前没处理 → 掉进「未知结构 · 原始数据」兜底卡（用户报过）。
+  if (type === "compaction") return renderCompactionMsg(m);
+  // 同一族的另外三类同样不该掉兜底卡：切换模式 / 切换模型 / 在客户端跑过的 shell 命令
+  if (type === "agent-switched") return noticeHtml(`已切换模式：${esc(String(m.agent || "默认"))}`);
+  if (type === "model-switched") {
+    const from = m.previous ? modelRefText(m.previous) : "";
+    return noticeHtml(`已切换模型：${from ? esc(from) + " → " : ""}${esc(modelRefText(m.model))}`);
+  }
+  if (type === "shell") return renderShellMsg(m);
 
   let parts = "";
   let hadReasoning = false;
@@ -465,7 +829,11 @@ function renderMessage(m) {
   const files = renderAttachments((m.files && m.files.length ? m.files : null)
     || (m.metadata && m.metadata.attachments));
 
-  const thinkChip = hadReasoning ? thinkChipHtml(m) : "";
+  // ★「思考 时长」= **整轮**总时长：这一条自己有思考就显示；否则若是这一轮的最后一条、
+  //   而整轮又确实思考过，也显示（否则一长串工具步骤之后，最终答案上就看不到总时长了）。
+  const turnInfo = TURNMAP.get(m.id);
+  const showThink = hadReasoning || !!(turnInfo && turnInfo.last && turnInfo.hasThink);
+  const thinkChip = showThink ? thinkChipHtml(m) : "";
   const finished = !!(m.time && m.time.completed);
   const trulyEmpty = !!contentArr && contentArr.length === 0;
 
@@ -495,7 +863,7 @@ function renderMessage(m) {
   const agent = (m.agent || (m.metadata && m.metadata.agent)) || "";
   const streaming = type === "assistant" && m.time && !m.time.completed;
 
-  return `<div class="msg ${isUser ? "user" : "assistant"}${m.pending ? " pending" : ""}">
+  return `<div class="msg ${isUser ? "user" : "assistant"}${m.pending ? " pending" : ""}" data-mid="${esc(m.id)}">
     <div class="who">
       ${isUser ? "" : `<img class="avatar" src="${appearanceUrl("avatar", "/assets/avatar.png")}" alt="">`}
       <strong>${isUser ? "我" : "助手"}</strong>
@@ -639,8 +1007,10 @@ function initSelCopy() {
     } catch { return false; }
   };
   const placeAt = (x, y) => {
-    btn.style.left = Math.min(Math.max(x, 70), window.innerWidth - 70) + "px";
-    btn.style.top = Math.max(y - 36, 6) + "px";
+    const z = uiZoom();                      // 真实像素 → 设计像素（见 uiZoom）
+    const left = Math.min(Math.max(x, 70 * z), window.innerWidth - 70 * z) / z;
+    btn.style.left = left + "px";
+    btn.style.top = Math.max(y - 36 * z, 6 * z) / z + "px";
   };
   const placeByRange = () => {
     const s = window.getSelection();
@@ -879,12 +1249,22 @@ function swapHtml(el, html) {
  * 主会话界面只显示「思考用时 + 输出正文」；思考正文与工具明细都在这里。 */
 
 const TRACE = { open: false };
+const TRACE_OPEN = new Set();   // 用户手动展开过的条目（重渲染后保留，别一刷新就收起来）
+let TRACE_KEYS = [];            // 当前画出来的条目 key（「全部展开 / 收起」用）
 
-/** 把当前会话里所有「思考 / 工具调用」按顺序收集出来（含正在生成的那一轮）。 */
+/** 把当前会话里所有「思考 / 工具调用 / 系统通知」按顺序收集出来（含正在生成的那一轮）。 */
 function traceItems() {
   const out = [];
   const pushMsg = (m) => {
-    if (!m || m.type !== "assistant") return;
+    if (!m) return;
+    // ★系统注入通知（AGENTS.md 指令变更 / 日期 / 运行环境 / 工具目录变更…）整条归轨迹，
+    //   主界面不再显示（见 renderMessage 里 `type === "system"` 那条 return ""）。
+    if (m.type === "system") {
+      out.push({ kind: "note", label: sysNoteLabel(m.text), text: m.text || "",
+                 time: (m.time && m.time.created) ? fmtTime(m.time.created) : "" });
+      return;
+    }
+    if (m.type !== "assistant") return;
     const content = Array.isArray(m.content) ? m.content : [];
     for (const p of content) {
       if (!p || typeof p !== "object") continue;
@@ -906,24 +1286,320 @@ function traceItems() {
       out.push({ kind: "tool", name: t.name || "tool", state: { status: t.status, input: t.input } });
     }
   }
+  out.forEach((it, i) => { it._i = i; });         // 稳定序号：折叠状态就靠它跨重渲染记住
   return out;
 }
 
-function traceItemHtml(it) {
-  if (it.kind === "think") {
-    return `<div class="tr-item tr-think">
-      <div class="tr-h"><span class="tag${it.live ? " thinking" : ""}">${it.live ? "思考中…" : "思考"}</span></div>
-      <div class="tr-body">${esc(it.text)}</div>
-    </div>`;
+/** 系统通知在轨迹页里的短标题（原文太长，一条能顶十几行）。 */
+function sysNoteLabel(text) {
+  const t = String(text || "").trim();
+  let m = t.match(/^The instructions from (.+?) changed/i);
+  if (m) return "指令变更 · " + m[1].replace(/\\/g, "/").split("/").pop();
+  m = t.match(/^Today's date is now:\s*(.+)/i);
+  if (m) return "日期 · " + m[1].trim();
+  if (/tool catalog has changed/i.test(t)) return "工具目录变更";
+  if (/^The environment you are running in is now/i.test(t)) return "运行环境更新";
+  const first = (t.split("\n")[0] || "").trim();
+  return first.length > 46 ? first.slice(0, 46) + "…" : (first || "系统");
+}
+
+/* ---------------- 轨迹条目：把工具调用翻成人话 ----------------
+ *  以前这里直接把 `state.input` 用 JSON 倒出来（一屏 `{"newString": "…\n…"}`），
+ *  而且**输出一个字都不显示** —— OpenCode 的 `output` 恒为 null，真正的输出在 `state.content`。
+ *  现在：① 一行中文摘要（运行命令 / 修改 xxx +12 −3 / 搜索「x」→ 6 处）；
+ *        ② 把输出接上（shell stdout + exit、read 内容、grep 命中）；
+ *        ③ `edit` 用 `metadata.files[].patch` 画**真 diff**（红绿行）；
+ *        ④ 默认折叠，点开看详情，原始 JSON 另收一层。 */
+
+/** 工具名（OpenCode）/ ACP ToolKind → 「动词 + 中文名」 */
+const TOOL_META = {
+  bash: ["exec", "运行命令"], shell: ["exec", "运行命令"], run: ["exec", "运行命令"],
+  execute: ["exec", "运行命令"], command: ["exec", "运行命令"], terminal: ["exec", "运行命令"],
+  "run command": ["exec", "运行命令"], exec_command: ["exec", "运行命令"],
+  read: ["read", "读取文件"], "read file": ["read", "读取文件"], cat: ["read", "读取文件"],
+  view: ["read", "读取文件"], read_file: ["read", "读取文件"],
+  edit: ["edit", "修改文件"], "edit file": ["edit", "修改文件"], patch: ["edit", "修改文件"],
+  multiedit: ["edit", "修改文件"], replace: ["edit", "修改文件"], edit_file: ["edit", "修改文件"],
+  delete: ["edit", "删除"], move: ["edit", "移动 / 重命名"],
+  write: ["write", "写入文件"], "write file": ["write", "写入文件"], create: ["write", "新建文件"],
+  newfile: ["write", "新建文件"], write_file: ["write", "写入文件"],
+  grep: ["search", "搜索内容"], search: ["search", "搜索内容"], find: ["search", "搜索内容"],
+  ripgrep: ["search", "搜索内容"], codesearch: ["search", "搜索内容"],
+  glob: ["glob", "查找文件"], ls: ["list", "列出目录"], list: ["list", "列出目录"],
+  webfetch: ["fetch", "抓取网页"], fetch: ["fetch", "抓取网页"], web: ["fetch", "联网"],
+  todo: ["plan", "更新计划"], todowrite: ["plan", "更新计划"], todoread: ["plan", "查看计划"],
+  plan: ["plan", "更新计划"], task: ["other", "子任务"],
+  think: ["other", "思考"], switch_mode: ["other", "切换模式"], other: ["other", "工具"],
+};
+
+/** 状态 → 中文（轨迹里那些 completed / running 也得是人话） */
+const STATUS_ZH = { completed: "完成", running: "进行中", pending: "等待",
+                    error: "失败", failed: "失败", cancelled: "已取消" };
+
+/** 工具名 + ACP kind → `[动词, 中文名]`；认不出就用原始名字兜底（ACP 的 title 常是人话） */
+function toolMeta(name, kind) {
+  const k1 = String(name || "").trim().toLowerCase();
+  const k2 = String(kind || "").trim().toLowerCase();
+  return TOOL_META[k1] || TOOL_META[k2] || ["other", String(name || kind || "工具")];
+}
+
+/** 工具输出：OpenCode 在 `state.content`（分块数组），ACP 在 `state.output`（字符串） */
+function toolOutput(st) {
+  if (!st) return "";
+  const c = st.content;
+  if (typeof c === "string" && c) return c;
+  if (Array.isArray(c)) {
+    const t = c.filter((p) => p && typeof p.text === "string").map((p) => p.text).join("");
+    if (t) return t;
   }
-  const st = (it.state && it.state.status) || "pending";
-  const cls = st === "completed" ? "ok" : st === "error" ? "err" : "run";
-  const input = it.state && it.state.input ? JSON.stringify(it.state.input, null, 2) : "";
-  const out = (it.state && (it.state.output || it.state.error)) || "";
-  return `<div class="tr-item tr-tool${st === "error" ? " err" : ""}">
-    <div class="tr-h"><span class="tag ${cls}">${esc(st)}</span> <b>${esc(it.name)}</b></div>
-    ${(input || out) ? `<div class="tr-body">${esc(input)}${out ? "\n\n" + esc(String(out).slice(0, 20000)) : ""}</div>` : ""}
+  const o = st.output;
+  if (typeof o === "string") return o;
+  if (o && typeof o === "object") return JSON.stringify(o, null, 2);
+  return "";
+}
+
+/** 压成一行（命令 / 预览用） */
+function oneLine(s, max) {
+  const t = String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const m = max || 90;
+  return t.length > m ? t.slice(0, m) + "…" : t;
+}
+
+/** 只留文件名（行内摘要放不下完整路径） */
+function shortPath(p) {
+  const s = String(p || "").replace(/\\/g, "/");
+  const i = s.lastIndexOf("/");
+  return i < 0 ? s : s.slice(i + 1);
+}
+
+/** 字节数 → 人话 */
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+  return (b / 1048576).toFixed(1) + " MB";
+}
+
+const TR_DIFF_MAX = 20000;      // diff 最多画这么多字符
+const TR_OUT_MAX = 12000;       // 输出最多画这么多字符
+
+/** unified diff（`metadata.files[].patch`）→ 逐行上色 */
+function renderDiff(patch) {
+  const lines = String(patch || "").split("\n");
+  const out = [];
+  for (const raw of lines) {
+    if (/^(Index:|=+$)/.test(raw)) continue;                 // 头部噪音，不画
+    let cls = "ctx";
+    if (/^(\+\+\+|---)\s/.test(raw)) cls = "file";
+    else if (raw.startsWith("@@")) cls = "hunk";
+    else if (raw.startsWith("+")) cls = "add";
+    else if (raw.startsWith("-")) cls = "del";
+    out.push(`<span class="dl ${cls}">${raw ? esc(raw) : "&nbsp;"}</span>`);
+  }
+  return `<div class="tr-diff">${out.join("")}</div>`;
+}
+
+/** 折叠块外壳：摘要一行 + 点开看详情 + 原始 JSON 再收一层 */
+function foldHtml(key, summary, body, rawInput, autoOpen) {
+  const open = (autoOpen || TRACE_OPEN.has(key)) ? " open" : "";
+  let raw = "";
+  if (rawInput !== undefined && rawInput !== null) {
+    const js = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput, null, 2);
+    raw = `<details class="tr-raw"><summary>原始数据</summary>
+      <pre class="tr-pre">${esc(String(js).slice(0, 8000))}</pre></details>`;
+  }
+  return `<div class="tr-fold-wrap">
+    <details class="tr-fold" data-k="${esc(key)}"${open}>
+      <summary class="tr-sum">${summary}</summary>
+      ${body || ""}${raw}
+    </details>
   </div>`;
+}
+
+/** 思考：摘要给「首行预览 + 字数」，点开看全文 */
+function traceThinkHtml(it) {
+  const t = String(it.text || "");
+  const sum = `<span class="tag${it.live ? " thinking" : ""}">${it.live ? "思考中…" : "思考"}</span>
+    <span class="tr-preview">${esc(oneLine(t, 110))}</span>
+    <span class="tr-meta">${t.length} 字</span>`;
+  return `<div class="tr-item tr-think">${foldHtml(
+    "k" + it._i, sum, `<div class="tr-body">${esc(t.slice(0, TR_OUT_MAX))}</div>`, null, it.live)}</div>`;
+}
+
+/** 工具：一行中文摘要 + 真输出 / 真 diff；出错自动展开 */
+function traceToolHtml(it) {
+  const st = (it.state && typeof it.state === "object") ? it.state : {};
+  const input = (st.input && typeof st.input === "object") ? st.input : {};
+  const md = (st.metadata && typeof st.metadata === "object") ? st.metadata : {};
+  const [verb, zhName] = toolMeta(it.name, st.kind || it.kind);
+  const status = String(st.status || "pending");
+  const bad = status === "error" || status === "failed";
+  const cls = status === "completed" ? "ok" : bad ? "err" : "run";
+  const out = toolOutput(st);
+
+  let obj = "", meta = "", body = "";
+  const pre = (s, c) => `<pre class="${c || "tr-pre"}">${esc(String(s || "").slice(0, TR_OUT_MAX))}</pre>`;
+
+  if (verb === "exec") {
+    const cmd = String(input.command || input.cmd || input.script || "");
+    obj = oneLine(cmd, 70) || (it.name || "");
+    if (md.exit !== undefined && md.exit !== null) meta = "exit " + md.exit;
+    body = (cmd ? pre(cmd) : "") + (out ? pre(out, "tr-out") : "");
+  } else if (verb === "read") {
+    const p = input.path || input.filePath || input.file || "";
+    obj = shortPath(p) || oneLine(it.name, 40);
+    const off = Number(input.offset || 0), lim = Number(input.limit || 0);
+    if (lim) meta = `${off ? off + "–" : "1–"}${off + lim - 1} 行`;
+    else if (md.truncated) meta = "已截断";
+    body = (p ? `<div class="tr-file">${esc(p)}</div>` : "") + (out ? pre(out, "tr-out") : "");
+  } else if (verb === "edit" || verb === "write") {
+    const files = Array.isArray(md.files) ? md.files : null;
+    const list = (files && files.length) ? files
+      : [{ file: input.path || input.filePath || "", additions: 0, deletions: 0, patch: "" }];
+    const add = list.reduce((a, f) => a + (Number(f && f.additions) || 0), 0);
+    const del = list.reduce((a, f) => a + (Number(f && f.deletions) || 0), 0);
+    obj = list.length === 1 ? shortPath(list[0].file) : list.length + " 个文件";
+    meta = (add || del) ? `+${add} −${del}` : (verb === "write" ? "新建" : "");
+    body = list.map((f) => {
+      const head = `<div class="tr-file">${esc((f && f.file) || "(未知文件)")}`
+        + `<span class="tr-add">+${Number((f && f.additions) || 0)}</span>`
+        + `<span class="tr-del">−${Number((f && f.deletions) || 0)}</span></div>`;
+      if (f && f.patch) return head + renderDiff(String(f.patch).slice(0, TR_DIFF_MAX));
+      if (verb === "write" && input.content) return head + pre(input.content);
+      return head + pre(JSON.stringify({ oldString: input.oldString, newString: input.newString }, null, 2));
+    }).join("");
+  } else if (verb === "search") {
+    const pat = input.pattern || input.query || "";
+    obj = pat ? `「${oneLine(pat, 40)}」` : oneLine(it.name, 40);
+    if (input.path) obj += " · " + shortPath(input.path);
+    if (md.matches !== undefined) meta = md.matches + " 处命中";
+    body = out ? pre(out, "tr-out") : "";
+  } else if (verb === "glob" || verb === "list") {
+    obj = oneLine(input.pattern || input.path || it.name, 60);
+    const n = out ? out.split("\n").filter((l) => l.trim()).length : 0;
+    if (n) meta = n + " 项";
+    body = out ? pre(out, "tr-out") : "";
+  } else if (verb === "fetch") {
+    obj = oneLine(String(input.url || "").replace(/^https?:\/\//, ""), 60) || oneLine(it.name, 40);
+    body = out ? pre(out, "tr-out") : "";
+  } else if (verb === "plan") {
+    const todos = Array.isArray(input.todos) ? input.todos : null;
+    obj = todos ? todos.length + " 项" : oneLine(it.name, 40);
+    body = pre(JSON.stringify(todos || input, null, 2));
+  } else {
+    obj = oneLine(it.name, 50);
+    const anyIn = Object.keys(input).length ? JSON.stringify(input, null, 2) : "";
+    body = (anyIn ? pre(anyIn) : "") + (out ? pre(out, "tr-out") : "");
+  }
+
+  const sum = `<span class="tag ${cls}">${esc(STATUS_ZH[status] || status)}</span>
+    <span class="tr-zh">${esc(zhName)}</span>
+    ${obj ? `<span class="tr-obj" title="${esc(obj)}">${esc(obj)}</span>` : ""}
+    ${meta ? `<span class="tr-meta">${esc(meta)}</span>` : ""}`;
+  return `<div class="tr-item tr-tool${bad ? " err" : ""}">${foldHtml("k" + it._i, sum, body, input, bad)}</div>`;
+}
+
+/** 系统通知：也折叠（标题已经说清是什么了，diff 是细节），跟工具/思考一个观感 */
+function traceNoteHtml(it) {
+  const sum = `<span class="tag">系统</span><b>${esc(it.label)}</b>`
+    + `${it.time ? `<span class="tr-meta">${esc(it.time)}</span>` : ""}`;
+  return `<div class="tr-item tr-note">${foldHtml(
+    "k" + it._i, sum, `<div class="tr-body">${esc(String(it.text || "").slice(0, 20000))}</div>`, null, false)}</div>`;
+}
+
+function traceItemHtml(it) {
+  if (it.kind === "think") return traceThinkHtml(it);
+  if (it.kind === "note") return traceNoteHtml(it);
+  return traceToolHtml(it);
+}
+
+/* ---------------- ★主界面「本轮活动卡」：会话里的进展也要看得见 ----------------
+   和群聊 C1 那张同款：**一张卡**把"这一轮它都干了什么"列出来（一行一步、中文人话），
+   点某一步能看命令原文 / stdout / **真 diff**（直接复用 `traceToolHtml` 那套）。
+   设计取舍：
+   · **只收工具**（思考已经有「思考 Ns」芯片了，再列一遍太吵）；**没有工具的那一轮不出现卡片**；
+   · 卡片**贴在这一轮最后一条消息之后**（所以干活时它就长在消息流末尾，做完原地留着 —— 用户要"保持展开"）；
+   · 折叠状态用**独立 key 前缀**（`tc<轮序号>-`），别和轨迹页的 `k<i>` 撞（不然一处展开两处都展开）。 */
+function turnCards() {
+  const msgs = state.messages || [];
+  const out = [];
+  let cur = null;
+  const startTurn = (t) => {
+    cur = { start: t || null, end: null, items: [], afterId: null, live: false };
+    out.push(cur);
+  };
+  for (const m of msgs) {
+    if (!m) continue;
+    if (m.type === "user") { startTurn(((m.time || {}).created) || null); continue; }
+    if (!cur) startTurn(((m.time || {}).created) || null);   // 会话以助手开头（导入 / 接续）的兜底
+    if (m.type !== "assistant") continue;
+    const cn = Array.isArray(m.content) ? m.content : [];
+    for (const p of cn) {
+      if (p && p.type === "tool") cur.items.push({ kind: "tool", name: p.name || "tool", state: p.state || {} });
+    }
+    if (cn.length) cur.afterId = m.id;
+    const t = m.time || {};
+    if (t.completed) cur.end = t.completed;
+  }
+  // 正在生成、还没落库的那一轮 → 也来一张（贴 live 槽位末尾）
+  const liveIds = pendingLiveIds();
+  if (liveIds.length) {
+    const g = { start: null, end: null, items: [], afterId: null, live: true };
+    for (const id of liveIds) {
+      const e = state.live[id];
+      if (!e) continue;
+      for (const t of (e.tools || [])) {
+        g.items.push({ kind: "tool", name: t.name || "tool", state: { status: t.status, input: t.input } });
+      }
+    }
+    if (state.pending.length) g.start = state.pending[state.pending.length - 1].time || null;
+    out.push(g);
+  }
+  out.forEach((g, gi) => g.items.forEach((it, i) => { it._i = gi * 1000 + i; }));
+  return out;
+}
+
+/** ★主界面「本轮进展」—— **就一行**（用户明确要"大概的进展，不要太详细"）。
+ *  干活时：「● 正在执行 · 运行命令 npm test … · 第 3 步」；干完：「本轮 6 步 · 12s · 改了 app.js」。
+ *  ⚠ **绝不列步骤** —— 一轮实测能有 **69 步**，一列就把消息区刷满；
+ *    想看每一步的命令原文 / stdout / 真 diff，去「轨迹」页（那边是完整版）。 */
+function turnLineHtml(g, idx) {
+  if (!g || !g.items.length) return "";
+  const n = g.items.length;
+  const lastIt = g.items[n - 1];
+  const st = (lastIt.state && typeof lastIt.state === "object") ? lastIt.state : {};
+  const input = (st.input && typeof st.input === "object") ? st.input : {};
+  const md = (st.metadata && typeof st.metadata === "object") ? st.metadata : {};
+  const [verb, zhName] = toolMeta(lastIt.name, st.kind);
+  // 一句话说清"正在"在哪件事上（命令首行 / 文件名 / 搜索词 / 网址）
+  let what = "";
+  if (verb === "exec") what = oneLine(input.command || input.cmd || input.script || "", 70);
+  else if (verb === "edit" || verb === "write" || verb === "read") {
+    const fl = Array.isArray(md.files) ? md.files : null;
+    what = shortPath((fl && fl.length ? (fl[0] || {}).file : "") || input.path || input.filePath || input.file || "");
+  } else if (verb === "search") what = input.pattern || input.query || "";
+  else if (verb === "fetch") what = oneLine(String(input.url || "").replace(/^https?:\/\//, ""), 48);
+
+  if (g.live) {
+    return `<div class="turn-line live" data-tc="${idx}"><i class="tl-dot"></i>正在${esc(zhName)}`
+      + (what ? ` <span class="tl-what" title="${esc(what)}">${esc(what)}</span>` : "")
+      + `<span class="tl-n">第 ${n} 步</span></div>`;
+  }
+  const files = [];
+  g.items.forEach((it) => {
+    const m2 = (it.state && it.state.metadata) || {};
+    (Array.isArray(m2.files) ? m2.files : []).forEach((f) => {
+      const nm = shortPath((f && f.file) || "");
+      if (nm && files.indexOf(nm) < 0) files.push(nm);
+    });
+  });
+  const bits = [`本轮 ${n} 步`];
+  const dur = (g.end && g.start) ? (g.end - g.start) / 1000 : 0;
+  if (dur > 0.5) bits.push(fmtDur(dur));
+  if (files.length) {
+    bits.push("改了 " + files.slice(0, 3).join("、") + (files.length > 3 ? " 等 " + files.length + " 个" : ""));
+  }
+  return `<div class="turn-line" data-tc="${idx}">${esc(bits.join(" · "))}</div>`;
 }
 
 function renderTrace() {
@@ -932,15 +1608,54 @@ function renderTrace() {
   if (!state.current) { box.innerHTML = `<div class="trace-empty">还没有会话。</div>`; return; }
   const all = traceItems();
   if (!all.length) {
-    box.innerHTML = `<div class="trace-empty">这个会话还没有思考过程 / 工具调用。<br>
-      助手的思考与工具明细都会出现在这里；主界面只留「思考用时 + 正文」。</div>`;
+    box.innerHTML = `<div class="trace-empty">这个会话还没有思考过程 / 工具调用 / 系统通知。<br>
+      助手的思考、工具明细、以及"指令变更 / 日期 / 环境"这类系统通知都在这里；主界面只留「思考用时 + 正文」。</div>`;
     return;
   }
   const MAX = 250;                                  // 长会话保护：只画最近 N 条
   const items = all.length > MAX ? all.slice(-MAX) : all;
   const head = all.length > MAX
     ? `<div class="trace-empty">（只显示最近 ${MAX} 条，共 ${all.length} 条）</div>` : "";
+  TRACE_KEYS = items.map((it) => "k" + it._i);
   box.innerHTML = head + items.map(traceItemHtml).join("");
+  syncTraceAllBtn();
+}
+
+/** 「全部展开 / 全部收起」按钮的文案跟着实际状态走 */
+function syncTraceAllBtn() {
+  const btn = $("trace-all");
+  if (!btn) return;
+  const folds = document.querySelectorAll("#trace-body details.tr-fold");
+  const opened = document.querySelectorAll("#trace-body details.tr-fold[open]");
+  btn.textContent = (folds.length && folds.length === opened.length) ? "全部收起" : "全部展开";
+}
+
+/** 一键展开 / 收起全部条目 */
+function traceToggleAll() {
+  const box = $("trace-body");
+  if (!box) return;
+  const folds = [].slice.call(box.querySelectorAll("details.tr-fold"));
+  if (!folds.length) return;
+  const everyOpen = folds.every((d) => d.open);
+  for (const d of folds) {
+    d.open = !everyOpen;
+    const k = d.dataset.k;
+    if (k) { if (d.open) TRACE_OPEN.add(k); else TRACE_OPEN.delete(k); }
+  }
+  syncTraceAllBtn();
+}
+
+/** 记住用户手动展开 / 收起过哪几条（`details` 的 toggle 不冒泡 → 捕获监听） */
+function initTraceFold() {
+  const box = $("trace-body");
+  if (!box) return;
+  box.addEventListener("toggle", (e) => {
+    const d = e.target;
+    if (!d || !d.classList || !d.classList.contains("tr-fold")) return;
+    const k = d.dataset.k;
+    if (k) { if (d.open) TRACE_OPEN.add(k); else TRACE_OPEN.delete(k); }
+    syncTraceAllBtn();
+  }, true);
 }
 
 function traceOpen() {
@@ -982,25 +1697,74 @@ function syncDrawerOverlap() {
 function initTrace() {
   const b = $("btn-trace"); if (b) b.addEventListener("click", toggleTrace);
   const x = $("trace-close"); if (x) x.addEventListener("click", traceClose);
+  const all = $("trace-all"); if (all) all.addEventListener("click", traceToggleAll);
+  initTraceFold();
+  initTraceResize();
   window.addEventListener("keydown", (e) => { if (e.key === "Escape" && TRACE.open) traceClose(); });
+}
+
+/** 轨迹面板的**右边缘**可拖宽（它是从左边界往右推的，所以拖的是右边）——
+ *  轨迹里有真 diff 和真输出，560px 不够看；宽度记 `cocraft.traceWidth`。 */
+function initTraceResize() {
+  const grip = $("trace-resize"), box = $("trace");
+  if (!grip || !box) return;
+  try {
+    const w = localStorage.getItem("cocraft.traceWidth");
+    if (w) document.documentElement.style.setProperty("--trace-w", w);
+  } catch { /* 隐私模式忽略 */ }
+  let dragging = false;
+  grip.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    box.classList.add("resizing");
+    try { grip.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  });
+  grip.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const z = uiZoom();
+    const left = box.getBoundingClientRect().left / z;                  // 左边界（= 侧栏宽）不动
+    const max = Math.max(340, (window.innerWidth / z) - left - 220);    // 右边给主界面留 220px
+    const w = Math.max(340, Math.min(max, (e.clientX / z) - left));
+    document.documentElement.style.setProperty("--trace-w", w + "px");
+    syncDrawerOverlap();
+  });
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    box.classList.remove("resizing");
+    try { localStorage.setItem("cocraft.traceWidth", document.documentElement.style.getPropertyValue("--trace-w")); } catch { /* ignore */ }
+  };
+  grip.addEventListener("pointerup", stop);
+  grip.addEventListener("pointercancel", stop);
 }
 
 function renderMessages() {
   const pending = pendingLiveIds();
-  const empty = !state.messages.length && !pending.length;
 
+  TURNMAP = buildTurnMap();        // ★「思考 Ns」按整轮算时长（必须在拼 HTML 之前算好）
   const sSig = signatureOf(state.messages);
   if (sSig !== staticSig) {
     staticSig = sSig;
-    staticHtml = state.messages.map(renderMessage).filter(Boolean).join("");
+    // ★每一轮的「进展行」贴在该轮**最后一条消息之后**（一行，不列步骤）
+    const cards = turnCards();
+    const byAfter = new Map();
+    cards.forEach((g, i) => { if (!g.live && g.afterId) byAfter.set(g.afterId, [g, i]); });
+    staticHtml = state.messages.map((m) => {
+      const h = renderMessage(m) || "";
+      const c = byAfter.get(m.id);
+      return c ? h + turnLineHtml(c[0], c[1]) : h;
+    }).join("");
     heroShown = false;
     swapHtml($("msg-static"), staticHtml);
   }
+  // ★"空会话"= 真的**没有任何可显示的东西** —— 消息可能全是系统注入通知 / idle（它们不渲染），
+  //   那种情况该像新会话一样显示首屏，而不是留一片空白。
+  const empty = !staticHtml && !pending.length;
   if (empty && !heroShown) { swapHtml($("msg-static"), heroHtml()); heroShown = true; }
   else if (!empty && heroShown) { swapHtml($("msg-static"), staticHtml); heroShown = false; }
 
   paintLiveSlot();
   if (TRACE.open) renderTrace();
+  ctxSync();                       // ★上下文「还剩多少」跟着当前会话/最新回答走
 }
 
 /** 只重建「生成中」那一小块：我发的消息（乐观回显）→ 思考 → 回答，一路向下生长 */
@@ -1027,7 +1791,11 @@ function paintLiveSlot() {
     const liveHtml = ids
       .map((id) => renderMessage(liveToMessage(id, state.live[id], state.reveal[id])))
       .join("");
-    slot.innerHTML = pendingHtml + liveHtml;
+    // ★「本轮进展」一行 —— 正在干活时它长在消息流末尾（干完就落进静态区，留一行小结）
+    const cards = turnCards();
+    const liveG = cards.length ? cards[cards.length - 1] : null;
+    const liveLine = (liveG && liveG.live) ? turnLineHtml(liveG, cards.length - 1) : "";
+    slot.innerHTML = pendingHtml + liveHtml + liveLine;
   }
 
   // 内容按打字机进度就位（只改内容、不动结构，光标闪烁不会被打断）
@@ -1095,12 +1863,14 @@ async function openSession(id) {
   state.pending = [];
   state.attachments = [];
   state.follow = true;
+  resetMsgPaging();               // 换会话：分页状态一并复位（否则会把上一个会话的游标带过来）
   renderAttachRow();
   $("session-title").textContent = state.current.title || "(无标题)";
   // 会话名下面不再显示 session id / 本地路径（详情请用侧栏会话项的 ▸ 展开）
   $("session-meta").textContent = "";
   updateModelBtn();                                  // 顶栏模型按钮跟着当前会话走
   renderModeButton();                                // 顶栏模式按钮跟着当前会话走
+  ctxSync();                                         // 上下文条先按会话自带的数据显示（ACP 有 context）
   loadModes();                                       // ACP 的模式清单挂在会话上，所以拿到会话后再拉一次
   $("input").disabled = false;
   $("btn-send").disabled = false;
@@ -1111,16 +1881,153 @@ async function openSession(id) {
   pollAsks();
 }
 
+/* ---------------- 消息分页：往上翻页读更早的历史 ----------------
+ *  `/message` 一次只给一页（默认取最新那一页）。往上滚到顶时再取"更早一页"，
+ *  拼到最前面，并把视口**锚在原处**（否则内容一多就会跳到别的地方）。 */
+
+const MSG_PAGE = 80;            // 每页条数（首屏与翻页共用）
+const MSG_TOP_TRIGGER = 120;    // 距顶多少像素内就自动取下一页
+const MSG_MAX = 2000;           // 上翻的总上限（超长会话保护，别把内存撑爆）
+
+/** 从响应里的 cursor 取出「更早一页」的游标。
+ *  ⚠ 两个引擎形状不同：
+ *    · OpenCode → `{previous, next}`（desc 排序下 `next` 才是更旧那一边）；
+ *    · ACP      → 直接一个字符串（上一页最旧那条消息 id）。
+ *  ⚠ OpenCode 的 `cursor.next` **到底了也不为空**（只剩 3 条也给），所以它只能当"翻页令牌"，
+ *    绝不能拿它判"还有没有更早"——那条判据见 refreshMessages / loadHistory 里的 `MSG_PAGE`。 */
+function msgCursorOf(cursor) {
+  if (!cursor) return null;
+  if (typeof cursor === "string") return cursor || null;
+  if (typeof cursor === "object") return cursor.next || cursor.previous || null;
+  return null;
+}
+
+/** 升序（旧 → 新）；接口返回是「新 → 旧」，不重排界面就会倒过来。 */
+function sortByCreated(list) {
+  return (list || []).slice().sort((a, b) =>
+    ((((a || {}).time || {}).created) || 0) - ((((b || {}).time || {}).created) || 0));
+}
+
+/** 刷新时把"已经翻出来的更早几页"接回来（刷新只重取最新一页，别把历史丢掉）。
+ *  判据：不在最新一页里，且时间比最新一页最旧那条还早。 */
+function olderKept(page) {
+  if (!state.msgOlder) return [];
+  const ids = new Set(page.map((m) => m.id));
+  const oldest = ((page[0] || {}).time || {}).created || 0;
+  const out = [];
+  for (const m of state.messages) {
+    if (ids.has(m.id)) continue;
+    if (!oldest || ((((m.time || {}).created) || 0) < oldest)) out.push(m);
+  }
+  return out;
+}
+
+/** 顶部那条提示 / 按钮：正在加载 / 还能往上翻 / 没有更早了 */
+function renderHistoryHint() {
+  const el = $("msg-more");
+  if (!el) return;
+  if (!state.current || !state.messages.length) { el.hidden = true; el.innerHTML = ""; return; }
+  if (state.msgLoading) {
+    el.hidden = false;
+    el.innerHTML = `<span class="mm-hint">正在加载更早的消息…</span>`;
+    return;
+  }
+  if (state.msgDone) {
+    if (!state.msgOlder) { el.hidden = true; el.innerHTML = ""; return; }   // 本来就没往上翻过，不打扰
+    el.hidden = false;
+    el.innerHTML = `<span class="mm-hint">— 没有更早的消息了 —</span>`;
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = `<button type="button" class="mm-btn">↑ 加载更早的消息</button>`;
+}
+
+let histLastTop = 0;            // 上一次 scrollTop（只认"真的往上滚"，免得首屏渲染时误触发）
+
+/** 复位分页状态（换会话 / 换引擎 / 换 agent 时都要调，否则会把旧游标带过去） */
+function resetMsgPaging() {
+  state.msgCursor = null;
+  state.msgDone = true;
+  state.msgLoading = false;
+  state.msgOlder = false;
+  histLastTop = 0;
+  renderHistoryHint();
+}
+
+/** 往上翻一页：接更早的消息，并保持当前视口不动。 */
+async function loadHistory() {
+  if (!state.current || state.msgLoading || state.msgDone || !state.msgCursor) return;
+  if (state.messages.length >= MSG_MAX) { state.msgDone = true; renderHistoryHint(); return; }
+  const sid = state.current.id;
+  state.msgLoading = true;
+  state.follow = false;          // 用户在往上读历史 → 明确停止跟随（别被 paintLiveSlot 拽回底部）
+  renderHistoryHint();
+  const box = $("messages");
+  const beforeTop = box ? box.scrollTop : 0;
+  const beforeH = box ? box.scrollHeight : 0;
+  try {
+    const body = await api(`/api/session/${encodeURIComponent(sid)}/message`
+      + `?limit=${MSG_PAGE}&cursor=${encodeURIComponent(state.msgCursor)}`);
+    if (!state.current || state.current.id !== sid) return;      // 期间切了会话 → 丢弃这一页
+    const older = sortByCreated(unwrap(body));
+    const known = new Set(state.messages.map((m) => m.id));
+    const fresh = older.filter((m) => !known.has(m.id));
+    if (!fresh.length) {
+      state.msgDone = true;                                     // 到底了（服务端回空 / 整页都是已有的）
+    } else {
+      state.messages = fresh.concat(state.messages);
+      state.msgOlder = true;
+      const next = msgCursorOf(body && body.cursor);
+      // 页没填满（或游标没往前走）→ 说明没有更早的了
+      if (next && next !== state.msgCursor && fresh.length >= MSG_PAGE) state.msgCursor = next;
+      else state.msgDone = true;
+      staticSig = null;                                         // 强制重建（renderMessages 里按签名比对）
+      renderMessages();
+      // ★锚定：把"新增的高度"补进 scrollTop，视口停在原来那条消息上
+      const fix = () => {
+        const b = $("messages");
+        if (!b) return;
+        b.scrollTop = beforeTop + (b.scrollHeight - beforeH);
+      };
+      fix();
+      requestAnimationFrame(fix);                               // 字体/图片就位后高度还会变，再补一次
+    }
+  } catch (err) {
+    setBanner("加载更早的消息失败：" + (err && err.message ? err.message : err));
+  } finally {
+    state.msgLoading = false;
+    renderHistoryHint();
+  }
+}
+
+/** 滚到接近顶部时自动翻页（只在"真的往上滚"时触发，见下面的 scroll 监听） */
+function maybeLoadHistory() {
+  const b = $("messages");
+  if (!b || !state.current) return;
+  if (state.msgDone || state.msgLoading || !state.msgCursor) return;
+  if (b.scrollTop > MSG_TOP_TRIGGER) return;
+  if (b.scrollHeight - b.clientHeight < 200) return;            // 内容还没超出一屏，翻了也没意义
+  loadHistory();
+}
+
 async function refreshMessages() {
   if (!state.current) return;
   if (state.refreshing) { state.pendingRefresh = true; return; }
   state.refreshing = true;
   try {
-    const body = await api(`/api/session/${encodeURIComponent(state.current.id)}/message?limit=80`);
+    const body = await api(`/api/session/${encodeURIComponent(state.current.id)}/message?limit=${MSG_PAGE}`);
     // ⚠ 接口返回是「新 → 旧」（最新在索引 0），必须按 time.created 升序重排；
     //   少了这一步，界面就会变成「最新在顶、最旧在底」。
-    state.messages = (unwrap(body) || []).slice().sort((a, b) =>
-      (((a.time || {}).created) || 0) - (((b.time || {}).created) || 0));
+    const page = sortByCreated(unwrap(body));
+    // 已经往上翻过：把更早那几页接回来（只重取最新一页，别把翻出来的历史丢掉）
+    state.messages = olderKept(page).concat(page);
+    if (!state.msgOlder) {
+      // ★"有没有更早的"：不能看 cursor（OpenCode 到底了也不为空），要看**这一页有没有填满**
+      //   （ACP 的 cursor 在到顶时会是 null，这里一并覆盖）。
+      state.msgCursor = msgCursorOf(body && body.cursor);
+      state.msgDone = !state.msgCursor || page.length < MSG_PAGE;
+    }
+    renderHistoryHint();
     // 对账：权威数据里已有的消息，就丢掉对应的生成缓冲
     const known = new Set(state.messages.map((m) => m.id));
     for (const id of Object.keys(state.live)) if (known.has(id)) delete state.live[id];
@@ -1230,6 +2137,8 @@ async function send() {
 
   try {
     await ensureSessionModel(state.current.id);       // ★ 没有模型先补上，别让这一轮空转
+    // ★可逆执行：**动手前**给工作目录落一次快照（失败不影响发消息；热扫 ~10ms）
+    await snapTurnStart(state.current.id, currentDir());
     await api(`/api/session/${encodeURIComponent(state.current.id)}/prompt`, {
       method: "POST",
       body: JSON.stringify(files.length ? { text, files } : { text }),
@@ -1564,6 +2473,16 @@ function handleEvent(p) {
   // 需要你选择 / 权限请求：SSE 一到就立刻去看，不用等轮询
   if (t.startsWith("form.") || t.startsWith("permission.")) { pollAsks(); return; }
 
+  // ★上下文窗口占用（ACP 的 `usage_update`）：agent 每轮上报 used/size → 更新会话 + 小条
+  //   ⚠ 这是**上下文**，不是账单 token（账单累计在 session.tokens 里）。
+  if (t === "session.usage.update") {
+    if (mine && state.current) {
+      state.current.context = { used: Number(d.used) || 0, size: Number(d.size) || 0 };
+      ctxSync();
+    }
+    return;
+  }
+
   // ① 文本 / 思考增量 —— 直接追加，绝不重取
   if (t === "session.text.delta" || t === "session.reasoning.delta") {
     if (!mine || !d.assistantMessageID) return;
@@ -1585,6 +2504,20 @@ function handleEvent(p) {
       scheduleRefresh();
       if (d && d.modelUnavailable) refreshCurrentModel();   // 后端可能已自动换模型 → 同步按钮
     }
+    return;
+  }
+
+  // ①c ★上下文压缩（OpenCode 的 `session.compaction.*`）：以前只有兜底的"刷会话列表"，
+  //     消息区看不到任何变化。`delta` 是摘要流（很多条）→ 不重取；started/ended/failed 才值得对账。
+  if (t.startsWith("session.compaction.")) {
+    if (!mine) return;
+    if (t === "session.compaction.delta") return;
+    if (t === "session.compaction.failed") {
+      setBanner("上下文压缩失败：" + (textOfError(d.error) || "未知原因"), { ms: 12000 });
+    } else if (t === "session.compaction.started") {
+      setBanner("正在压缩上下文…", { ms: 60000 });
+    }
+    scheduleRefresh();
     return;
   }
 
@@ -1687,7 +2620,12 @@ function syncUiVersion(served) {
     v.classList.add("stale");
     v.title = "界面已更新到 " + served + "，点顶部横幅或按 Ctrl+Shift+R 刷新";
   }
-  setBanner(`界面已更新到 ${served}：点这里刷新（或 Ctrl+Shift+R）`, { clickable: true });
+  // ★ 走通知聚合器（优先级 50）：权限申请 / @我 在时**不会**被这条顶掉
+  NOTIFY.set("ui-update", {
+    priority: 50,
+    text: `界面已更新到 ${served}：点这里刷新（或 Ctrl+Shift+R）`,
+    onClick: safeReload,
+  });
   return false;
 }
 
@@ -1705,11 +2643,39 @@ function safeReload() {
 }
 
 let bannerTimer = null;
+let bannerBase = { text: "", opts: {} };   // "普通"广播条（底）：被 NOTIFY 里更高优先级的项压住
+let bannerAction = null;                   // 当前广播条的点击动作（点横幅时执行）
 
-/** 顶部广播条。
- *  `opts.clickable` = 可点（更新提示用，永远常驻）；`opts.sticky` = 常驻不自动消失；
- *  都不加 → **几秒后自己收起**（`opts.ms` 可调）。以前非点击的广播条会一直挂着，用户反馈过。 */
-function setBanner(text, opts) {
+/** ★ 通知聚合器（`ui 0.1.67`）。
+ *  ⚠ 横幅**同时只能显示一条** → "谁该显示"必须由优先级决定，否则会互相顶掉
+ *  （权限申请 / @我 / 更新提示 / 连接状态 都会想说话）。优先级：权限 100 > @我 80 > 更新 50 > 普通 0。 */
+const NOTIFY = {
+  items: {},
+  seq: 0,
+  /** 放一条（同 key 覆盖）。`text` 为空视为不显示。 */
+  set(key, item) {
+    if (!key) return;
+    this.items[key] = Object.assign({ key, priority: 0, sticky: true, seq: ++this.seq }, item || {});
+    renderBanner();
+  },
+  clear(key) {
+    if (this.items[key]) { delete this.items[key]; renderBanner(); }
+  },
+  /** 当前该显示的那一条（优先级最高；同优先级取更晚来的）。 */
+  top() {
+    let best = null;
+    for (const k in this.items) {
+      const it = this.items[k];
+      if (!it || !it.text) continue;
+      if (!best || it.priority > best.priority
+          || (it.priority === best.priority && it.seq > best.seq)) best = it;
+    }
+    return best;
+  },
+};
+
+/** 底层：把一段文字真正画进 `#banner`。 */
+function paintBanner(text, opts) {
   const el = $("banner");
   if (!el) return;
   const o = opts || {};
@@ -1717,27 +2683,46 @@ function setBanner(text, opts) {
   el.classList.toggle("clickable", clickable);
   clearTimeout(bannerTimer);
   bannerTimer = null;
-  if (!text) { el.hidden = true; el.textContent = ""; return; }
+  if (!text) { el.hidden = true; el.textContent = ""; bannerAction = null; return; }
   if (el.textContent !== text) el.textContent = text;
   el.hidden = false;
+  bannerAction = clickable ? (o.onClick || null) : null;
   if (!o.sticky && !clickable) {
     bannerTimer = setTimeout(restoreBanner, Math.max(1200, o.ms || 5000));
   }
 }
 
-/** 广播条自动收起后：有更新提示就把它挂回来，否则清空。 */
+/** 决定"现在显示哪一条"：NOTIFY 的最高优先级项优先，否则普通广播条。 */
+function renderBanner() {
+  const top = NOTIFY.top();
+  if (top) { paintBanner(top.text, { clickable: true, sticky: true, onClick: top.onClick }); return; }
+  paintBanner(bannerBase.text, bannerBase.opts);
+}
+
+/** 顶部广播条（**调用方接口**，语义与以前一致）。
+ *  `opts.clickable` = 可点（**配 `opts.onClick` 才有动作**）；`opts.sticky` = 常驻不自动消失；
+ *  都不加 → **几秒后自己收起**（`opts.ms` 可调）。以前非点击的广播条会一直挂着，用户反馈过。 */
+function setBanner(text, opts) {
+  bannerBase = { text: text || "", opts: opts || {} };
+  renderBanner();
+}
+
+/** 广播条自动收起后：NOTIFY 里还有东西就让它显示，否则清空。 */
 function restoreBanner() {
-  if (updateReady) {
-    setBanner(`界面已更新到 ${updateReady}：点这里刷新（或 Ctrl+Shift+R）`, { clickable: true });
-  } else {
-    setBanner("");
-  }
+  bannerBase = { text: "", opts: {} };
+  renderBanner();
 }
 
 async function checkHealth() {
   try {
     const body = await api("/healthz");
     $("upstream").textContent = `OpenCode ${body.version || ""}`;
+    // ★ 后端进程身份放 tooltip：改完后端后**悬停这里**就能确认"新代码加载了没有"
+    //   （`ui` 是现读 index.html 的，看不出后端新不新 —— 2026-10-14 踩过）
+    if (body.pid) {
+      $("upstream").title = `后台服务 pid ${body.pid}｜启动于 ${body.startedAt || body.started || "?"}`
+        + `（已运行 ${Math.round((body.uptime || 0) / 60)} 分钟）`;
+    }
     syncUiVersion(body.ui);            // 服务端的前端版本变了就自动刷新
     return true;
   } catch {
@@ -1752,7 +2737,7 @@ async function ensureConnected() {
     if (connected) return;
     connected = true;
     setConn("online", "已连接");
-    setBanner(updateReady ? `界面已更新到 ${updateReady}：按 Ctrl+Shift+R 刷新本页` : "", { clickable: true });
+    setBanner("");            // 清掉"正在连接…"（更新提示由 NOTIFY 常驻，不受影响）
     await loadSessions();
     connectEvents();
     if (state.sessions.length) {
@@ -2242,9 +3227,11 @@ function initToolsMenu() {
   if (!btn || !menu) return;
   const refresh = () => {
     $("tm-dir").textContent = (CODE.open && CODE.root) ? CODE.root : (currentDir() || "（当前会话没有工作目录）");
-    const t = $("tm-term"), c = $("tm-code");
+    const t = $("tm-term"), c = $("tm-code"), q = $("tm-quar"), u = $("tm-undo");
     if (t) t.classList.toggle("on", !!TERM.open);
     if (c) c.classList.toggle("on", !!CODE.open);
+    if (q) q.classList.toggle("on", !!($("quar") && !$("quar").hidden));
+    if (u) u.classList.toggle("on", !!($("undo") && !$("undo").hidden));
   };
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -2256,6 +3243,8 @@ function initToolsMenu() {
     e.stopPropagation();
     if (b.dataset.tool === "term") termToggle();
     else if (b.dataset.tool === "code") codeToggle();
+    else if (b.dataset.tool === "quar") { menu.hidden = true; quarOpen(); return; }
+    else if (b.dataset.tool === "undo") { menu.hidden = true; undoOpen(); return; }
     refresh();
   });
   document.addEventListener("click", (e) => {
@@ -2381,7 +3370,7 @@ function applyBrandName(name) {
   const v = String(name ?? "").trim().slice(0, 24);
   const use = v || BRAND_DEFAULT;
   $("brand-name").textContent = use;
-  document.title = `${use} · OpenCode`;
+  syncTitle(`${use} · OpenCode`);          // ★B3：标题栏计数（未读 / 待批准）会加在它前面
   try {
     if (v) localStorage.setItem(BRAND_KEY, v);
     else localStorage.removeItem(BRAND_KEY);
@@ -2553,6 +3542,7 @@ const CC_OPEN_KEY = "cocraft.open";
 const CC_TOKEN_KEY = "cocraft.token";
 const CC_W_KEY = "cocraft.w";
 const CC_USERS_KEY = "cocraft.users";   // {id: {id,username,avatar,email,created_at}}
+const CC_UNREAD_KEY = "cocraft.cc.unread";  // {chatID: n} 未读计数（自己发的不算；打开即清零）
 const CC_W_DEFAULT = 520;
 
 const CC = {
@@ -2563,6 +3553,7 @@ const CC = {
   users: {},              // 用户信息缓存（见 ccCacheUser / ccUserName）
   ai: [],                 // AI 成员（/ccagent/list；后端桥）
   permDone: {},           // 已处理过的权限申请（群消息 id → true；点了按钮就不再显示弹窗）
+  unread: {},             // 未读：{chatID: n}（自己发的不算；打开会话 / 抽屉即清零）
   chats: [],
   chatID: "",
   msgs: [],
@@ -2574,11 +3565,309 @@ const CC = {
   wsPing: null,
   wsRetry: 0,
   poll: null,
+  activity: {},           // ★C1：活动卡 {[chatID]: [{id,seq,rev,agent,tool,summary,status,ts,detail}]}
+  actRev: {},             // ★C1：{[chatID]: 已拉到的最大 rev（`since` 比的就是它）}
+  actTimer: null,         // ★C1：轮询心跳（抽屉关着时慢跑，只为顶栏「工作中」角标）
+  actAt: 0,
+  roles: {},              // ★主动编排：角色表 {id: {label}}（由 /ccagent/list 给）
+  dis: null,              // ★主动编排：最近一次派活 {chat, task, ts, members:[{id,name,role,roleLabel,status}]}
+  disSel: new Set(),      // 派活台里已勾选的成员 id
+  disOpen: false,
+  teamPresets: [],        // ★一键建组：内置 + 自定义预设（/ccagent/list 的 teamPresets）
+  teamDraft: null,        // ★当前面板里那几行（改过角色/名字就存这里；换预设即清空）
+  pickId: null,           // ★刚点过「推荐 X」跳到的那一列（成员 id；重画后仍高亮）
 };
 
 const ccEl = (id) => document.getElementById(id);
 const ccLoad = (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } };
 const ccStore = (k, v) => { try { localStorage.setItem(k, v); } catch { /* 隐私模式 */ } };
+
+/* ---- 未读（A1/A2）：自己发的不算；正在看（抽屉开着 + 当前会话）不算；打开会话 / 抽屉即清零 ---- */
+function ccLoadUnread() {
+  try { CC.unread = JSON.parse(localStorage.getItem(CC_UNREAD_KEY) || "{}") || {}; }
+  catch { CC.unread = {}; }
+}
+function ccSaveUnread() {
+  try { localStorage.setItem(CC_UNREAD_KEY, JSON.stringify(CC.unread || {})); } catch { /* ignore */ }
+}
+function ccUnreadOf(id) { return Number((CC.unread || {})[String(id)] || 0); }
+function ccUnreadTotal() {
+  return Object.keys(CC.unread || {}).reduce((a, k) => a + (Number(CC.unread[k]) || 0), 0);
+}
+/** 收到一条别人 / AI 的消息 → 记一条未读（带守卫）。 */
+function ccBumpUnread(id, msg) {
+  if (id == null) return;
+  const key = String(id);
+  if (CC.me && msg && String(msg.sender_id) === String(CC.me.id)) return;   // 自己发的
+  if (key === String(CC.chatID) && cocraftIsOpen()) return;                 // 正在看这一条
+  CC.unread[key] = (Number(CC.unread[key]) || 0) + 1;
+  ccSaveUnread();
+  ccSyncUnreadUI();
+}
+/** 打开一个会话 / 抽屉 → 清掉它的未读。 */
+function ccUnreadClear(id) {
+  const key = String(id == null ? "" : id);
+  if (!key || !(CC.unread || {})[key]) return;
+  delete CC.unread[key];
+  ccSaveUnread();
+  ccSyncUnreadUI();
+}
+/** 未读变化 → 重画会话列表 + 顶栏按钮徽章。 */
+function ccSyncUnreadUI() {
+  try { ccRenderChats(); } catch { /* ignore */ }
+  if (typeof syncHubBtn === "function") syncHubBtn();
+  try { syncTitle(); } catch { /* ignore */ }
+}
+
+/* ---- ★B3：权限申请「强提醒」----
+   ① **标题栏计数**：`(N) 标题`，N = 群聊未读 + 待批准权限（各 1）。
+   ② **系统级提醒**：面板**不在前台**（切走 / 最小化）时，把提醒交给独立托盘进程 ——
+      `POST /panel/notify` → 面板写 `runtime/state/_notify.json` → `tray_host.py` 轮询它
+      弹系统气泡（`icon.notify`）并让窗口闪任务栏（`panel_window.py` 的 `flash` 命令）。
+      面板就在眼前时不弹系统通知（页面里的横幅 / 小弹窗已经够用），顺便天然节流。
+      ⚠ 浏览器窗口模式（Edge --app）没有托盘进程 → 只写文件不弹气泡，标题栏计数照常。 */
+var SYNC_TITLE_BASE = "";
+const TITLE_FALLBACK = "cocraft · 絵梨衣";
+const CC_PERM_ALERT_KEY = "cocraft.cc.permAlert";     // 已强提醒过的申请 id
+
+/** 需要用户注意的数量：群聊未读 + 待批准权限（各算 1）。 */
+function attentionCount() {
+  let n = 0;
+  try { n += ccUnreadTotal(); } catch { /* ignore */ }
+  try { if (ccPermPending()) n += 1; } catch { /* ignore */ }
+  return n;
+}
+
+/** 写 `document.title`：N>0 时加 `(N) ` 前缀；传 base 时顺手更新标题本体。 */
+function syncTitle(base) {
+  if (base) SYNC_TITLE_BASE = String(base);
+  const b = SYNC_TITLE_BASE || TITLE_FALLBACK;
+  const n = attentionCount();
+  try { document.title = n > 0 ? "(" + n + ") " + b : b; } catch { /* ignore */ }
+}
+
+function ccPermAlertSeen(id) {
+  try { return String(localStorage.getItem(CC_PERM_ALERT_KEY) || "") === String(id); }
+  catch { return false; }
+}
+function ccPermAlertMark(id) {
+  try { localStorage.setItem(CC_PERM_ALERT_KEY, String(id)); } catch { /* ignore */ }
+}
+
+/** 面板不在前台时，为一条**新**的权限申请请求系统级强提醒（同一申请只提醒一次）。 */
+function ccPermStrongAlert(m, info, label) {
+  if (!m || m.id == null) return;
+  if (ccPermAlertSeen(m.id)) return;
+  let fg = true;
+  try { fg = !document.hidden && document.hasFocus(); } catch { fg = true; }
+  if (fg) return;                       // 面板就在眼前 → 页面里的提醒已经够
+  ccPermAlertMark(m.id);
+  const what = info.destructive ? "请求执行破坏性操作" : "请求权限";
+  try {
+    fetch("/panel/notify", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: "cocraft · 群聊权限申请",
+        body: `${label} ${what}：${info.title}${info.kind ? " · " + info.kind : ""}（点托盘图标打开面板）`,
+        flash: true,
+      }),
+    }).catch(() => {});
+  } catch { /* ignore */ }
+}
+
+/* ---- ★C1：进行中活动卡（让「AI 真的在干活」看得见；见 `docs/群聊存在感-方案.md` §12）----
+   数据源：`GET /ccagent/activity?chat=<id>&since=<seq>` —— 桥的内存环形缓冲（§12.1）。
+   ⚠ 走**面板轮询**，**不让桥往群里发消息** —— 既不污染聊天历史，也不碰"只认拥有者批准"的审计语义。
+   ⚠ 抽屉关着时**慢轮询**（只更新顶栏「工作中」角标、不渲染卡片）：§12.2 #7 的原话是"关着不轮询"，
+     但 #10 又要求"关着时角标显示工作中" —— 折中就是慢跑一点点（本机端点，几乎不要钱）。 */
+const CC_ACT_BUSY_MS = 2000;      // 有成员在干活 → 2s
+const CC_ACT_IDLE_MS = 6000;      // 空闲 / 抽屉关着 → 6s
+const CC_ACT_KEEP = 200;          // 与服务端 deque(maxlen=200) 对齐
+const CC_ACT_SHOW = 8;            // 卡片最多显示最近几条
+const CC_ACT_BUSY_ST = { running: 1, asking: 1 };
+const CC_ACT_ZH = {
+  running: "进行中", asking: "等待批准", completed: "完成",
+  error: "失败", allowed: "已批准", denied: "已拒绝", timeout: "超时未批",
+};
+
+/** 某个会话的活动列表。 */
+function ccActItems(chatID) { return (CC.activity || {})[String(chatID || "")] || []; }
+
+/** 还有没有"没干完"的活动（决定轮询节奏 / 忙碌标记）。 */
+function ccActBusy(chatID) {
+  return ccActItems(chatID || CC.chatID).some((a) => CC_ACT_BUSY_ST[a.status]);
+}
+
+/** 正在干活的成员名集合（当前会话）→ C2 的「工作中」小圆片。 */
+function ccActBusyAgents(chatID) {
+  const s = new Set();
+  ccActItems(chatID || CC.chatID).forEach((a) => {
+    if (CC_ACT_BUSY_ST[a.status] && a.agent) s.add(String(a.agent));
+  });
+  return s;
+}
+
+/** 把新拉到的活动并进内存。
+ *  ⚠ 按 **id**（稳定的工具调用标识）**替换**同一条，比较的是 **rev**（修改版本）——
+ *  因为桥收尾是**原地改**那条记录（running → completed），只按 seq 去重会永远看不到它变。
+ *  `seq`（创建顺序）只用来排序，保证收尾后那一行不乱跳。 */
+function ccActMerge(chatID, items) {
+  const key = String(chatID);
+  const cur = (CC.activity[key] = CC.activity[key] || []);
+  CC.actRev = CC.actRev || {};
+  const byId = {};
+  cur.forEach((x) => { byId[String(x.id)] = x; });
+  let mx = Number(CC.actRev[key] || 0);
+  (items || []).forEach((it) => {
+    if (!it || it.id == null) return;
+    const rv = Number(it.rev) || 0;
+    if (rv > mx) mx = rv;
+    const id = String(it.id);
+    const old = byId[id];
+    if (!old) { cur.push(it); byId[id] = it; }
+    else if (rv > (Number(old.rev) || 0)) { Object.assign(old, it); }
+  });
+  cur.sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0));
+  if (cur.length > CC_ACT_KEEP) cur.splice(0, cur.length - CC_ACT_KEEP);
+  CC.actRev[key] = mx;
+  return mx;
+}
+
+/** 拉一次活动（抽屉关着时也在跑，为了顶栏角标）。 */
+async function ccActTick() {
+  if (!CC.token || !CC.chatID) return;
+  const chat = String(CC.chatID);
+  const since = Number(((CC.actRev || {})[chat] || 0));
+  try {
+    const r = await ccAgentFetch("/activity?chat=" + encodeURIComponent(chat) + "&since=" + since);
+    if (String(CC.chatID) !== chat) return;         // 中途换了会话 → 这次结果丢掉
+    ccActMerge(chat, (r && r.items) || []);
+  } catch { /* 桥没跑 / 未登录 → 静默（不打扰聊天） */ }
+  ccActRender();
+  ccActBadge();
+  if (typeof ccRenderRoomMeta === "function") ccRenderRoomMeta();   // 顺手刷「工作中」小圆片
+}
+
+/** 定频心跳：按"有没有在干活 / 抽屉开没开"决定这次要不要真去拉。 */
+function ccActBeat() {
+  const open = cocraftIsOpen();
+  const ms = (open && ccActBusy()) ? CC_ACT_BUSY_MS : CC_ACT_IDLE_MS;
+  const now = Date.now();
+  if (now - (CC.actAt || 0) < ms) return;
+  CC.actAt = now;
+  ccActTick();
+}
+function ccActStart() {
+  if (CC.actTimer) return;
+  CC.actTimer = setInterval(ccActBeat, 500);
+  ccActBeat();
+}
+function ccActStop() {
+  if (CC.actTimer) { clearInterval(CC.actTimer); CC.actTimer = null; }
+}
+/** 登录态 / 当前会话变化时同步轮询开关。 */
+function ccActSync() {
+  if (!CC.token || !CC.chatID) { ccActStop(); return; }
+  ccActStart();
+  // ★即使心跳定时器已经在跑，也允许"立刻拉一次"（是否真拉由 `actAt` 节流决定）——
+  //   否则换了会话要干等 2~6s 才刷新（实测：app 启动时自动恢复上次会话，把节流占住了）。
+  ccActBeat();
+}
+
+/** 活动卡 HTML（中文口径与轨迹页一致；`status` 决定图标与颜色）。 */
+function ccActHtml(items) {
+  const row = (a) => {
+    const st = String(a.status || "");
+    const cls = CC_ACT_BUSY_ST[st] ? "running"
+      : ((st === "error" || st === "denied" || st === "timeout") ? "bad" : "done");
+    const ico = st === "asking" ? "🔐"
+      : (st === "running" ? '<i class="cc-act-spin"></i>' : (cls === "bad" ? "✕" : "✓"));
+    return `<div class="cc-act-row ${cls}"><span class="cc-act-ico">${ico}</span>`
+      + `<b class="cc-act-tool">${esc(a.tool || "工具")}</b>`
+      + `<span class="cc-act-sum" title="${esc(a.detail || a.summary || "")}">${esc(a.summary || "")}</span>`
+      + `<span class="cc-act-st">${esc(CC_ACT_ZH[st] || st)}</span></div>`;
+  };
+  const recent = (items || []).slice(-CC_ACT_SHOW);
+  const busyItems = recent.filter((a) => CC_ACT_BUSY_ST[a.status]);
+  const who = [...new Set(busyItems.map((a) => a.agent))].filter(Boolean).join("、");
+  const cap = busyItems.length ? `执行中${who ? " · " + esc(who) : ""}` : "刚刚做过";
+  return `<div class="cc-act-cap">${busyItems.length ? '<i class="cc-act-dot"></i>' : ""}${cap}</div>`
+    + recent.map(row).join("");
+}
+
+/** 把活动卡画到**消息流末尾**。
+ *  ⚠ `ccRenderMsgs` 会重建 `#cc-msgs` 的 innerHTML → 每次都要重新 append（否则卡片被冲掉）。 */
+function ccActRender() {
+  const box = ccEl("cc-msgs");
+  if (!box) return;
+  let el = ccEl("cc-act-card");
+  const items = ccActItems(CC.chatID);
+  if (!items.length) { if (el) el.remove(); return; }
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  if (!el) { el = document.createElement("div"); el.id = "cc-act-card"; el.className = "cc-act"; }
+  el.innerHTML = ccActHtml(items);
+  if (box.lastChild !== el) box.appendChild(el);        // 永远贴最后
+  if (atBottom) ccScrollBottom(box);
+}
+
+/** 顶栏群聊入口的「工作中」角标（抽屉关着时也看得见）。 */
+function ccActBadge() {
+  const b = $("btn-hub");
+  if (!b) return;
+  const busy = ccActItems(CC.chatID).some((a) => CC_ACT_BUSY_ST[a.status]);
+  b.classList.toggle("cc-busy", !!busy);
+  if (busy) b.setAttribute("data-busy", "工作中"); else b.removeAttribute("data-busy");
+}
+
+/* ---- ★A3：@我 → 抽屉关着时给一条**可点**横幅（点了就开抽屉 + 打开那个会话） ----
+   横幅同时只能显示一条 → 走通知聚合器 NOTIFY（权限 100 > @我 80 > 更新 50 > 普通 0）。
+   `mentions` 服务端给的是**名字数组**（见 docs/COCRAFT.md）；另外 `mention` 帧本身就是"点名了我"。 */
+function ccMentionedMe(d, force) {
+  if (!d) return false;
+  if (CC.me && String(d.sender_id) === String(CC.me.id)) return false;     // 自己说的不算
+  if (force) return true;
+  const xs = [];
+  if (Array.isArray(d.mentions)) xs.push.apply(xs, d.mentions);
+  else if (d.mentions != null) xs.push(d.mentions);
+  if (d.mention_id != null) xs.push(d.mention_id);
+  const myId = CC.me && CC.me.id != null ? String(CC.me.id) : "";
+  const myName = (CC.me && (CC.me.username || CC.me.name)) || "";
+  for (const x of xs) {
+    if (x && typeof x === "object") {
+      const oid = x.id != null ? String(x.id) : "";
+      const onm = String(x.username || x.name || "");
+      if ((myId && oid === myId) || (myName && onm === myName)) return true;
+      continue;
+    }
+    const s = String(x == null ? "" : x);
+    if ((myId && s === myId) || (myName && s === myName)) return true;
+  }
+  const c = String(d.content || "");
+  return !!(myName && (c.indexOf("@" + myName) >= 0 || c.indexOf("@" + myId) >= 0));
+}
+function ccChatNameOf(id) {
+  const c = (CC.chats || []).find((x) => String(x.id) === String(id));
+  return (c && ccChatName(c)) || ("会话 #" + id);
+}
+/** 被 @ → 顶栏可点横幅（点 = 开抽屉 + 打开那个会话 + 贴底）。 */
+function ccMentionNotify(d, force) {
+  if (!ccMentionedMe(d, force)) return;
+  // 正在看那个会话（抽屉开着）→ 消息就在眼前，不用再提醒
+  if (cocraftIsOpen() && String(CC.chatID) === String(d.chat_id)) return;
+  const who = ccUserName(d.sender_id) || "有人";
+  NOTIFY.set("cc-mention", {
+    priority: 80,
+    text: `群聊：${who} 在「${ccChatNameOf(d.chat_id)}」@了你 —— 点这里打开`,
+    onClick: () => {
+      NOTIFY.clear("cc-mention");
+      setCocraft(true);
+      ccOpenChat(String(d.chat_id));
+      setTimeout(() => { try { ccScrollBottom(ccEl("cc-msgs")); } catch { /* ignore */ } }, 120);
+    },
+  });
+}
+/** 打开群聊（或在看那个会话）→ 撤下 @我 提醒。 */
+function ccClearMentionNotify() { NOTIFY.clear("cc-mention"); }
 
 /* ---- 用户信息缓存（用 GET /users/{id} 补全用户名 ── 见 docs/COCRAFT.md） ----
    登录/注册返回的 user 就是自己 → 直接缓存；其它人（消息发送者）缺名字时按 id 拉一次。 */
@@ -2678,8 +3967,11 @@ function setCocraft(open) {
   document.documentElement.classList.toggle("cc-open", !!open);   // ← 分屏：面板内容让位
   if (open) ccApplyWidth(parseInt(ccLoad(CC_W_KEY), 10) || CC_W_DEFAULT, true);  // 打开时把让位宽度同步好
   try { localStorage.setItem(CC_OPEN_KEY, open ? "1" : "0"); } catch { /* 隐私模式 */ }
+  if (open && CC.chatID) ccUnreadClear(CC.chatID);   // ★打开抽屉 = 在看当前会话 → 未读清零
+  if (open) ccClearMentionNotify();                  // ★抽屉开了 → 撤下 @我 提醒
   if (typeof syncHubBtn === "function") syncHubBtn();
   if (open && CC.token && CC.chatID && !CC.msgs.length) ccLoadMsgs();
+  ccActSync();                                       // ★C1：抽屉开合 → 活动卡轮询节奏跟着变
   // 打开时重算用户名（缓存里可能已经有；没有的就补一次 /users/{id}）——
   // 否则名字可能是在抽屉关着的时候拉回来的，界面还停在「用户 id」。
   if (open) setTimeout(() => {
@@ -2733,6 +4025,15 @@ function ccShowAuth(msg) {
   CC.members = [];
   CC.floor = null;
   if (CC.floorTimer) { clearInterval(CC.floorTimer); CC.floorTimer = null; }
+  CC.unread = {};                    // ★登出 / 未登录 → 清掉未读，别残留
+  CC.activity = {};                  // ★C1：活动卡也跟着清（否则顶栏会留个「工作中」角标）
+  CC.actRev = {};
+  ccActStop();
+  ccSaveUnread();
+  ccClearMentionNotify();            // ★登出 → 也撤下 @我 提醒
+  NOTIFY.clear("cc-perm");           // ★登出 → 权限提醒一并撤下
+  try { syncTitle(); } catch { /* ignore */ }   // ★B3：登出 → 标题栏不留计数
+  if (typeof syncHubBtn === "function") syncHubBtn();
   ccStopPoll();
   ccCloseWS();
 }
@@ -2747,6 +4048,7 @@ function ccShowMain() {
   ccConnectWS();
   ccLoadChats();
   ccStartPoll();
+  ccActSync();               // ★C1：登录后如果已经有选中的会话，活动卡轮询也跟着起来
 }
 
 function ccAuthMsg(text, isErr) {
@@ -2771,6 +4073,8 @@ async function ccInit() {
   } catch { /* 用默认 */ }
   if (!CC.ws) CC.ws = "wss://www.animaker.cc.cd/ws";
   ccLoadUsers();
+  ccLoadUnread();
+  syncTitle();                          // ★B3：启动就把未读计数写进标题栏
   CC.token = ccLoad(CC_TOKEN_KEY);
   if (CC.token) {
     try {
@@ -2830,22 +4134,31 @@ function ccRenderChats() {
   if (!CC.chats.length) { box.innerHTML = `<div class="cc-empty">还没有会话</div>`; return; }
   box.innerHTML = CC.chats.map((c) => {
     const n = (c.members || []).length;
+    const u = ccUnreadOf(c.id);                                        // ★未读数
+    const badge = u ? `<em class="cc-badge">${u > 99 ? "99+" : u}</em>` : "";
     return `<div class="cc-chat${String(c.id) === String(CC.chatID) ? " on" : ""}" data-chat="${esc(c.id)}">`
-      + `<b>${esc(ccChatName(c))}</b><i>${n ? n + " 人" : ""}</i></div>`;
+      + `<b>${esc(ccChatName(c))}</b>${badge}<i>${n ? n + " 人" : ""}</i></div>`;
   }).join("");
 }
 
 /* ---- 聊天内容 ---- */
 async function ccOpenChat(id) {
   CC.chatID = String(id);
+  ccUnreadClear(id);                   // ★打开会话 → 未读清零
+  ccClearMentionNotify();              // ★已经点开来看它了 → 撤下 @我 提醒
   CC.msgs = [];
   CC.members = [];
   CC.floor = null;
+  // ★C1：换会话 → 该会话的活动**从头拉**（since=0），卡片立刻有内容
+  CC.activity[String(id)] = [];
+  CC.actRev[String(id)] = 0;
+  CC.actAt = 0;           // ★清掉节流 → ccActSync 会**立刻**拉一次（否则要等 2~6s 才刷新）
   ccMenuOpen(false);
   ccRenderChats();
   ccRenderRoomHead();
   ccLoadMembers();        // 成员在线状态（不 await：慢也不该挡住消息）
   ccLoadFloor();          // 当前发言权
+  ccActSync();            // ★C1：活动卡轮询
   await ccLoadMsgs();
 }
 
@@ -2888,13 +4201,17 @@ function ccRenderRoomMeta() {
   const mem = CC.members || [];
   if (!CC.chatID || (!mem.length && !CC.floor)) { box.hidden = true; box.innerHTML = ""; return; }
   const on = mem.filter((m) => m.presence === "online").length;
+  const busyAg = ccActBusyAgents(CC.chatID);      // ★C1/C2：正在干活的成员（前端推断，**不动服务端 presence**）
   const chips = mem.map((m) => {
     const isAgent = m.kind === "agent";
     const onl = m.presence === "online";
     const fl = isAgent && CC.floor && String(CC.floor.holder_agent_id) === String(m.id);
-    return `<span class="cc-chip${isAgent ? " agent" : ""}${fl ? " floor" : ""}"`
-      + ` title="${esc(ccMemberName(m))}${isAgent ? "（agent）" : ""}${onl ? " · 在线" : " · 离线"}">`
-      + `<i class="cc-dot${onl ? " on" : ""}"></i>${isAgent ? "🤖" : ""}${esc(ccMemberName(m))}</span>`;
+    const bz = isAgent && (busyAg.has(String(m.name || "")) || busyAg.has(String(m.display || ""))
+                           || busyAg.has(String(ccMemberName(m))));
+    return `<span class="cc-chip${isAgent ? " agent" : ""}${fl ? " floor" : ""}${bz ? " busy" : ""}"`
+      + ` title="${esc(ccMemberName(m))}${isAgent ? "（agent）" : ""}${onl ? " · 在线" : " · 离线"}${bz ? " · 工作中" : ""}">`
+      + `<i class="cc-dot${onl ? " on" : ""}"></i>${isAgent ? "🤖" : ""}${esc(ccMemberName(m))}`
+      + (bz ? `<em class="cc-busy-tag">工作中</em>` : "") + `</span>`;
   }).join("");
   box.innerHTML = `<span class="cc-meta-on">在线 ${on}/${mem.length}</span>` + chips + ccFloorChip();
   box.hidden = false;
@@ -3035,7 +4352,7 @@ function ccLocalTime(iso) {
 function ccRenderMsgs(toBottom) {
   const box = ccEl("cc-msgs");
   if (!box) return;
-  if (!CC.msgs.length) { box.innerHTML = `<div class="cc-empty">还没有消息</div>`; return; }
+  if (!CC.msgs.length) { box.innerHTML = `<div class="cc-empty">还没有消息</div>`; ccDisRender(); ccActRender(); return; }
   box.innerHTML = CC.msgs.map((m) => {
     const isAgent = ccIsAgentMsg(m);
     const mine = !isAgent && CC.me && String(m.sender_id) === String(CC.me.id);
@@ -3047,6 +4364,439 @@ function ccRenderMsgs(toBottom) {
   }).join("");
   if (toBottom !== false) ccScrollBottom(box);
   ccPermRender();                 // ★ 顺手刷新「权限申请」小弹窗（输入框上方那个）
+  ccDisRender();                  // ★主动编排：派活汇总卡（在活动卡**之前**）
+  ccActRender();                  // ★C1：活动卡永远贴在消息流末尾（innerHTML 重建后要补回去）
+}
+
+/* ---- ★主动编排（方向 2）：角色预设 + 派活台 ----
+   并行是**天然**的：每个 AI 成员各自一条 WS + 线程 + AcpService，一条消息 @ 三个就是三家同时干。
+   这里补的是编排层：① 角色（只注入给本人，不污染别人的上下文）② 多选派活 ③ 一张"谁回了"的汇总卡。 */
+
+/** 角色中文名（拿不到就回 id / 空）。 */
+function ccRoleLabel(role) {
+  const r = String(role || "");
+  return (CC.roles && CC.roles[r] && CC.roles[r].label) || r;
+}
+
+/** 角色下拉的选项（`cur` = 当前值）。 */
+function ccRoleOptionsHtml(cur) {
+  const c = String(cur || "");
+  let html = `<option value=""${c ? "" : " selected"}>（无角色）</option>`;
+  Object.keys(CC.roles || {}).forEach((k) => {
+    html += `<option value="${esc(k)}"${k === c ? " selected" : ""}>${esc(ccRoleLabel(k))}</option>`;
+  });
+  return html;
+}
+
+/** 把角色表填进「建成员」那个下拉（顺带重画成员行里的角色下拉）。 */
+function ccFillRoles() {
+  const sel = ccEl("cc-ai-role");
+  if (sel) sel.innerHTML = ccRoleOptionsHtml(sel.value || "");
+  ccRenderAI();
+}
+
+/** 给某个成员改角色（服务端只影响它自己的提示词）。 */
+async function ccAiRole(id, role) {
+  try {
+    const r = await ccAgentFetch("/update", { method: "POST", body: { id: id, role: role } });
+    CC.ai = (r && r.agents) || CC.ai;
+    ccRenderAI();
+    ccDisRenderMembers();
+    ccNote(role ? `已设角色：${ccRoleLabel(role)}` : "已清掉角色");
+  } catch (e) {
+    ccNote("改角色失败：" + (e && e.message ? e.message : e), true);
+  }
+}
+
+/* ---- 派活台 ---- */
+
+function ccDisOpen(open) {
+  const p = ccEl("cc-dis");
+  if (!p) return;
+  CC.disOpen = !!open;
+  p.hidden = !open;
+  if (open) {
+    ccDisRenderMembers();
+    const t = ccEl("cc-dis-task");
+    if (t) t.focus();
+  }
+}
+
+function ccDisRenderMembers() {
+  const box = ccEl("cc-dis-members");
+  if (!box) return;
+  const list = CC.ai || [];
+  if (!list.length) {
+    box.innerHTML = `<div class="cc-dis-empty">还没有 AI 成员 —— ☰ →「AI 成员」里先建一个并加群。</div>`;
+    return;
+  }
+  box.innerHTML = list.map((a) => {
+    const id = String(a.id);
+    const on = CC.disSel.has(id);
+    const inChat = ccIsInChat(a);
+    return `<button type="button" class="cc-dis-chip${on ? " on" : ""}${inChat ? "" : " off"}"
+      data-dis="${esc(id)}" title="${esc(a.name)} · 大脑 ${esc(a.engine)}${inChat ? "" : " · 还没加进本群"}">`
+      + `${on ? "✓ " : ""}${esc(a.name)}`
+      + (a.roleLabel ? `<i>${esc(a.roleLabel)}</i>` : "") + `</button>`;
+  }).join("");
+}
+
+/** 派活：把选中的成员拼成一条 `@a @b 任务` 发进群（服务端按 mentions 给每人推一条 → 并行）。 */
+function ccDispatchGo() {
+  if (!CC.chatID) { ccDisNote("先选一个会话", true); return; }
+  const ms = Array.from(CC.disSel)
+    .map((id) => (CC.ai || []).find((a) => String(a.id) === String(id)))
+    .filter(Boolean);
+  if (!ms.length) { ccDisNote("先选至少一个 AI 成员", true); return; }
+  const task = String((ccEl("cc-dis-task") || {}).value || "").trim();
+  if (!task) { ccDisNote("写一句要他们做什么", true); return; }
+  const text = ms.map((a) => "@" + a.name).join(" ") + " " + task;
+  if (!ccSend(text)) return;
+  CC.dis = {
+    chat: String(CC.chatID), task: task, ts: Date.now(),
+    members: ms.map((a) => ({ id: String(a.id), name: a.name, role: a.role || "",
+                              roleLabel: a.roleLabel || "", status: "wait" })),
+  };
+  CC.pickId = null;                      // 新派活：清掉上一轮「推荐 X」的高亮
+  const t = ccEl("cc-dis-task");
+  if (t) t.value = "";
+  ccDisNote("");
+  ccDisOpen(false);
+  ccDisRender();
+  ccNote(`已派活给 ${ms.length} 个成员（各自并行，结果看下面的「派活」卡）`);
+}
+
+function ccDisNote(text, isErr) {
+  const n = ccEl("cc-dis-note");
+  if (!n) return;
+  n.textContent = text || "";
+  n.classList.toggle("err", !!isErr);
+}
+
+/** 派活汇总卡：谁已回复 / 谁还在跑。
+ *  状态**从群里已有的消息里推**（不额外问服务端）：派活之后这个成员在本群说过话 = 已回复。 */
+function ccDisRender() {
+  const box = ccEl("cc-msgs");
+  if (!box) return;
+  let el = ccEl("cc-dis-card");
+  const d = CC.dis;
+  if (!d || !d.members || String(d.chat) !== String(CC.chatID)) {
+    if (el) el.remove();
+    return;
+  }
+  d.members.forEach((m) => {
+    if (m.status === "done") return;
+    const t0 = Number(d.ts) - 2000;                 // 给 2s 容差（本地时钟 / 服务端时间戳）
+    const hit = (CC.msgs || []).some((x) => String(x.sender_id) === String(m.id)
+      && ccEpoch(x.created_at) >= t0);
+    if (hit) m.status = "done";
+  });
+  const done = d.members.filter((m) => m.status === "done").length;
+  if (!el) { el = document.createElement("div"); el.id = "cc-dis-card"; el.className = "cc-dis-card"; }
+  el.innerHTML = `<div class="cc-dis-cap">`
+    + `<i class="cc-dis-dot${done < d.members.length ? " busy" : ""}"></i>`
+    + `派活 · ${done}/${d.members.length} 已回复`
+    + (done ? `<button type="button" class="cc-dis-cmp" data-dis-cmp="1" title="并排看他们的回答">对比</button>` : "")
+    + `<button type="button" class="cc-dis-x" data-dis-hide="1" title="收起这张卡">×</button></div>`
+    + d.members.map((m) => `<div class="cc-dis-row ${m.status === "done" ? "done" : "wait"}">`
+      + `<span class="cc-dis-ico">${m.status === "done" ? "✓" : '<i class="cc-act-spin"></i>'}</span>`
+      + (m.roleLabel ? `<b class="cc-dis-role">${esc(m.roleLabel)}</b>` : "")
+      + `<span class="cc-dis-name">${esc(m.name)}</span>`
+      + `<span class="cc-dis-st">${m.status === "done" ? "已回复" : "等待中"}</span></div>`).join("");
+  if (el.parentNode !== box) box.appendChild(el);
+}
+
+/* ---- ★多方案对比：把同一次派活里每个人的回答**并排**摆出来（2 人时可逐行看差异） ---- */
+
+/** 这次派活里每个成员的回复（按消息时间拼起来；没有就空串）。
+ *  ⚠ 仲裁开始**之后** reviewer 说的话算「仲裁」，不算方案（否则会污染它那一列）。 */
+function ccCmpRows() {
+  const d = CC.dis;
+  if (!d) return [];
+  const t0 = Number(d.ts) - 2000;
+  const arb = (CC.arb && String(CC.arb.chat) === String(CC.chatID)) ? CC.arb : null;
+  return (d.members || []).map((m) => {
+    const hit = (CC.msgs || []).filter((x) => String(x.sender_id) === String(m.id)
+      && ccEpoch(x.created_at) >= t0
+      && !(arb && String(arb.reviewer.id) === String(m.id) && ccEpoch(x.created_at) >= arb.ts));
+    return { id: m.id, name: m.name, role: m.role || "", roleLabel: m.roleLabel || "",
+             count: hit.length, text: hit.map((x) => String(x.content || "")).join("\n\n") };
+  });
+}
+
+/* ---- ★结果仲裁：让 **reviewer 角色**的成员给这批方案拍板（打分 / 挑错 / 推荐） ---- */
+
+/** 本群里的 reviewer 角色成员（没有就空）。 */
+function ccArbReviewers() {
+  return (CC.ai || []).filter((a) => String(a.role) === "reviewer" && ccIsInChat(a));
+}
+
+/** 仲裁区里 reviewer 的回复（纯文本）。 */
+function ccArbReply() {
+  const a = CC.arb;
+  if (!a || String(a.chat) !== String(CC.chatID)) return "";
+  return (CC.msgs || [])
+    .filter((x) => String(x.sender_id) === String(a.reviewer.id) && ccEpoch(x.created_at) >= a.ts)
+    .map((x) => String(x.content || "")).join("\n\n").trim();
+}
+
+/** 从仲裁文本里**尽量**抠出「推荐 X」（抠不到就不显示，别编）。 */
+function ccArbPick(text) {
+  const m = String(text || "").match(/推荐\s*[:：]?\s*[*_`]*([^\n，,。;；]{1,24})/);
+  return m ? m[1].replace(/[*_`]/g, "").trim() : "";
+}
+
+/** 「推荐 X」落在**哪一列**：先按成员名，再按正文里提到这个名字（方案名常写在回答里）。
+ *  返回列下标；对不上就 -1（**不硬猜**，前端会明说对不上）。 */
+function ccArbPickTarget(pick) {
+  const key = String(pick || "").toLowerCase().replace(/\s+/g, "");
+  if (!key) return -1;
+  const rows = ccCmpRows();
+  const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, "");
+  let i = rows.findIndex((r) => norm(r.name) === key);
+  if (i < 0) i = rows.findIndex((r) => norm(r.name) && (norm(r.name).includes(key) || key.includes(norm(r.name))));
+  if (i < 0) i = rows.findIndex((r) => norm(r.text).includes(key));
+  return i;
+}
+
+/** 点「推荐：X」→ 跳到那一列（高亮）。对不上就明说，不假装。 */
+function ccArbJump() {
+  const pick = ccArbPick(ccArbReply());
+  if (!pick) return;
+  const rows = ccCmpRows();
+  const idx = ccArbPickTarget(pick);
+  const cols = document.querySelectorAll("#cmp-cols .cmp-col");
+  if (idx < 0 || !cols[idx]) {
+    setBanner(`结论里的「${pick}」对不上任何一列（成员：${rows.map((r) => r.name).join("、") || "无"}）`);
+    return;
+  }
+  CC.pickId = String(rows[idx].id);
+  Array.prototype.forEach.call(cols, (c) => c.classList.remove("pick"));
+  cols[idx].classList.add("pick");
+  try { cols[idx].scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" }); }
+  catch (e) { cols[idx].scrollIntoView(); }
+  setBanner(`已跳到「${rows[idx].name}」那一列`);
+}
+
+/* ★每次「派活 + 仲裁」的结论记一份历史（本机 localStorage，最多 50 条）。
+   现在只给「信任面板（方向 3）」攒素材；等那边做的时候直接读这个键。 */
+const CC_DEC_KEY = "cocraft.cc.decisions";
+
+function ccDecisionRemember(chat, task, pick, reviewer, target) {
+  try {
+    const v = JSON.parse(localStorage.getItem(CC_DEC_KEY) || "[]");
+    const arr = Array.isArray(v) ? v : [];
+    arr.unshift({ chat: String(chat || ""), task: String(task || "").slice(0, 200),
+                  pick: String(pick || ""), reviewer: String(reviewer || ""),
+                  target: String(target || ""), ts: Date.now() });
+    localStorage.setItem(CC_DEC_KEY, JSON.stringify(arr.slice(0, 50)));
+  } catch (e) { /* 隐私模式 / 配额满：历史不是功能前置，安静跳过 */ }
+}
+
+function ccDecisionHistory() {
+  try {
+    const v = JSON.parse(localStorage.getItem(CC_DEC_KEY) || "[]");
+    return Array.isArray(v) ? v : [];
+  } catch (e) { return []; }
+}
+
+function ccArbAsk() {
+  const d = CC.dis;
+  if (!d) { setBanner("先派活，再让 reviewer 仲裁"); return; }
+  const list = ccArbReviewers();
+  if (!list.length) {
+    setBanner("本群没有「审查者」角色的 AI 成员 —— 在 ☰ →「AI 成员」里把某个成员的角色设成「审查者」");
+    return;
+  }
+  const sel = $("cmp-arb-sel");
+  const want = sel ? String(sel.value || "") : "";
+  const who = list.find((a) => String(a.id) === want) || list[0];
+  const names = (d.members || []).map((m) => m.name).filter(Boolean);
+  const text = "@" + who.name + " 【仲裁】请评审上面这次派活的方案（" + names.join(" / ") + "）。\n"
+    + "要求：① 每个方案各给 1-2 句评价，指出**具体问题**（别写场面话）；② 结尾单独一行用"
+    + "「结论：推荐 <方案名>」收口，并说一句为什么。\n"
+    + "你只做评审、**不要改代码**；拿不准的地方直接说不确定。";
+  if (!ccSend(text)) return;
+  CC.pickId = null;                      // 新一轮仲裁：上一轮的高亮不该留着
+  CC.arb = { chat: String(CC.chatID), ts: Date.now(), task: d.task,
+             reviewer: { id: String(who.id), name: who.name } };
+  ccCmpRender();
+  ccNote("已请 " + who.name + " 仲裁（结果会出现在对比弹窗的「仲裁」区）");
+}
+
+function ccArbRender() {
+  const box = $("cmp-arb");
+  if (!box) return;
+  const d = CC.dis;
+  if (!d) { box.innerHTML = ""; box.hidden = true; return; }
+  const list = ccArbReviewers();
+  const a = (CC.arb && String(CC.arb.chat) === String(CC.chatID)) ? CC.arb : null;
+  const reply = ccArbReply();
+  const pick = ccArbPick(reply);
+  let head = `<div class="cmp-arb-h"><b>仲裁</b>`;
+  if (a) {
+    head += `<span class="cmp-arb-who">${esc(a.reviewer.name)}</span>`;
+    head += `<span class="cmp-arb-st">${reply ? "已出结论" : "等待中…"}</span>`;
+  }
+  head += `<span class="cmp-arb-sp"></span>`;
+  if (list.length) {
+    if (list.length > 1) {
+      head += `<select id="cmp-arb-sel" class="cmp-arb-sel">`
+        + list.map((x) => `<option value="${esc(x.id)}"${a && String(a.reviewer.id) === String(x.id) ? " selected" : ""}>${esc(x.name)}</option>`).join("")
+        + `</select>`;
+    }
+    head += `<button type="button" class="cmp-arb-go" data-arb-go="1">${a ? "再问一次" : "请 " + (list.length === 1 ? esc(list[0].name) : "审查者") + " 仲裁"}</button>`;
+  } else {
+    head += `<span class="muted">本群没有「审查者」角色的成员</span>`;
+  }
+  head += `</div>`;
+  const body = reply
+    ? `<div class="cmp-arb-body">`
+      + (pick ? `<button type="button" class="cmp-arb-rec" data-arb-pick="${esc(pick)}"
+            title="跳到这一列（对照着看）">推荐：<b>${esc(pick)}</b><span class="cmp-arb-jump">看这一列 →</span></button>` : "")
+      + renderText(reply) + `</div>`
+    : (a ? `<div class="muted" style="padding:4px 0">还在评……（点「刷新」看最新）</div>` : "");
+  box.innerHTML = head + body;
+  box.hidden = false;
+  // ★结论一出来就记一份历史（同一份结论只记一次；target 对不上就留空，不编）
+  if (pick && a && a.pickSeen !== pick) {
+    a.pickSeen = pick;
+    const idx = ccArbPickTarget(pick);
+    const rows = ccCmpRows();
+    ccDecisionRemember(d.chat, d.task, pick, a.reviewer.name, idx >= 0 ? rows[idx].name : "");
+  }
+}
+
+function ccCmpOpen() {
+  const box = $("cmp");
+  if (!box) return;
+  box.hidden = false;
+  ccCmpRender();
+}
+
+function ccCmpClose() { const b = $("cmp"); if (b) b.hidden = true; }
+
+function ccCmpRender() {
+  const cols = $("cmp-cols");
+  const task = $("cmp-task");
+  const note = $("cmp-note");
+  const diffBtn = $("cmp-diff-btn");
+  const diffBox = $("cmp-diff");
+  if (!cols) return;
+  const d = CC.dis;
+  if (diffBox) { diffBox.hidden = true; diffBox.innerHTML = ""; }
+  if (!d) {
+    if (task) task.textContent = "还没有派活记录 —— 先在群聊里「派活」。";
+    cols.innerHTML = "";
+    if (note) note.textContent = "";
+    if (diffBtn) diffBtn.hidden = true;
+    ccArbRender();
+    return;
+  }
+  if (task) task.textContent = "任务：" + d.task;
+  const rows = ccCmpRows();
+  const got = rows.filter((r) => r.text.trim());
+  if (note) {
+    note.textContent = `${got.length}/${rows.length} 个成员已回复`
+      + (got.length === 2 ? " · 可以点「逐行差异」看两边的差别" : "");
+  }
+  if (diffBtn) diffBtn.hidden = got.length !== 2;
+  if (!got.length) {
+    cols.innerHTML = `<div class="muted" style="padding:10px">还没有人回复 —— 等等再看（点「刷新」）。</div>`;
+    ccArbRender();
+    return;
+  }
+  cols.innerHTML = rows.map((r) => {
+    const empty = !r.text.trim();
+    return `<div class="cmp-col${empty ? " empty" : ""}">`
+      + `<h4>${r.roleLabel ? `<i class="cmp-role">${esc(r.roleLabel)}</i>` : ""}`
+      + `${esc(r.name)}<span>${empty ? "等待中" : (r.count > 1 ? r.count + " 条" : "已回复")}</span></h4>`
+      + `<div class="cmp-body">${empty ? `<span class="muted">（还没回复）</span>` : renderText(r.text)}</div>`
+      + `</div>`;
+  }).join("");
+  // ★点过「推荐 X」之后重画也要保住高亮（列顺序不变，按 id 找回那一列）
+  if (CC.pickId) {
+    const at = rows.findIndex((r) => String(r.id) === String(CC.pickId));
+    const pickEl = at >= 0 ? cols.querySelectorAll(".cmp-col")[at] : null;
+    if (pickEl) pickEl.classList.add("pick");
+  }
+  ccArbRender();
+  ccCmpLoadChanges(rows);          // ★每列补一块「文件改动」（异步，失败就算了）
+}
+
+/** 每列补「派活之前 → 现在」改了哪些文件（**文件级**；接方向 1 的轮快照，不占磁盘）。 */
+async function ccCmpLoadChanges(rows) {
+  const cols = document.querySelectorAll("#cmp-cols .cmp-col");
+  for (let i = 0; i < rows.length; i++) {
+    const col = cols[i];
+    if (!col) continue;
+    const old = col.querySelector(".cmp-chg");
+    if (old) old.remove();
+    try {
+      const r = await ccAgentFetch("/changes?chat=" + encodeURIComponent((CC.dis && CC.dis.chat) || CC.chatID)
+        + "&aid=" + encodeURIComponent(rows[i].id));
+      if (!r || r.ok === false || !r.files) continue;
+      col.appendChild(ccChgNode(r));
+    } catch (e) { /* 没快照 / 拿不到就算了，不要打扰用户 */ }
+  }
+}
+
+function ccChgNode(r) {
+  const lines = []
+    .concat((r.changed || []).map((x) => ["改", x.path]))
+    .concat((r.added || []).map((x) => ["增", x.path]))
+    .concat((r.deleted || []).map((x) => ["删", x.path]))
+    .concat((r.renamed || []).map((x) => ["名", (x.from || "") + " → " + (x.to || "")]));
+  const d = document.createElement("details");
+  d.className = "cmp-chg";
+  d.innerHTML = `<summary>文件改动 · ${r.files} 个</summary>`
+    + lines.slice(0, 40).map(([k, p]) => `<div class="cmp-chg-row"><i>${esc(k)}</i>`
+      + `<span title="${esc(p)}">${esc(p)}</span></div>`).join("")
+    + (lines.length > 40 ? `<div class="muted">…还有 ${lines.length - 40} 个</div>` : "");
+  return d;
+}
+
+/** 两个回答的**逐行差异**（LCS；太长就不算，免得卡）。 */
+function ccDiffLines(a, b) {
+  const A = String(a || "").split("\n");
+  const B = String(b || "").split("\n");
+  const n = A.length, m = B.length;
+  if (n * m > 400000) return null;                       // 太长：别把界面算死
+  const dp = [];
+  for (let i = 0; i <= n; i++) dp.push(new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (A[i] === B[j]) { out.push(" " + A[i]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push("-" + A[i]); i++; }
+    else { out.push("+" + B[j]); j++; }
+  }
+  while (i < n) out.push("-" + A[i++]);
+  while (j < m) out.push("+" + B[j++]);
+  return out;
+}
+
+function ccCmpToggleDiff() {
+  const box = $("cmp-diff");
+  const btn = $("cmp-diff-btn");
+  if (!box) return;
+  if (!box.hidden) { box.hidden = true; if (btn) btn.textContent = "逐行差异"; return; }
+  const got = ccCmpRows().filter((r) => r.text.trim());
+  if (got.length !== 2) { setBanner("需要正好 2 个成员回复才能看逐行差异"); return; }
+  const lines = ccDiffLines(got[0].text, got[1].text);
+  if (!lines) { setBanner("两边回复太长，算差异会卡 —— 直接并排看吧"); return; }
+  const add = lines.filter((l) => l.startsWith("+")).length;
+  const del = lines.filter((l) => l.startsWith("-")).length;
+  box.innerHTML = `<div class="cmp-diff-h">逐行差异：<b>${esc(got[0].name)}</b> → <b>${esc(got[1].name)}</b>`
+    + `<span class="muted">（+${add} / −${del} 行）</span></div>`
+    + renderDiff(lines.join("\n"));
+  box.hidden = false;
+  if (btn) btn.textContent = "收起差异";
 }
 
 /* ---- ★群聊权限申请：**输入框上方的小弹窗** ----
@@ -3075,14 +4825,20 @@ function ccPermParse(text) {
   };
 }
 
-/** 当前待批准的申请：最近一条「🔐 权限申请」；若其后已有「已允许/已拒绝/超时」→ 视为已结算。 */
+/* ★ 只认桥发的**真正申请文案**：固定带 `🔐 **权限申请**：`。
+   ⚠ 以前用 `c.indexOf("权限申请") >= 0` —— 太宽：AI 成员**解释自己规则**时随口提到
+   "发权限申请 / 破坏性操作"也会被当成一次待批申请 → 误弹"请求（破坏性）权限"卡片
+   （2026-10-13：用户问 yiyi"为什么申请破坏性操作"，它的回答本身就把弹窗顶了出来）。 */
+const CC_PERM_ASK_RE = /🔐\s*\*\*权限申请\*\*：/;
+
+/** 当前待批准的申请：最近一条「🔐 权限申请」；若其后已有「已允许/已拒绝/超时/已确认」→ 视为已结算。 */
 function ccPermPending() {
   const msgs = CC.msgs || [];
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     const c = String((m && m.content) || "");
-    if (m.sender_kind === "agent" && /已允许|已拒绝|权限申请超时/.test(c)) return null;
-    if (m.sender_kind === "agent" && c.indexOf("权限申请") >= 0 && m.id != null) return m;
+    if (m.sender_kind === "agent" && /已允许|已拒绝|权限申请超时|已确认，开始执行/.test(c)) return null;
+    if (m.sender_kind === "agent" && CC_PERM_ASK_RE.test(c) && m.id != null) return m;
   }
   return null;
 }
@@ -3101,15 +4857,21 @@ function ccPermRender() {
   if (!m || (CC.permDone || {})[String(m.id)]) {
     if (!box.hidden) { box.hidden = true; box.innerHTML = ""; }
     ccPermTimer(false);
+    NOTIFY.clear("cc-perm");           // ★没有待批准的了 → 撤下提醒
+    syncTitle();                       // ★B3：待批准没了 → 标题栏计数跟着减
     return;
   }
   const info = ccPermParse(m.content);
   const a = ccPermAgent(m);
   const left = Math.max(0, Math.round(info.secs - (Date.now() - ccEpoch(m.created_at)) / 1000));
   if (!(left > 0)) {                    // 到点（或时间戳异常）→ 桥那边会自行拒绝，这里也收起来
-    box.hidden = true; box.innerHTML = ""; ccPermTimer(false); return;
+    box.hidden = true; box.innerHTML = ""; ccPermTimer(false);
+    NOTIFY.clear("cc-perm");
+    syncTitle();
+    return;
   }
   box.hidden = false;
+  ccPermStrongAlert(m, info, a.label);   // ★B3：面板不在前台 → 托盘气泡 + 闪任务栏（同一申请只提醒一次）
   const cmdLine = info.cmd
     ? `<div class="cc-perm-cmd" title="${esc(info.cmd)}">${esc(info.cmd)}</div>` : "";
   box.innerHTML = `<div class="cc-perm-h${info.destructive ? " danger" : ""}">`
@@ -3129,8 +4891,18 @@ function ccPermRender() {
     + `<button type="button" class="cc-perm-x" data-perm="hide" title="先不管（到点自动拒绝）">×</button>`
     + `</div>`;
   ccPermTimer(true);
-  // 抽屉没开着 → 用顶部横幅提醒（否则根本看不到这个弹窗）
-  if (!cocraftIsOpen()) setBanner(`群聊：${a.label} 有权限申请待批准 —— 打开群聊，在输入框上方一键「允许」`);
+  // 抽屉没开着 → 用顶部横幅提醒（否则根本看不到这个弹窗）。
+  // ★A3：走通知聚合器（优先级 100 = 最高），并且**可点**（点一下直接开抽屉）。
+  if (!cocraftIsOpen()) {
+    NOTIFY.set("cc-perm", {
+      priority: 100,
+      text: `群聊：${a.label} 有权限申请待批准 —— 点这里打开，一键「允许」`,
+      onClick: () => { NOTIFY.clear("cc-perm"); setCocraft(true); },
+    });
+  } else {
+    NOTIFY.clear("cc-perm");
+  }
+  syncTitle();                          // ★B3：出现待批准 → 标题栏计数 +1
 }
 
 let ccPermT = null;
@@ -3187,6 +4959,9 @@ function ccScrollBottom(box) {
 function ccPushMsg(m) {
   if (!m || m.id == null) return;
   if ((CC.msgs || []).some((x) => String(x.id) === String(m.id))) return;
+  // ★C1：群里来了新消息 → 很可能马上就有成员开始干活 → 让活动卡**立刻**拉一次
+  //   （否则空闲节奏是 6s，「正在执行」会迟到好几秒才出现）
+  CC.actAt = 0;
   // 帧里理论上带 created_at；万一没带就用「现在」（推送是实时的，正好对）。
   if (!m.created_at) m.created_at = new Date().toISOString();
   const box = ccEl("cc-msgs");
@@ -3315,6 +5090,186 @@ function ccFillAiEngines() {
 
 const ccIsInChat = (a) => String(CC.chatID) && (a.chats || []).some((c) => String(c) === String(CC.chatID));
 
+/* ---- ★主动编排：一键建组 ----
+   后端 `/ccagent/team`：按预设建几个 agent（各带角色 + 大脑）→ 自动进群 → 打开应答。
+   名字必须能被 `@` 解析（`[A-Za-z0-9_-]`），重名后端会自动加 `-2`。 */
+
+function ccTeamOpen(open) {
+  const box = ccEl("cc-team");
+  if (!box) return;
+  box.hidden = !open;
+  if (open) { ccTeamFillPreset(); ccTeamRender(); }
+}
+
+function ccTeamPreset() {
+  const sel = ccEl("cc-team-preset");
+  if (sel && sel.options.length) return sel.value || "dev";
+  const first = (CC.teamPresets || [])[0];
+  return (first && first.id) || "dev";
+}
+
+function ccTeamPresetInfo() {
+  const id = ccTeamPreset();
+  return (CC.teamPresets || []).find((x) => x.id === id) || null;
+}
+
+/** 填预设下拉。`want` = 存完/删完要选中的 id；没有就保住当前选择。
+ *  ⚠ 换预设会把 **草稿（CC.teamDraft）清空** —— 面板里改过的角色/名字属于"这一次"，不跨预设带。 */
+function ccTeamFillPreset(want) {
+  const sel = ccEl("cc-team-preset");
+  CC.teamDraft = null;
+  if (!sel) return;
+  const list = CC.teamPresets || [];
+  const cur = want || sel.value;
+  sel.innerHTML = list.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}${p.builtin ? "" : " ★"}</option>`).join("")
+    || `<option value="dev">开发 + 审查 + 测试</option>`;
+  if (cur) sel.value = cur;
+  if (list.length && !sel.value) sel.value = list[0].id;
+}
+
+/** 面板里当前这几行（草稿优先：用户在面板上改过角色/名字就用改过的）。 */
+function ccTeamRows() {
+  if (CC.teamDraft) return CC.teamDraft;
+  const p = ccTeamPresetInfo();
+  return ((p && p.rows) || []).map((r) => ({ role: r.role, name: r.name,
+                                             roleLabel: r.roleLabel || ccRoleLabel(r.role) }));
+}
+
+function ccTeamRoleSelectHtml(i, role) {
+  const c = String(role || "");
+  const opts = Object.keys(CC.roles || {}).map((k) =>
+    `<option value="${esc(k)}"${k === c ? " selected" : ""}>${esc(ccRoleLabel(k))}</option>`).join("");
+  return `<select class="cc-team-role" data-team-role="${i}" title="角色（只注入它自己的提示词）">${opts}</select>`;
+}
+
+function ccTeamRender() {
+  const box = ccEl("cc-team-rows");
+  if (!box) return;
+  ccFillAiEngines();                       // 先把「大脑」清单填好
+  const engines = Array.from((ccEl("cc-ai-engine") || {}).options || []);
+  const engOpts = (cur) => `<option value="">（默认引擎）</option>`
+    + engines.map((o) => `<option value="${esc(o.value)}"${o.value === cur ? " selected" : ""}>${esc(o.textContent)}</option>`).join("");
+  if (!CC.teamDraft) CC.teamDraft = ccTeamRows().map((r) => ({ role: r.role, name: r.name }));
+  const rows = CC.teamDraft;
+  if (!rows.length) { box.innerHTML = `<div class="muted">这个预设没有成员</div>`; return; }
+  box.innerHTML = rows.map((r, i) => `<div class="cc-team-row">`
+    + ccTeamRoleSelectHtml(i, r.role)
+    + `<input type="text" class="cc-team-name" data-team-name="${i}" value="${esc(r.name)}"
+         maxlength="24" autocomplete="off" title="@ 用它（字母/数字/_/-）">`
+    + `<select class="cc-team-eng" data-team-eng="${i}" title="这个角色用哪个大脑">${engOpts(r.engine || "")}</select>`
+    + `</div>`).join("");
+}
+
+/** 把面板里的值读回草稿（建组 / 存预设都用它）。 */
+function ccTeamSyncDraft() {
+  const box = ccEl("cc-team-rows");
+  if (!box) return CC.teamDraft || [];
+  const old = CC.teamDraft || [];
+  const rows = [];
+  box.querySelectorAll(".cc-team-row").forEach((el, i) => {
+    const role = String((el.querySelector("[data-team-role]") || {}).value || (old[i] || {}).role || "");
+    const name = String((el.querySelector("[data-team-name]") || {}).value || "").trim();
+    const engine = String((el.querySelector("[data-team-eng]") || {}).value || "");
+    rows.push({ role: role, name: name, engine: engine });
+  });
+  CC.teamDraft = rows;
+  return rows;
+}
+
+async function ccTeamGo() {
+  if (!CC.chatID) { ccTeamNote("先选一个群（会话）", true); return; }
+  const rows = ccTeamSyncDraft().filter((r) => r.role);
+  if (!rows.length) { ccTeamNote("至少留一个角色", true); return; }
+  const task = String((ccEl("cc-team-task") || {}).value || "").trim();
+  const btn = ccEl("cc-team-go");
+  if (btn) btn.disabled = true;
+  ccTeamNote("建组中…（每个人都要上游建 agent + 进群，可能要几秒）");
+  try {
+    const r = await ccAgentFetch("/team", { method: "POST",
+      body: { chat_id: CC.chatID, preset: ccTeamPreset(), rows: rows } });
+    CC.ai = (r && r.agents) || CC.ai;
+    ccRenderAI();
+    ccDisRenderMembers();
+    const created = (r && r.created) || [];
+    const bad = (r && r.failed) || [];
+    let note = `建好 ${created.length} 个` + (bad.length
+      ? `；失败 ${bad.length} 个：` + bad.map((x) => x.name + "（" + (x.stage || "") + "）").join("、")
+      : "，已进群并开应答");
+    // ★建完自动派第一活：一条 `@a @b 任务`（服务端按 mentions 各推 → 并行），并挂上派活汇总卡
+    if (created.length && task) {
+      const text = created.map((x) => "@" + x.name).join(" ") + " " + task;
+      if (ccSend(text)) {
+        CC.dis = {
+          chat: String(CC.chatID), task: task, ts: Date.now(),
+          members: created.map((x) => ({ id: String(x.id), name: x.name, role: x.role || "",
+                                         roleLabel: x.roleLabel || "", status: "wait" })),
+        };
+        ccDisRender();
+        note += `；已派第一活给 ${created.length} 个成员`;
+        const t = ccEl("cc-team-task");
+        if (t) t.value = "";
+      } else {
+        note += "；第一活没发出去（WebSocket 未就绪）";
+      }
+    }
+    ccTeamNote(note, bad.length > 0);
+    if (created.length) setBanner(`已建组：${created.map((x) => x.name + "(" + (x.roleLabel || x.role) + ")").join("、")}`);
+  } catch (e) {
+    ccTeamNote("建组失败：" + (e && e.message ? e.message : e), true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/** ★把当前面板里的「角色 + 名字」存成自定义预设（后端 `POST /ccagent/team/preset`）。 */
+async function ccTeamSavePreset(label) {
+  const name = String(label || "").trim();
+  if (!name) { ccTeamNote("先给预设起个名字", true); return false; }
+  const rows = ccTeamSyncDraft().filter((r) => r.role)
+    .map((r) => ({ role: r.role, name: r.name }));
+  if (!rows.length) { ccTeamNote("至少留一个角色", true); return false; }
+  try {
+    const r = await ccAgentFetch("/team/preset", { method: "POST",
+      body: { action: "save", label: name, rows: rows } });
+    CC.teamPresets = (r && r.teamPresets) || CC.teamPresets;
+    const saved = (r && r.preset) || {};
+    ccTeamFillPreset(saved.id);        // 选中刚存的那个（草稿跟着预设重置）
+    ccTeamRender();
+    ccTeamNote(`已存为预设「${saved.label || name}」` + (saved.builtin === false ? "（自定义，可删）" : ""));
+    return true;
+  } catch (e) {
+    ccTeamNote("存预设失败：" + (e && e.message ? e.message : e), true);
+    return false;
+  }
+}
+
+/** 删除当前选中的**自定义**预设（内置的不许删）。 */
+async function ccTeamDeletePreset() {
+  const p = ccTeamPresetInfo();
+  if (!p) { ccTeamNote("没有选中的预设", true); return false; }
+  if (p.builtin) { ccTeamNote("内置预设不能删 —— 可以「存为预设」另存一份再改", true); return false; }
+  try {
+    const r = await ccAgentFetch("/team/preset", { method: "POST",
+      body: { action: "delete", id: p.id } });
+    CC.teamPresets = (r && r.teamPresets) || CC.teamPresets;
+    const first = (CC.teamPresets || [])[0];
+    ccTeamFillPreset(first && first.id);
+    ccTeamRender();
+    ccTeamNote(`已删除预设「${p.label}」`);
+    return true;
+  } catch (e) {
+    ccTeamNote("删预设失败：" + (e && e.message ? e.message : e), true);
+    return false;
+  }
+}
+
+function ccTeamNote(text, isErr) {
+  const n = ccEl("cc-team-note");
+  if (!n) return;
+  n.textContent = text || "";
+  n.classList.toggle("err", !!isErr);
+}
+
 function ccRenderAI() {
   const box = ccEl("cc-ai-list");
   if (!box) return;
@@ -3323,14 +5278,22 @@ function ccRenderAI() {
   box.innerHTML = list.map((a) => {
     const inChat = ccIsInChat(a);
     return `<div class="cc-ai" data-id="${esc(a.id)}">`
-      + `<span class="cc-ai-name" title="id ${esc(a.id)} · 大脑 ${esc(a.engine)}">`
-      + `<i class="cc-dot${a.enabled && a.running ? " on" : ""}"></i>${esc(a.name)}`
-      + ccAiEngineSelect(a) + `</span>`
+      + `<div class="cc-ai-head">`
+      + `<span class="cc-ai-name" title="id ${esc(a.id)}">`
+      + `<i class="cc-dot${a.enabled && a.running ? " on" : ""}"></i>${esc(a.name)}</span>`
+      + `<span class="cc-ai-sp"></span>`
       + `<button type="button" class="cc-ai-b" data-act="join" ${inChat ? "disabled" : ""}>加群</button>`
       + `<button type="button" class="cc-ai-b" data-act="leave" ${inChat ? "" : "disabled"}>退群</button>`
       + `<button type="button" class="cc-ai-b${a.enabled ? " on" : ""}" data-act="toggle">`
       + `${a.enabled ? "应答中" : "已停"}</button>`
       + `<button type="button" class="cc-ai-b del" data-act="del" title="删除这个 AI 成员">×</button>`
+      + `</div>`
+      + `<div class="cc-ai-opts">`
+      + `<span class="cc-ai-lbl">大脑</span>${ccAiEngineSelect(a)}`
+      + `<span class="cc-ai-lbl">角色</span>`
+      + `<select class="cc-ai-role" data-role-for="${esc(a.id)}" title="角色：只注入它自己的提示词（别人看不到）">`
+      + ccRoleOptionsHtml(a.role || "") + `</select>`
+      + `</div>`
       + `</div>`
       + (a.warn ? `<div class="cc-ai-warn" title="权限：${esc(a.warn)}">⚠ ${esc(a.warn)}</div>` : "");
   }).join("");
@@ -3341,17 +5304,22 @@ async function ccLoadAI() {
   try {
     const r = await ccAgentFetch("/list");
     CC.ai = (r && r.agents) || [];
-    ccRenderAI();
+    CC.roles = (r && r.roles) || CC.roles || {};
+    CC.teamPresets = (r && r.teamPresets) || CC.teamPresets || [];
+    ccFillRoles();
+    ccDisRenderMembers();
   } catch (e) { /* 拿不到就保持 */ }
 }
 
 async function ccAiAdd() {
   const name = String((ccEl("cc-ai-name") || {}).value || "").trim();
   const engine = String((ccEl("cc-ai-engine") || {}).value || "");
+  const role = String((ccEl("cc-ai-role") || {}).value || "");
   if (!name) { ccNote("给 AI 成员起个名字（@ 它用）", true); return; }
   if (!engine) { ccNote("没有可用的 ACP agent 当大脑（设置 → ACP 代理里先加一个）", true); return; }
   try {
-    const r = await ccAgentFetch("/create", { method: "POST", body: { name: name, display: name, engine: engine } });
+    const r = await ccAgentFetch("/create", { method: "POST",
+      body: { name: name, display: name, engine: engine, role: role } });
     ccEl("cc-ai-name").value = "";
     const a = r && r.agent;
     if (a && CC.chatID) {
@@ -3360,7 +5328,9 @@ async function ccAiAdd() {
     }
     CC.ai = (r && r.agents) || CC.ai;
     ccRenderAI();
-    ccNote("已建 AI 成员：" + name + "（用 " + engine + " 当大脑）");
+    ccDisRenderMembers();
+    ccNote("已建 AI 成员：" + name + "（用 " + engine + " 当大脑"
+      + (role ? "，角色 " + ccRoleLabel(role) : "") + "）");
   } catch (e) { ccNote("建 AI 成员失败：" + e.message, true); }
 }
 
@@ -3498,6 +5468,15 @@ function ccConnectWS() {
     if (t === "message") {
       // ★ 推送帧**本身就是消息本体** → 直接追加（省一次往返；也不会再"只看得到最旧的 100 条"）
       if (String(d.chat_id) === String(CC.chatID)) ccPushMsg(d);
+      ccBumpUnread(d.chat_id, d);        // ★未读（自己发的不算；正在看的也不算）
+      ccMentionNotify(d);                // ★@我 → 可点横幅（抽屉关着时也能看见）
+      ccLoadChats();
+    } else if (t === "mention") {
+      // 服务端定向推给"被 @ 的连接"（对 agent 是它的 agent_token 连接）。人一般走 message 广播，
+      // 但真收到就说明确实点了我 → 强制按 @我 处理（顺带也记一条未读）。
+      if (String(d.chat_id) === String(CC.chatID)) ccPushMsg(d);
+      ccBumpUnread(d.chat_id, d);
+      ccMentionNotify(d, true);
       ccLoadChats();
     } else if (t === "presence") {
       ccApplyPresence(d);                       // agent/用户上线、下线
@@ -3548,8 +5527,9 @@ async function ccSendCode(email, username) {
 
 /* ---- 抽屉宽度可拖动 ---- */
 function ccApplyWidth(w, commit) {
-  // 分屏：给面板至少留 300px（抽屉最大 = 视口 - 300）
-  const max = Math.max(300, window.innerWidth - 300);
+  // 分屏：给面板至少留 300px（抽屉最大 = 视口 - 300）—— 都是**设计像素**（见 uiZoom）
+  const z = uiZoom();
+  const max = Math.max(300, (window.innerWidth - 300) / z);
   const nw = Math.max(300, Math.min(w, max));
   document.documentElement.style.setProperty("--cc-w", nw + "px");
   // ★ 只有"提交"时才同步 #app 的 padding —— 拖动过程中不重排整个主面板（否则每帧重排，很卡）
@@ -3561,7 +5541,7 @@ function ccInitResize() {
   if (!box || !grip) return;
   let dragging = false, startX = 0, startW = 0, rafId = -1, lastW = 0;
   grip.addEventListener("pointerdown", (e) => {
-    dragging = true; startX = e.clientX; startW = box.getBoundingClientRect().width;
+    dragging = true; startX = e.clientX; startW = box.getBoundingClientRect().width / uiZoom();
     box.classList.add("resizing");
     document.documentElement.classList.add("cc-resizing");
     try { grip.setPointerCapture(e.pointerId); } catch { /* ignore */ }
@@ -3569,7 +5549,7 @@ function ccInitResize() {
   });
   grip.addEventListener("pointermove", (e) => {
     if (!dragging) return;
-    lastW = startW + (startX - e.clientX);          // 往左拖 = 变宽
+    lastW = startW + (startX - e.clientX) / uiZoom();   // 往左拖 = 变宽（换算成设计像素）
     if (rafId !== -1) return;                        // ★ rAF 节流：每帧最多改一次 CSS 变量
     rafId = requestAnimationFrame(() => { rafId = -1; ccApplyWidth(lastW, true); });
   });
@@ -3640,6 +5620,45 @@ function initCocraft() {
   $("cc-invite-go").addEventListener("click", ccInvite);
   $("cc-remove-go").addEventListener("click", ccRemoveMember);
   $("cc-ai-add").addEventListener("click", ccAiAdd);
+  // ★一键建组
+  const teamOpen = $("cc-team-open");
+  if (teamOpen) teamOpen.addEventListener("click", () => ccTeamOpen($("cc-team").hidden));
+  const teamX = $("cc-team-x");
+  if (teamX) teamX.addEventListener("click", () => ccTeamOpen(false));
+  const teamGo = $("cc-team-go");
+  if (teamGo) teamGo.addEventListener("click", ccTeamGo);
+  const teamPreset = $("cc-team-preset");
+  if (teamPreset) teamPreset.addEventListener("change", () => { CC.teamDraft = null; ccTeamRender(); ccTeamNote(""); });
+  const teamSave = $("cc-team-save");
+  if (teamSave) teamSave.addEventListener("click", () => {
+    const n = window.prompt("给这个预设起个名字（含角色 + 名字，到时候一键复用）", "我的组");
+    if (n) ccTeamSavePreset(n);
+  });
+  const teamDel = $("cc-team-del");
+  if (teamDel) teamDel.addEventListener("click", () => ccTeamDeletePreset());
+  const teamRows = $("cc-team-rows");
+  if (teamRows) {
+    teamRows.addEventListener("input", (e) => {
+      const el = e.target.closest && e.target.closest("[data-team-name]");
+      if (!el) return;
+      const i = Number(el.dataset.teamName);
+      if (CC.teamDraft && CC.teamDraft[i]) CC.teamDraft[i].name = String(el.value || "");
+    });
+    teamRows.addEventListener("change", (e) => {
+      if (!CC.teamDraft) ccTeamSyncDraft();
+      const rl = e.target.closest && e.target.closest("[data-team-role]");
+      if (rl) {
+        const i = Number(rl.dataset.teamRole);
+        if (CC.teamDraft[i]) { CC.teamDraft[i].role = rl.value; CC.teamDraft[i].roleLabel = ccRoleLabel(rl.value); }
+        return;
+      }
+      const en = e.target.closest && e.target.closest("[data-team-eng]");
+      if (en) {
+        const i = Number(en.dataset.teamEng);
+        if (CC.teamDraft[i]) CC.teamDraft[i].engine = en.value;
+      }
+    });
+  }
   initCcPerm();                         // ★ 权限申请小弹窗（输入框上方）：按钮 → 发 `@agent 可以`
   $("cc-ai-list").addEventListener("click", (e) => {
     const b = e.target.closest && e.target.closest(".cc-ai-b");
@@ -3649,7 +5668,46 @@ function initCocraft() {
   $("cc-ai-list").addEventListener("change", (e) => {
     const sel = e.target.closest && e.target.closest(".cc-ai-eng");
     const row = e.target.closest && e.target.closest(".cc-ai");
-    if (sel && row) ccAiEngine(row.dataset.id, sel.value);
+    if (sel && row) { ccAiEngine(row.dataset.id, sel.value); return; }
+    const rs = e.target.closest && e.target.closest(".cc-ai-role");
+    if (rs && row) { ccAiRole(row.dataset.id, rs.value); }
+  });
+  // ★主动编排：派活台
+  const disBtn = $("cc-dispatch");
+  if (disBtn) disBtn.addEventListener("click", () => ccDisOpen(!CC.disOpen));
+  const disClose = $("cc-dis-close");
+  if (disClose) disClose.addEventListener("click", () => ccDisOpen(false));
+  const disGo = $("cc-dis-go");
+  if (disGo) disGo.addEventListener("click", ccDispatchGo);
+  $("cc-dis-members").addEventListener("click", (e) => {
+    const b = e.target.closest && e.target.closest("[data-dis]");
+    if (!b) return;
+    const id = String(b.dataset.dis);
+    if (CC.disSel.has(id)) CC.disSel.delete(id); else CC.disSel.add(id);
+    ccDisRenderMembers();
+    ccDisNote("");
+  });
+  $("cc-msgs").addEventListener("click", (e) => {
+    const d = e.target.closest && e.target.closest("[data-dis-hide]");
+    if (d) { CC.dis = null; ccDisRender(); return; }
+    const c = e.target.closest && e.target.closest("[data-dis-cmp]");
+    if (c) { ccCmpOpen(); }
+  });
+  // ★多方案对比
+  const cmpClose = $("cmp-close");
+  if (cmpClose) cmpClose.addEventListener("click", ccCmpClose);
+  const cmpReload = $("cmp-reload");
+  if (cmpReload) cmpReload.addEventListener("click", ccCmpRender);
+  const cmpDiff = $("cmp-diff-btn");
+  if (cmpDiff) cmpDiff.addEventListener("click", ccCmpToggleDiff);
+  const cmpBox = $("cmp");
+  if (cmpBox) cmpBox.addEventListener("click", (e) => { if (e.target === cmpBox) ccCmpClose(); });
+  const arbBox = $("cmp-arb");
+  if (arbBox) arbBox.addEventListener("click", (e) => {
+    const p = e.target.closest && e.target.closest("[data-arb-pick]");
+    if (p) { ccArbJump(); return; }
+    const b = e.target.closest && e.target.closest("[data-arb-go]");
+    if (b) ccArbAsk();
   });
   document.addEventListener("click", (e) => {
     const pop = ccEl("cc-menu-pop");
@@ -3851,7 +5909,15 @@ function setPlayerFold(folded) {
 function syncHubBtn() {
   const b = $("btn-hub");
   const chatOn = (typeof cocraftIsOpen === "function") && cocraftIsOpen();
-  if (b) b.classList.toggle("on", !!(chatOn || MUSIC.shown));
+  if (b) {
+    b.classList.toggle("on", !!(chatOn || MUSIC.shown));
+    // ★未读徽章（群聊）
+    const u = (typeof ccUnreadTotal === "function") ? ccUnreadTotal() : 0;
+    b.classList.toggle("has-unread", u > 0);
+    if (u) b.setAttribute("data-unread", u > 99 ? "99+" : String(u));
+    else b.removeAttribute("data-unread");
+  }
+  if (typeof ccActBadge === "function") ccActBadge();   // ★C1：有成员在干活 → 「工作中」角标
   const c = $("hm-chat"), m = $("hm-music");
   if (c) c.classList.toggle("on", !!chatOn);
   if (m) m.classList.toggle("on", !!MUSIC.shown);
@@ -3860,7 +5926,7 @@ function syncHubBtn() {
 /** 播放条是否显示：默认**隐藏**，从顶栏「群聊 / 音乐」里选「音乐」才出现在输入框上方；× 可隐去。 */
 function setPlayerShown(on) {
   MUSIC.shown = !!on;
-  try { localStorage.setItem("cocraft.player.shown", MUSIC.shown ? "1" : "0"); } catch { /* 隐私模式 */ }
+  try { localStorage.setItem("cocraft.player.shown2", MUSIC.shown ? "1" : "0"); } catch { /* 隐私模式 */ }
   renderPlayer();
   syncHubBtn();
 }
@@ -4322,7 +6388,9 @@ function initMusic() {
   try { MUSIC.folded = localStorage.getItem("cocraft.player.folded2") !== "0"; } catch { MUSIC.folded = true; }
   setPlayerFold(MUSIC.folded);
   $("p-fold").addEventListener("click", () => setPlayerFold(!MUSIC.folded));
-  try { MUSIC.shown = localStorage.getItem("cocraft.player.shown") === "1"; } catch { MUSIC.shown = false; }
+  // ⚠ 用新键 shown2：旧键 `cocraft.player.shown` 曾被 musicPlay() 的 bug 擅自写成 "1"
+  // （刷新面板就弹音乐条）→ 不再继承旧值，只有用户**主动**开/关（选「音乐」/ ×）才记。
+  try { MUSIC.shown = localStorage.getItem("cocraft.player.shown2") === "1"; } catch { MUSIC.shown = false; }
   renderPlayer();
   const _pc = $("p-close");
   if (_pc) _pc.addEventListener("click", () => setPlayerShown(false));
@@ -4674,7 +6742,10 @@ async function loadPermLevel() {
 async function setPermLevel(lv) {
   PERM.level = lv;
   permBtnSync();
-  try { await api("/api/permission/level", { method: "POST", body: { level: lv } }); } catch { /* ignore */ }
+  // ⚠ `api()` 直接把 options 交给 fetch —— body 必须是**字符串**（传对象会变成 "[object Object]"，
+  //   后端读不到 level 会回落成 ask：等级切换看起来生效、其实没写进去）。
+  try { await api("/api/permission/level", { method: "POST", body: JSON.stringify({ level: lv }) }); }
+  catch { /* ignore */ }
 }
 function permMenuToggle() {
   const old = document.getElementById("perm-menu");
@@ -4685,12 +6756,14 @@ function permMenuToggle() {
   m.id = "perm-menu"; m.className = "perm-menu";
   m.innerHTML = PERM.levels.map((it) =>
     `<button type="button" data-lv="${esc(it.id)}" class="${it.id === PERM.level ? "on" : ""}">${esc(it.label)}</button>`
-  ).join("");
+  ).join("") + `<button type="button" class="perm-more" data-trust-open="1">信任面板…</button>`;
   document.body.appendChild(m);
   const r = b.getBoundingClientRect();
   m.style.left = Math.max(8, r.left) + "px";
   m.style.top = Math.max(8, r.top - m.offsetHeight - 6) + "px";
   m.addEventListener("click", (e) => {
+    const more = e.target.closest("button[data-trust-open]");
+    if (more) { m.remove(); trustOpen(true); return; }
     const t = e.target.closest("button[data-lv]");
     if (!t) return;
     setPermLevel(t.dataset.lv);
@@ -4705,6 +6778,208 @@ function permMenuToggle() {
     document.addEventListener("pointerdown", close, true);
   }, 0);
 }
+/* ---- ★信任面板（方向 3 第一块）：权限等级 / 待批准 / 最近「始终允许」 ----
+   三条红线：① 只读 + 展示为主（换等级是**逐档**点，不给"一键全放行"）；
+   ② 「谁批准了什么」要能追溯到**具体那条规则**（每条都能单独撤销）；
+   ③ 撤销复用现有接口（`/api/permission/always`、`/api/permission/level`），不另造一套。 */
+const TRUST = { open: false, busy: false, pend: [], pendErr: "",
+                always: null, alwaysErr: "", group: null };
+
+function trustIsOpen() { const b = $("trust"); return !!b && !b.hidden; }
+
+function trustOpen(open) {
+  const box = $("trust");
+  if (!box) return;
+  TRUST.open = !!open;
+  box.hidden = !open;
+  if (open) trustRefresh();
+}
+
+function trustClose() { trustOpen(false); }
+
+/** 每一档**实际**会自动放行什么（和后端 allowed_by_level / 前端 permAllowedByLevel 保持一致）。 */
+function trustLevelDesc(id) {
+  return {
+    ask:  "所有权限请求都弹出来问你（默认，最安全）",
+    read: "纯读 / 搜索 / 联网 自动放行；写、执行、工作区外仍会问",
+    edit: "再加「工作区内写」自动；执行、工作区外仍会问",
+    exec: "再加「工作区内执行」自动；工作区外仍会问（破坏性操作永远要确认）",
+    all:  "连工作区外也自动放行（破坏性操作仍要确认）。⚠ 2026-10-13 丢 21 个文件就在这个档",
+  }[id] || "";
+}
+
+function trustRender() {
+  // 当前等级
+  const cur = $("trust-cur");
+  if (cur) {
+    cur.innerHTML = `<span class="trust-cur-k">当前等级</span><b>${esc(permLevelLabel(PERM.level))}</b>`
+      + `<span class="trust-cur-a">面板 + 群聊 AI 成员共用这一份（<code>_perm_level.json</code> · 改完立刻生效）</span>`;
+  }
+  // 5 档
+  const lvBox = $("trust-levels");
+  if (lvBox) {
+    lvBox.innerHTML = PERM.levels.map((it, i) => `<button type="button"
+      class="trust-lv${it.id === PERM.level ? " on" : ""}${it.id === "all" ? " danger" : ""}"
+      data-lv="${esc(it.id)}" title="${esc(it.label)}">
+      <span class="trust-lv-n">${i + 1}</span>
+      <span class="trust-lv-t"><b>${esc(it.label)}</b><i>${esc(trustLevelDesc(it.id))}</i></span>
+      <span class="trust-lv-mark">${it.id === PERM.level ? "当前" : "切到这一档"}</span>
+    </button>`).join("");
+  }
+  // 待批准（当前会话 + 群聊）
+  const pbox = $("trust-pend");
+  const pnote = $("trust-pend-note");
+  if (pbox) {
+    const rows = [];
+    (TRUST.pend || []).forEach((pm) => {
+      const paths = (pm.resources || []).join("、");
+      rows.push(`<div class="trust-pend-row"><i>会话</i>`
+        + `<b>${esc(pm.action || pm.kind || "权限")}</b>`
+        + `<span title="${esc(paths || pm.message || "")}">${esc(paths || pm.message || "")}</span>`
+        + `<button type="button" data-trust-go="ask">去处理</button></div>`);
+    });
+    if (TRUST.group) {
+      const pr = ccPermParse(TRUST.group.content);
+      const who = ccPermAgent(TRUST.group);
+      rows.push(`<div class="trust-pend-row"><i>群聊</i>`
+        + `<b>${esc(who.label || who.name || "AI 成员")} · ${esc(pr.title)}</b>`
+        + `<span title="${esc(pr.paths || pr.cmd || "")}">${esc(pr.paths || pr.cmd || "")}</span>`
+        + `<button type="button" data-trust-go="chat">去群聊处理</button></div>`);
+    }
+    pbox.innerHTML = rows.length ? rows.join("") : `<div class="trust-empty">没有待批准的请求。</div>`;
+    if (pnote) {
+      pnote.textContent = TRUST.pendErr ? ("拿不到： " + TRUST.pendErr)
+        : ((TRUST.pend || []).length + (TRUST.group ? " + 群聊 1" : "") + " 条");
+    }
+  }
+  // 最近「始终允许」
+  const abox = $("trust-always");
+  if (abox) {
+    if (TRUST.always === null) {
+      abox.innerHTML = `<div class="trust-empty">${esc(TRUST.alwaysErr || "拿不到「始终允许」列表")}</div>`;
+    } else if (!(TRUST.always || []).length) {
+      abox.innerHTML = `<div class="trust-empty">还没有「始终允许」的记忆 —— 在权限弹窗里点「始终允许」才会记一条（默认只在本会话内有效）。</div>`;
+    } else {
+      abox.innerHTML = (TRUST.always || []).map((r) => {
+        const hit = (state.sessions || []).find((s) => String(s.id) === String(r.session));
+        const title = (hit && hit.title) || String(r.session || "").slice(0, 18) || "（不限会话）";
+        return `<div class="trust-alw-row">`
+          + `<span class="trust-alw-k">${esc(r.kind || "*")}</span>`
+          + `<span class="trust-alw-p" title="${esc(r.path || "")}">${esc(r.path || "（不限路径）")}</span>`
+          + `<span class="trust-alw-s" title="${esc(r.session || "")}">${esc(title)}</span>`
+          + `<span class="trust-alw-h">${esc(String(r.hits || 0))} 次</span>`
+          + `<span class="trust-alw-ts">${esc(fmtTime(r.ts))}</span>`
+          + `<button type="button" class="trust-alw-x" data-alw-del="${esc(r.id)}" title="撤销这条 —— 以后这类请求会重新问你">撤销</button>`
+          + `</div>`;
+      }).join("")
+        + `<div class="trust-alw-foot"><button type="button" data-alw-clear="1" title="只清当前 agent 的全部「始终允许」记忆">清空全部「始终允许」</button></div>`;
+    }
+  }
+}
+
+async function trustRefresh() {
+  if (TRUST.busy) return;
+  TRUST.busy = true;
+  try {
+    await loadPermLevel();
+    // 待批（当前会话）
+    TRUST.pend = []; TRUST.pendErr = "";
+    if (state.current) {
+      try {
+        const r = await api(`/api/session/${encodeURIComponent(state.current.id)}/permission`);
+        TRUST.pend = (r && r.data) || [];
+      } catch (e) { TRUST.pendErr = (e && e.message) || String(e); }
+    }
+    // 待批（群聊，从已有消息推；不额外问服务端）
+    TRUST.group = (typeof ccPermPending === "function" && CC.chatID) ? ccPermPending() : null;
+    // 最近「始终允许」（只有 ACP 引擎有这个接口）
+    try {
+      const r = await api("/api/permission/always");
+      TRUST.always = (r && r.data) || [];
+      TRUST.alwaysErr = "";
+    } catch (e) {
+      TRUST.always = null;
+      const msg = String((e && e.message) || e);
+      TRUST.alwaysErr = /^404/.test(msg)
+        ? "当前引擎不支持「始终允许」记忆（只有 ACP 引擎有；opencode 引擎没有这个接口）"
+        : ("拿不到「始终允许」列表：" + msg);
+    }
+    trustRender();
+  } finally {
+    TRUST.busy = false;
+  }
+}
+
+/** 切档：放宽到 exec / all 要二次确认（历史事故见 AGENTS 踩坑）；收紧不问。 */
+async function trustPickLevel(lv) {
+  if (!lv || lv === PERM.level) return;
+  const order = { ask: 0, read: 1, edit: 2, exec: 3, all: 4 };
+  const wider = (order[lv] || 0) > (order[PERM.level] || 0);
+  if (wider && (lv === "exec" || lv === "all")) {
+    const msg = lv === "all"
+      ? "「全部放行」= 连工作区外也自动放行（破坏性操作仍会确认）。\n2026-10-13 曾因等级过宽 + 盲目放行丢失 21 个文件。\n确定切到这一档？"
+      : "「读 + 改 + 执行」会在工作区内自动跑命令（删除等破坏性操作仍会确认）。\n确定切到这一档？";
+    if (!confirm(msg)) return;
+  }
+  await setPermLevel(lv);
+  trustRender();
+  setBanner("权限等级已切到：" + permLevelLabel(lv));
+}
+
+async function trustForget(id) {
+  try {
+    await api("/api/permission/always", { method: "DELETE", body: JSON.stringify({ id: id }) });
+    setBanner("已撤销一条「始终允许」—— 以后这类请求会重新问你");
+    await trustRefresh();
+  } catch (e) { setBanner("撤销失败：" + ((e && e.message) || e), { sticky: true }); }
+}
+
+async function trustForgetAll() {
+  if (!confirm("清空当前 agent 的全部「始终允许」记忆？以后这类请求都会重新问你（收紧，可随时再授权）。")) return;
+  try {
+    await api("/api/permission/always", { method: "DELETE", body: JSON.stringify({}) });
+    setBanner("已清空「始终允许」记忆");
+    await trustRefresh();
+  } catch (e) { setBanner("清空失败：" + ((e && e.message) || e), { sticky: true }); }
+}
+
+function initTrust() {
+  // 入口统一收在「权限 ▾」菜单底部（顶栏盾牌已按用户要求删除）
+  const close = $("trust-close");
+  if (close) close.addEventListener("click", trustClose);
+  const reload = $("trust-reload");
+  if (reload) reload.addEventListener("click", trustRefresh);
+  const tighten = $("trust-tighten");
+  if (tighten) tighten.addEventListener("click", async () => {
+    if (PERM.level === "ask") { setBanner("已经是「全部询问」了"); return; }
+    await setPermLevel("ask");
+    trustRender();
+    setBanner("已收紧到「全部询问」");
+  });
+  const box = $("trust");
+  if (box) {
+    box.addEventListener("click", (e) => {
+      if (e.target === box) { trustClose(); return; }
+      const lv = e.target.closest("[data-lv]");
+      if (lv && box.contains(lv)) { trustPickLevel(lv.dataset.lv); return; }
+      const go = e.target.closest("[data-trust-go]");
+      if (go) {
+        trustClose();
+        if (go.dataset.trustGo === "chat") {
+          try { setCocraft(true); ccPermRender(); } catch { /* 没登录就算了 */ }
+        } else {
+          try { pollAsks(); } catch { /* ignore */ }
+        }
+        return;
+      }
+      const del = e.target.closest("[data-alw-del]");
+      if (del) { trustForget(del.dataset.alwDel); return; }
+      if (e.target.closest("[data-alw-clear]")) { trustForgetAll(); }
+    });
+  }
+  window.addEventListener("keydown", (e) => { if (e.key === "Escape" && trustIsOpen()) trustClose(); });
+}
+
 /** 资源是不是都在当前工作区内。
  *  ⚠ **没给路径 → false（范围未知，不能算"区内"）** —— 与后端 `_in_dir` 逐条一致。
  *    2026-10-13 改：以前 fail-open（空=区内），codex 从不带路径 → 连"删桌面"都被当成区内自动放行。 */
@@ -4867,9 +7142,14 @@ let liveApply = null;           // initLiveBg 里赋值：设置一变就立刻�
 const SET_KEY = "cocraft.settings";
 const SET_DEFAULT = {
   dimHiru: 100, blur: 28, rate: 80,
+  zoom: 100,                         // ★界面缩放（%）：整页等比放大/缩小（文字/间距/图标一起）
   live: true, taskbar: true, spectrumSides: true, spectrumSidesH: 100, spectrumSidesGain: 120,
   petals: true, zh: true,
   glass: true,                       // ★液态玻璃皮肤（面板半透明磨砂 + 壁纸透出）
+  // ★可逆执行：每轮工作区快照（发消息前留底 → 「撤销这一轮」）。
+  //   ⚠ **默认关**（用户 2026-10-16 反馈：把整个工作区镜像进内容仓太重）——
+  //   关掉后**只保留破坏性操作的隔离区**（那条不走这个开关）。
+  turnSnap: false,
   // 空会话首屏那几行文案（留空 = 用自带的）
   heroL1: "", heroL2: "", heroCredit: "",
 };
@@ -4913,6 +7193,12 @@ function applySettings() {
   root.style.setProperty("--bg-dim", (SET.dimHiru / 100).toFixed(2));
   // ★统一的「模糊程度」—— 会话界面 / 消息气泡 / 群聊界面共用这一个值（0 = 全透明不模糊）
   root.style.setProperty("--g-blur", Math.max(0, SET.blur) + "px");
+  // ★界面缩放：整页等比（文字 / 间距 / 图标一起），像浏览器缩放那样。
+  //   `--ui-z` 是给 CSS 用的 —— `zoom` 会把 vw/vh 也一起放大（100vh 变 1.5 倍高 → 溢出），
+  //   所以 style.css 里所有视口相对单位都写成 `calc(N / var(--ui-z))` 除回来。
+  const _z = Math.max(0.5, Math.min(1.5, (Number(SET.zoom) || 100) / 100));
+  root.style.setProperty("--ui-z", String(_z));
+  root.style.zoom = String(_z);
   liveRate = Math.min(1.3, Math.max(0.5, SET.rate / 100));
   document.body.classList.toggle("no-petals", !SET.petals);
   root.classList.toggle("glass", !!SET.glass);               // ★液态玻璃皮肤：整页开关
@@ -4928,6 +7214,14 @@ function applySettings() {
   if (typeof drawSpectrum === "function") drawSpectrum();    // 开关后立刻画一次两侧音频条
   applyAppearance();                                         // 左上角头像（可能被用户换过）
   syncTaskbarPref();                                         // 通知守护进程：任务栏是否隐藏
+}
+
+/** 当前界面缩放倍率（1 = 100%）。
+ *  ★ CSS `zoom` 下：`getBoundingClientRect()` / `clientX` / `innerWidth` 给的是**真实像素**，
+ *    而 CSS 变量里的 px 是**设计像素**（渲染时还会被 zoom 再放大一次）→ 拖动/定位类交互
+ *    必须除以它换算，否则在非 100% 缩放下会错位（抽屉宽度、气泡球位置）。 */
+function uiZoom() {
+  return Math.max(0.5, Math.min(1.5, (Number(SET.zoom) || 100) / 100));
 }
 
 /** 改一项设置：落盘 → 生效 → 刷新设置面板 */
@@ -4953,6 +7247,14 @@ function engineOptionsHtml(ids) {
     const label = `${d.label || id}${ok ? "" : "（未就绪）"}`;
     return `<option value="${esc(id)}"${ok ? "" : " disabled"}>${esc(label)}</option>`;
   }).join("");
+}
+
+/** ★预热 ACP agent：冷启动实测 ~5.4s，热起来之后 ~0.5s。
+ *  服务端在「启动 / 切引擎 / 切 agent」时也会预热；这里补「服务早起了但 agent 进程已死」那个缺口。
+ *  只在引擎是 acp 时发，安静失败（预热只是加速，失败不影响任何功能）。 */
+function acpPrewarm() {
+  if (!ENGINE || ENGINE.active !== "acp") return;
+  api("/engine/acp/prewarm", { method: "POST" }).catch(() => {});
 }
 
 /** 拉取可用引擎并填充设置里的下拉；老后端没这些接口就优雅降级（禁用 + 说明） */
@@ -5017,6 +7319,7 @@ async function setEngine(id) {
     staticSig = null;
     liveShellSig = null;
     heroShown = false;
+    resetMsgPaging();
     renderAttachRow();
     $("session-title").textContent = "未选择会话";
     $("session-meta").textContent = "";
@@ -5057,6 +7360,7 @@ async function setEngine(id) {
     alert("切换引擎失败：" + err.message);
   }
   await loadEngineStatus();
+  acpPrewarm();                            // ★引擎是 acp 就先预热 agent 子进程（冷启动实测 ~5.4s）
 }
 
 /* ---------------- 模型 API Key（写进 ACP 共享基线；后端只回掩码）---------------- */
@@ -5495,6 +7799,12 @@ async function removeSkill(path) {
   }
 }
 
+/** 输入框左下角的「上下文 剩 X%」：点一下把详细用量打到横幅（悬停也有 tooltip）。 */
+function initCtxChip() {
+  const b = $("ctx-chip");
+  if (b) b.addEventListener("click", ctxShowInfo);
+}
+
 function initSkillPicker() {
   const b = $("btn-skill");
   if (b) b.addEventListener("click", () => ($("skill").hidden ? openSkills() : closeSkills()));
@@ -5553,6 +7863,312 @@ async function openImport() {
 }
 
 function closeImport() { const b = $("import"); if (b) b.hidden = true; }
+
+/* ---------------- ★可逆执行：隔离区（工具 → 隔离区） ----------------
+ * 破坏性操作**放行前**先把要动的目标复制进 runtime/quarantine/（见 backend/snapshots.py）。
+ * 这里只做三件事：列出 / 一键恢复 / 删除记录（「撤销这一轮」建在同一个快照底座上，后续接）。 */
+
+const QUAR = { items: [], stats: null, err: "", busy: false };
+
+async function quarOpen() {
+  const box = $("quar");
+  if (!box) return;
+  box.hidden = false;
+  await quarLoad();
+}
+
+function quarClose() { const b = $("quar"); if (b) b.hidden = true; }
+
+async function quarLoad() {
+  const list = $("quar-list");
+  if (list) list.innerHTML = `<div class="muted" style="padding:10px">读取中…</div>`;
+  try {
+    const r = unwrap(await api("/quarantine/list")) || {};
+    QUAR.items = r.items || [];
+    QUAR.stats = r.stats || null;
+    QUAR.err = "";
+  } catch (e) {
+    QUAR.items = [];
+    QUAR.stats = null;
+    QUAR.err = (e && e.message) ? e.message : String(e);
+  }
+  renderQuar();
+}
+
+function quarWhen(ts) {
+  const t = Number(ts || 0) * 1000;
+  if (!t) return "";
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderQuar() {
+  const box = $("quar-list");
+  const foot = $("quar-foot");
+  if (!box) return;
+  if (QUAR.err) {
+    box.innerHTML = `<div class="muted" style="padding:10px">读取失败：${esc(QUAR.err)}</div>`;
+    if (foot) foot.textContent = "";
+    return;
+  }
+  const items = QUAR.items || [];
+  const st = QUAR.stats || {};
+  if (foot) {
+    foot.textContent = st.quarantine_dir
+      ? `共 ${items.length} 条记录 · 隔离区占用 ${fmtBytes(st.quarantine || 0)}（${st.quarantine_dir}）`
+      : `共 ${items.length} 条记录`;
+  }
+  if (!items.length) {
+    box.innerHTML = `<div class="muted" style="padding:10px">还没有隔离记录。<br>`
+      + `群聊里的 AI 成员执行**破坏性操作**时，放行前会把要动的文件备份到这里（面板侧的直接操作暂未接入）。</div>`;
+    return;
+  }
+  box.innerHTML = items.map((it) => {
+    const missed = Number(it.missed || 0);
+    return `<div class="q-row" data-qid="${esc(it.id)}">
+      <div class="q-top">
+        <b>🛡 ${it.count} 项</b>
+        <span class="q-size">${fmtBytes(it.bytes || 0)}</span>
+        <span class="q-time" title="${esc(it.ts || "")}">${esc(quarWhen(it.taken_at))}</span>
+      </div>
+      <div class="q-note">${esc(it.note || "（无说明）")}</div>
+      ${it.cmd ? `<div class="q-cmd mono" title="${esc(it.cmd)}">${esc(it.cmd)}</div>` : ""}
+      ${missed ? `<div class="q-warn">⚠️ 另有 ${missed} 项没保住（太大 / 不存在 / 范围过大）—— 这几项找不回来</div>` : ""}
+      <div class="q-acts">
+        <button type="button" class="q-restore" data-qrestore="${esc(it.id)}"
+          title="把备份放回原路径（目标已存在则不覆盖）">恢复全部</button>
+        <button type="button" class="q-drop" data-qdrop="${esc(it.id)}" title="删掉这条隔离记录（**永久**，之后再也恢复不了）">删除记录</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function quarRestore(qid, override = false) {
+  if (QUAR.busy) return;
+  QUAR.busy = true;
+  try {
+    const r = await api("/quarantine/restore", { method: "POST",
+      body: JSON.stringify({ id: qid, override }) });
+    const n = Number(r.restored || 0);
+    const cf = Number(r.conflict || 0);
+    const bad = Number(r.failed || 0) + Number(r.missing || 0);
+    if (cf && !override) {
+      if (confirm(`有 ${cf} 项的目标位置**已经有文件**了（可能被重建过）。\n`
+        + `要用隔离区的备份**覆盖**它们吗？（取消 = 保留现在的文件）`)) {
+        QUAR.busy = false;
+        return quarRestore(qid, true);
+      }
+      setBanner(`已恢复 ${n} 项；${cf} 项因目标已存在跳过（保留现在的文件）`);
+    } else {
+      setBanner(`已恢复 ${n} 项` + (cf ? `，覆盖 ${cf} 项` : "") + (bad ? `，失败/缺失 ${bad} 项` : ""));
+    }
+    await quarLoad();
+  } catch (e) {
+    setBanner("恢复失败：" + (e && e.message ? e.message : e), { sticky: true });
+  } finally {
+    QUAR.busy = false;
+  }
+}
+
+async function quarDrop(qid) {
+  if (!confirm("删掉这条隔离记录？备份会被**永久**删除，之后再也恢复不了。")) return;
+  try {
+    await api("/quarantine/drop", { method: "POST", body: JSON.stringify({ id: qid }) });
+    setBanner("已删除那条隔离记录");
+    await quarLoad();
+  } catch (e) {
+    setBanner("删除失败：" + (e && e.message ? e.message : e));
+  }
+}
+
+/* ---------------- ★可逆执行：「撤销这一轮」（工具 → 撤销这一轮） ----------------
+ * 每发一条消息、**在 prompt 之前**给会话工作目录落一次快照（后端 `/snapshot/take`，走 hash 缓存，热扫 ~10ms）。
+ * 这里显示「这一轮改了哪些文件」→ 点开看行级 diff → 一键退回（后端 `/snapshot/undo`）。 */
+
+const UNDO = { scope: "", root: "", ts: "", diff: null, err: "", busy: false, note: "" };
+
+/** 轮开始落快照。**失败绝不挡住发消息**（返回 null）。开关关着就直接跳过。 */
+async function snapTurnStart(sid, dir) {
+  if (!SET.turnSnap) return null;      // ★默认关：只留破坏性操作的隔离区
+  if (!sid || !dir) return null;
+  try {
+    const r = unwrap(await api("/snapshot/take", { method: "POST",
+      body: JSON.stringify({ root: dir, scope: String(sid), label: "turn", content: true }) }));
+    if (r && r.ts) {
+      UNDO.scope = String(sid); UNDO.root = dir; UNDO.ts = r.ts;
+    }
+    return r;
+  } catch (e) {
+    return null;                       // 安静失败：快照只是安全网，不该挡住干活
+  }
+}
+
+async function undoOpen() {
+  const box = $("undo");
+  if (!box) return;
+  box.hidden = false;
+  await undoLoad();
+}
+
+function undoClose() { const b = $("undo"); if (b) b.hidden = true; }
+
+async function undoLoad() {
+  const list = $("undo-list");
+  if (list) list.innerHTML = `<div class="muted" style="padding:10px">对比中…</div>`;
+  UNDO.diff = null;
+  UNDO.err = "";
+  UNDO.note = "";
+  UNDO.ts = "";                        // ★ 先清掉：否则"这次没有快照"时按钮还是可点的
+  UNDO.scope = state.current ? String(state.current.id) : "";
+  UNDO.root = currentDir();
+  if (!UNDO.scope) {
+    UNDO.err = "先选一个会话 —— 「撤销这一轮」是**按会话**记的。";
+    renderUndo();
+    return;
+  }
+  if (!UNDO.root) {
+    UNDO.err = "这个会话没有工作目录，没法对比工作区。";
+    renderUndo();
+    return;
+  }
+  try {
+    const lst = unwrap(await api(`/snapshot/list?scope=${encodeURIComponent(UNDO.scope)}`));
+    const latest = ((lst && lst.items) || [])[0];
+    if (!latest) {
+      UNDO.note = SET.turnSnap
+        ? "还没有快照 —— 发出第一条消息时面板会自动记录一次。"
+        : "还没有快照。「每轮工作区快照」现在是关着的 —— 在 设置 →「每轮工作区快照」打开它，"
+          + "之后每发一条消息就会先留一次底；破坏性操作的隔离区不受这个开关影响。";
+      renderUndo();
+      return;
+    }
+    UNDO.ts = latest.ts;
+    const d = unwrap(await api(`/snapshot/diff?scope=${encodeURIComponent(UNDO.scope)}`
+      + `&root=${encodeURIComponent(UNDO.root)}`));
+    UNDO.diff = d;
+  } catch (e) {
+    UNDO.err = (e && e.message) ? e.message : String(e);
+  }
+  renderUndo();
+}
+
+function undoWhen(ts) {
+  const t = Number(ts || 0);
+  if (!t) return "";
+  const d = new Date(t * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 一行改动：⚠ 不给它生成"按路径拼出来的 id" —— `getElementById` 收到的是**字面量**，
+ *  用 `CSS.escape()` 转义过的字符串必然找不到元素（这次踩到过）。diff 块就取它的**下一个兄弟**。 */
+function undoRow(kind, cls, label, extra, rel) {
+  return `<div class="u-row" data-upath="${esc(rel)}" data-ukind="${esc(kind)}">
+    <span class="u-kind ${cls}">${label}</span>
+    <span class="u-path" title="${esc(rel)}">${esc(rel)}</span>
+    <span class="u-meta">${extra || ""}</span>
+  </div>`;
+}
+
+function renderUndo() {
+  const box = $("undo-list");
+  const foot = $("undo-foot");
+  const runBtn = $("undo-run");
+  if (!box) return;
+  if (runBtn) runBtn.disabled = !!UNDO.busy || !UNDO.ts;
+  if (UNDO.err) {
+    box.innerHTML = `<div class="muted" style="padding:10px">${esc(UNDO.err)}</div>`;
+    if (foot) foot.textContent = "";
+    return;
+  }
+  if (UNDO.note) {
+    box.innerHTML = `<div class="muted" style="padding:10px">${esc(UNDO.note)}</div>`;
+    if (foot) foot.textContent = "工作目录：" + (UNDO.root || "");
+    return;
+  }
+  const d = UNDO.diff || {};
+  const st = d.stats || {};
+  const n = (st.added || 0) + (st.deleted || 0) + (st.changed || 0) + (st.renamed || 0);
+  if (foot) {
+    foot.textContent = n
+      ? `这一轮：改 ${st.changed || 0} · 增 ${st.added || 0} · 删 ${st.deleted || 0}`
+        + ` · 改名 ${st.renamed || 0}（基准 ${undoWhen(st.base_at)}）`
+      : `没有改动（基准 ${undoWhen(st.base_at)}）· ${UNDO.root}`;
+  }
+  if (!n) {
+    box.innerHTML = `<div class="muted" style="padding:10px">`
+      + `工作区**没有变化** —— 这一轮 agent 没动文件（只聊了天 / 只跑了只读命令）。</div>`;
+    return;
+  }
+  let html = "";
+  const row = (kind, cls, label, extra, rel) =>
+    undoRow(kind, cls, label, extra, rel) + `<div class="u-diff" hidden></div>`;
+  for (const x of (d.changed || [])) {
+    const dl = Number(x.size_before || 0) - Number(x.size || 0);
+    html += row("changed", "ch", "改", `${dl === 0 ? "" : (dl > 0 ? "−" + dl + " B" : "+" + (-dl) + " B")}`, x.path);
+  }
+  for (const x of (d.added || [])) html += row("added", "ad", "增", fmtBytes(x.size || 0), x.path);
+  for (const x of (d.deleted || [])) html += row("deleted", "dl", "删", fmtBytes(x.size || 0), x.path);
+  for (const x of (d.renamed || [])) html += row("renamed", "mv", "名", esc(x.from || ""), x.to);
+  box.innerHTML = html;
+}
+
+/** 点一行：展开 / 收起该文件的行级 diff（diff 块 = 这一行的下一个兄弟）。 */
+async function undoToggleFile(rowEl) {
+  if (!rowEl) return;
+  const rel = rowEl.dataset.upath || "";
+  const box = rowEl.nextElementSibling;
+  if (!box || !box.classList.contains("u-diff")) return;
+  if (!box.hidden) {
+    box.hidden = true;
+    rowEl.classList.remove("open");
+    return;
+  }
+  rowEl.classList.add("open");
+  box.hidden = false;
+  await undoLoadFile(box, rel);
+}
+
+async function undoLoadFile(box, rel) {
+  if (!box) return;
+  box.hidden = false;
+  if (box.dataset.loaded === "1") return;
+  box.innerHTML = `<div class="muted" style="padding:6px 0">读取…</div>`;
+  try {
+    const r = unwrap(await api(`/snapshot/file?scope=${encodeURIComponent(UNDO.scope)}`
+      + `&ts=${encodeURIComponent(UNDO.ts)}&path=${encodeURIComponent(rel)}`));
+    if (r && r.ok && r.lines && r.lines.length) {
+      box.innerHTML = renderDiff(r.lines.join("\n"));
+      box.dataset.loaded = "1";
+    } else {
+      box.innerHTML = `<div class="muted" style="padding:6px 0">${esc((r && r.reason) || "拿不到行级 diff")}</div>`;
+    }
+  } catch (e) {
+    box.innerHTML = `<div class="muted" style="padding:6px 0">读取失败：${esc(e && e.message ? e.message : e)}</div>`;
+  }
+}
+
+async function undoRun() {
+  if (UNDO.busy || !UNDO.ts) return;
+  if (!confirm(`把「${UNDO.root}」退回这一轮开始时的状态？\n\n`
+    + `被删的会恢复、被改的写回旧内容、这一轮新增的会被删掉\n`
+    + `（新增的文件会先自动进隔离区，所以撤销本身也可以再撤回来）`)) return;
+  UNDO.busy = true;
+  renderUndo();
+  try {
+    const r = await api("/snapshot/undo", { method: "POST",
+      body: JSON.stringify({ scope: UNDO.scope, ts: UNDO.ts }) });
+    setBanner(`已撤销这一轮：恢复 ${r.restored || 0} · 删掉新增 ${r.removed || 0}`
+      + ((r.skipped || 0) ? ` · 跳过 ${r.skipped}（内容仓里没有那一版）` : ""));
+    UNDO.busy = false;
+    await undoLoad();
+  } catch (e) {
+    UNDO.busy = false;
+    setBanner("撤销失败：" + (e && e.message ? e.message : e));
+    renderUndo();
+  }
+}
 
 async function loadImport() {
   try {
@@ -5868,8 +8484,124 @@ function openAgentsNew() {
   $("agents-new").hidden = false;
   renderCandidates();
   loadCandidates();
+  loadInstallCatalog();          // ★面板内安装：先拉「能装什么 / 装过没有」
 }
-function closeAgentsNew() { $("agents-new").hidden = true; }
+function closeAgentsNew() {
+  $("agents-new").hidden = true;
+  AINST.stop();                  // 关掉弹窗就别再轮询安装进度（装还是会继续）
+}
+
+/* ---------------- ★面板内安装 Agent（联网 npm；装到 agents\npm\<id>） ---------------- */
+
+const AINST = {
+  items: [], job: null, timer: null, err: "",
+  stop() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } },
+};
+
+async function loadInstallCatalog() {
+  const note = $("anew-i-note");
+  try {
+    const r = unwrap(await api("/agent/catalog")) || {};
+    AINST.items = r.items || [];
+    AINST.err = "";
+    if (r.status && r.status.busy) { AINST.job = r.status; AINST.poll(); }
+    else if (r.status && r.status.phase) AINST.job = r.status;
+    if (note) {
+      note.textContent = (r.root ? "装到 " + r.root + " · " : "")
+        + "需要 Node（随包自带）；国内会自动走镜像";
+    }
+  } catch (e) {
+    AINST.items = [];
+    AINST.err = (e && e.message) ? e.message : String(e);
+    if (note) note.textContent = "读不到安装目录：" + AINST.err;
+  }
+  renderInstallCatalog();
+  renderInstallLog();
+}
+
+function renderInstallCatalog() {
+  const box = $("anew-i-list");
+  if (!box) return;
+  if (!AINST.items.length) {
+    box.innerHTML = `<div class="muted" style="padding:4px 0">${esc(AINST.err || "没有可安装项")}</div>`;
+    return;
+  }
+  const busy = !!(AINST.job && AINST.job.busy);
+  box.innerHTML = AINST.items.map((it) => {
+    const tag = it.installed
+      ? `<span class="anew-i-tag ok">已装</span>`
+      : (it.ready ? "" : `<span class="anew-i-tag bad">缺 Node</span>`);
+    const btn = it.installed
+      ? `<button type="button" class="anew-i-b" data-ainst-off="${esc(it.id)}" title="从注册表移除并删掉装的文件">卸载</button>`
+      : `<button type="button" class="anew-i-b" data-ainst-go="${esc(it.id)}"${(busy || !it.ready) ? " disabled" : ""}>安装</button>`;
+    return `<div class="anew-i-row">`
+      + `<b>${esc(it.label)}</b>${tag}`
+      + `<span class="anew-i-pkg" title="${esc(it.pkg)}">${esc(it.pkg)}</span>`
+      + `<span class="anew-i-note" title="${esc(it.note)}">${esc(it.note)}</span>`
+      + btn + `</div>`;
+  }).join("");
+}
+
+function renderInstallLog() {
+  const box = $("anew-i-log");
+  if (!box) return;
+  const j = AINST.job;
+  if (!j || (!j.busy && !j.phase)) { box.hidden = true; box.innerHTML = ""; return; }
+  const lines = (j.log || []).slice(-8);
+  const head = j.busy ? `正在安装 · ${esc(j.id)}（${esc(j.phase || "…")}）`
+    : (j.ok ? `装好了：${esc(j.agent || j.id)}` : `安装失败（${esc(j.error || j.phase || "")}）`);
+  box.innerHTML = `<div class="anew-i-lh${j.ok ? " ok" : (j.busy ? "" : " bad")}">${head}</div>`
+    + `<pre class="anew-i-pre">${esc(lines.join("\n") || "…")}</pre>`;
+  box.hidden = false;
+}
+
+/** 轮询安装进度（装完自动刷新目录 + agentlist）。 */
+function AINST_poll() {
+  AINST.stop();
+  AINST.timer = setTimeout(async () => {
+    try {
+      const j = unwrap(await api("/agent/install/status")) || {};
+      AINST.job = j;
+      renderInstallLog();
+      if (j.busy) { AINST_poll(); return; }
+      // 装完 / 失败 → 刷新两处
+      await loadInstallCatalog();
+      if (j.ok) {
+        await loadAcpAgents();
+        setBanner(`已安装并注册：${j.agent || j.id}（可以在「选择 Agent」里切过去）`);
+      } else if (j.error) {
+        setBanner("安装失败：" + j.error, { sticky: true });
+      }
+    } catch (e) {
+      AINST.stop();
+    }
+  }, 1000);
+}
+AINST.poll = AINST_poll;
+
+async function agentInstall(id) {
+  try {
+    await api("/agent/install", { method: "POST", body: JSON.stringify({ id: id }) });
+    AINST.job = { busy: true, id: id, phase: "准备", log: [] };
+    renderInstallCatalog();
+    renderInstallLog();
+    AINST_poll();
+  } catch (e) {
+    setBanner("安装失败：" + (e && e.message ? e.message : e), { sticky: true });
+  }
+}
+
+async function agentUninstall(id) {
+  if (!confirm("卸载这个 agent？会从 agentlist 移除，并删掉它装出来的文件。")) return;
+  try {
+    await api("/agent/uninstall", { method: "POST", body: JSON.stringify({ id: id }) });
+    setBanner("已卸载：" + id);
+    await loadInstallCatalog();
+    await loadAcpAgents();
+  } catch (e) {
+    setBanner("卸载失败：" + (e && e.message ? e.message : e), { sticky: true });
+  }
+}
 
 /** 「扫描本机」：POST {action:"scan"} → 本机发现报告（含已登记 / 可用性 / 客户端缺适配器提示） */
 async function loadCandidates() {
@@ -6053,6 +8785,7 @@ async function resetAfterAgentSwitch(msg) {
   staticSig = null;
   liveShellSig = null;
   heroShown = false;
+  resetMsgPaging();
   renderAttachRow();
   $("session-title").textContent = "未选择会话";
   $("session-meta").textContent = "";
@@ -6073,6 +8806,7 @@ async function pickAgent(id) {
     ACP.list = (r && r.agents) || ACP.list;
     updateAcpRow();
     renderAgents();
+    acpPrewarm();                          // ★换了大脑 → 提前把新 agent 的子进程热起来
     if (prev !== ACP.active && ENGINE.active === "acp") {
       closeAgents();
       await resetAfterAgentSwitch(`已切换 ACP 代理：${ACP.active}`);
@@ -6184,11 +8918,13 @@ function renderSettings() {
   });
   put("cfg-dim-hiru", SET.dimHiru, SET.dimHiru + "%");
   put("cfg-blur", SET.blur, SET.blur + "px");
+  put("cfg-zoom", SET.zoom, SET.zoom + "%");
   put("cfg-rate", SET.rate, (SET.rate / 100).toFixed(2) + "×");
   put("cfg-spec-h", SET.spectrumSidesH, SET.spectrumSidesH + "%");
   put("cfg-spec-gain", SET.spectrumSidesGain, SET.spectrumSidesGain + "%");
   [["cfg-live", SET.live], ["cfg-taskbar", SET.taskbar], ["cfg-spec-sides", SET.spectrumSides],
-   ["cfg-petals", SET.petals], ["cfg-zh", SET.zh], ["cfg-glass", SET.glass]].forEach(([id, on]) => {
+   ["cfg-petals", SET.petals], ["cfg-zh", SET.zh], ["cfg-glass", SET.glass],
+   ["cfg-turnsnap", SET.turnSnap]].forEach(([id, on]) => {
     const b = $(id);
     if (!b) return;
     b.classList.toggle("on", !!on);
@@ -6233,7 +8969,20 @@ function cfgClose() {
   syncDrawerOverlap();
 }
 
+/** ★设置项里的「说明」收进 tooltip：面板上只留标题，**鼠标悬停那一行**才显示（别把面板塞满碎碎念）。
+ *  动态状态（当前引擎 / 更新进度 / 面板窗口说明…）在 index.html 里带 `data-live`，保持原样可见。
+ *  对所有 `.cfg-row`（设置抽屉 / 新建会话 / agent 编辑 / 首次向导）都生效。 */
+function initCfgNotes() {
+  document.querySelectorAll(".cfg-row > label > i:not([data-live])").forEach((el) => {
+    const row = el.closest(".cfg-row");
+    const txt = String(el.textContent || "").trim();
+    if (row && txt) row.title = txt;        // 放到整行上：悬停该行任何位置都能看到
+    el.remove();                            // 从版面上彻底拿掉，不再占位
+  });
+}
+
 function initSettings() {
+  initCfgNotes();                           // ★说明收进悬停 tooltip
   const close = () => cfgClose();
   const open = () => {
     cfgOpen();
@@ -6265,7 +9014,8 @@ function initSettings() {
     });
     grip.addEventListener("pointermove", (e) => {
       if (!dragging) return;
-      const w = Math.max(320, Math.min(window.innerWidth - 300, window.innerWidth - e.clientX));
+      const w = Math.max(320, Math.min((window.innerWidth - 300) / uiZoom(),
+                                       (window.innerWidth - e.clientX) / uiZoom()));
       document.documentElement.style.setProperty("--cfg-w", w + "px");
     });
     const stop = () => {
@@ -6320,6 +9070,13 @@ function initSettings() {
   $("anew-reload").addEventListener("click", loadCandidates);
   $("anew-folder").addEventListener("click", addFromFolder);
   $("anew-addall").addEventListener("click", addAllCandidates);
+  // ★面板内安装 agent：点「安装」/「卸载」
+  $("anew-i-list").addEventListener("click", (e) => {
+    const go = e.target.closest && e.target.closest("[data-ainst-go]");
+    if (go && !go.disabled) { agentInstall(go.dataset.ainstGo); return; }
+    const off = e.target.closest && e.target.closest("[data-ainst-off]");
+    if (off) agentUninstall(off.dataset.ainstOff);
+  });
   $("agents-reload").addEventListener("click", loadAcpAgents);
   $("agents-detect").addEventListener("click", detectAgents);
   $("agents-edit").addEventListener("click", editAgentCommand);
@@ -6365,6 +9122,32 @@ function initSettings() {
     const row = e.target.closest("[data-imp]");
     if (row) doImport(row.dataset.imp);
   });
+  $("quar-close").addEventListener("click", quarClose);
+  $("quar-reload").addEventListener("click", quarLoad);
+  $("quar").addEventListener("click", (e) => { if (e.target === $("quar")) quarClose(); });
+  $("quar-open").addEventListener("click", async () => {
+    const dir = (QUAR.stats && QUAR.stats.quarantine_dir) || "";
+    if (!dir) { setBanner("隔离区目录还没生成（还没隔离过任何东西）"); return; }
+    try {
+      await api("/open/dir", { method: "POST", body: JSON.stringify({ what: "explorer", dir }) });
+    } catch (e) {
+      setBanner("打开失败：" + (e && e.message ? e.message : e));
+    }
+  });
+  $("quar-list").addEventListener("click", (e) => {
+    const r = e.target.closest("[data-qrestore]");
+    if (r) { quarRestore(r.dataset.qrestore); return; }
+    const d = e.target.closest("[data-qdrop]");
+    if (d) quarDrop(d.dataset.qdrop);
+  });
+  $("undo-close").addEventListener("click", undoClose);
+  $("undo-reload").addEventListener("click", undoLoad);
+  $("undo-run").addEventListener("click", undoRun);
+  $("undo").addEventListener("click", (e) => { if (e.target === $("undo")) undoClose(); });
+  $("undo-list").addEventListener("click", (e) => {
+    const row = e.target.closest("[data-upath]");
+    if (row) undoToggleFile(row);
+  });
   $("cfg-key-save").addEventListener("click", () => saveApiKey("cfg"));
   $("setup-key-save").addEventListener("click", () => saveApiKey("setup"));
   $("ae-close").addEventListener("click", closeAgentEdit);
@@ -6374,6 +9157,8 @@ function initSettings() {
   $("agent-edit").addEventListener("click", (e) => { if (e.target === $("agent-edit")) closeAgentEdit(); });
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    if (!$("quar").hidden) { quarClose(); return; }
+    if (!$("undo").hidden) { undoClose(); return; }
     if (!$("mode").hidden) { closeModes(); return; }
     if (!$("import").hidden) { closeImport(); return; }
     if (!$("agent-edit").hidden) { closeAgentEdit(); return; }
@@ -6382,6 +9167,7 @@ function initSettings() {
   });
   $("cfg-dim-hiru").addEventListener("input", (e) => setSetting("dimHiru", Number(e.target.value)));
   $("cfg-blur").addEventListener("input", (e) => setSetting("blur", Number(e.target.value)));
+  $("cfg-zoom").addEventListener("input", (e) => setSetting("zoom", Number(e.target.value)));
   $("cfg-rate").addEventListener("input", (e) => setSetting("rate", Number(e.target.value)));
   $("cfg-live").addEventListener("click", () => setSetting("live", !SET.live));
   $("cfg-taskbar").addEventListener("click", () => setSetting("taskbar", !SET.taskbar));
@@ -6402,6 +9188,12 @@ function initSettings() {
   $("cfg-spec-gain").addEventListener("input", (e) => setSetting("spectrumSidesGain", Number(e.target.value)));
   $("cfg-petals").addEventListener("click", () => setSetting("petals", !SET.petals));
   $("cfg-glass").addEventListener("click", () => setSetting("glass", !SET.glass));
+  $("cfg-turnsnap").addEventListener("click", () => {
+    setSetting("turnSnap", !SET.turnSnap);
+    setBanner(SET.turnSnap
+      ? "已打开「每轮工作区快照」：下次发消息前会先给工作目录留一次底（工具 →「撤销这一轮」）"
+      : "已关闭「每轮工作区快照」：只保留破坏性操作的隔离区");
+  });
   $("cfg-zh").addEventListener("click", () => {
     setSetting("zh", !SET.zh);
     MUSIC.lyrKey = "";                       // 开关变了要重新取一次歌词（tr=0/1 不同）
@@ -7102,7 +9894,10 @@ async function musicPlay(id, opts = {}) {
     id,
   };
   MUSIC.panelError = "";
-  if (!MUSIC.shown) { MUSIC.shown = true; try { localStorage.setItem("cocraft.player.shown", "1"); } catch (e) { /* ignore */ } }
+  // 播放条默认不显示（选「音乐」才出现）。⚠ 恢复上次曲目时不要把它顶开：
+  // 刷新页面会调 restoreMusicState() → musicPlay()，若这里强行 shown=true，
+  // 就会变成「每次刷新面板都自动弹出音乐条」（0.1.67 修）。
+  if (!opts.keepShown && !MUSIC.shown) { MUSIC.shown = true; try { localStorage.setItem("cocraft.player.shown2", "1"); } catch (e) { /* ignore */ } }
   if (MUS.homeOpen) hideBarResults();
   else renderBarResults();
   renderHome();
@@ -7176,7 +9971,7 @@ async function musicNext(auto, dir = 1) {
 
   // 单曲循环：自然放完就重放当前曲（随机开启时随机优先）
   if (auto && dir > 0 && !MUS.shuffle && MUS.loop === "one" && idx >= 0) {
-    return await musicPlay(list[idx].id, { play: true });
+    return await musicPlay(list[idx].id, { play: true, keepShown: !!auto });
   }
 
   for (let tries = 0; tries < total; tries++) {
@@ -7189,7 +9984,8 @@ async function musicNext(auto, dir = 1) {
       if (auto && dir > 0 && MUS.loop === "off" && next >= total) return false;  // 到队尾且不循环 → 停
       n = ((next % total) + total) % total;
     }
-    const ok = await musicPlay(list[n].id, { play: true });
+    // 自动续播（auto）不把播放条顶开：用户可能特意关掉了条形、只留着听
+    const ok = await musicPlay(list[n].id, { play: true, keepShown: !!auto });
     if (ok) return true;
     idx = n;
   }
@@ -7246,6 +10042,7 @@ async function restoreMusicState() {
     play: !!st.wasPlaying,
     position: Number(st.pos) || 0,
     silent: true,
+    keepShown: true,        // 恢复上次曲目 ≠ 要显示播放条（条形状态由用户上次的开/关决定）
   });
 }
 
@@ -7656,6 +10453,40 @@ function initModelPicker() {
 /* ---------------- 事件绑定 / 启动 ---------------- */
 
 $("session-list").addEventListener("click", (e) => {
+  // ★项目文件树（先判，别让它同时触发"打开会话"）
+  const tb = e.target.closest(".tree-btn");
+  if (tb) {
+    e.preventDefault();
+    e.stopPropagation();
+    sessionTreeToggle(tb.dataset.tree);
+    return;
+  }
+  const sdir = e.target.closest("[data-sdir]");            // 展开/收起子目录（懒加载）
+  if (sdir) {
+    e.preventDefault();
+    e.stopPropagation();
+    const host = sdir.closest(".session-tree");
+    const root = host ? host.dataset.root : "";
+    const path = sdir.dataset.sdir;
+    if (!root || !path) return;
+    const ex = (state.treeExp[root] = state.treeExp[root] || {});
+    ex[path] = !ex[path];
+    renderSessionTrees();
+    const d = state.treeData[root] || {};
+    if (ex[path] && d[path] === undefined) sessionTreeLoad(root, path);
+    return;
+  }
+  const sfile = e.target.closest("[data-sfile]");          // 点文件 → 编码模式里打开
+  if (sfile) {
+    e.preventDefault();
+    e.stopPropagation();
+    const host = sfile.closest(".session-tree");
+    const root = host ? host.dataset.root : "";
+    if (root) codeOpenAt(root, sfile.dataset.sfile);
+    return;
+  }
+  // 树 / 详情里的空白处：不算"打开会话"
+  if (e.target.closest(".session-tree") || e.target.closest(".det")) return;
   const info = e.target.closest(".info");          // 详情展开按钮：先判断，别让它同时触发"打开会话"
   if (info) {
     e.preventDefault();
@@ -7705,13 +10536,25 @@ $("input").addEventListener("input", (e) => {
   e.target.style.height = Math.min(e.target.scrollHeight, 200) + "px";
 });
 
-// 跟随策略：默认一路往下跟着最新内容；用户手动往上滚就暂停跟随，滚回底部再恢复
+// 跟随策略：默认一路往下跟着最新内容；离开底部就暂停跟随，滚回底部再恢复。
+// ⚠ 原来只在 wheel 时置 false（拖滚动条 / 键盘翻页不会触发 wheel）→ 往上读历史时
+//   一有增量就被拽回底部。现在按"离底部的距离"判，够不着底部就不再跟随。
 $("messages").addEventListener("wheel", (e) => {
   if (e.deltaY < 0) state.follow = false;
 });
 $("messages").addEventListener("scroll", () => {
   const b = $("messages");
-  if (b.scrollHeight - b.scrollTop - b.clientHeight < 60) state.follow = true;
+  if (!b) return;
+  const top = b.scrollTop;
+  const prev = histLastTop;
+  histLastTop = top;
+  state.follow = (b.scrollHeight - top - b.clientHeight) < 60;
+  // ★往上翻页：滚到顶附近、且这次确实是"往上"滚的（首屏渲染时 scrollTop 从 0 跳到最底，不算）
+  if (top <= MSG_TOP_TRIGGER && top < prev) maybeLoadHistory();
+});
+// 「↑ 加载更早的消息」按钮（内容会被重建，所以用事件委托挂在容器上）
+$("msg-more").addEventListener("click", (e) => {
+  if (e.target.closest(".mm-btn")) loadHistory();
 });
 
 /* ============================================================================
@@ -8505,6 +11348,27 @@ function codeOpen() {
   syncDrawerOverlap();
 }
 
+/** ★从**会话列表的文件树**打开：指定根目录 + 文件（不依赖「当前会话目录」）。
+ *  ⚠ 先把上一个文件挂起的自动保存补交掉 —— `codeResetTo()` 会清掉编辑器，别静默丢改动。 */
+async function codeOpenAt(root, path) {
+  if (CODE.open && CODE.dirty) {
+    await codeFlushSave();
+    if (CODE.dirty && !confirm("上一个文件还有没保存的改动，仍要打开这个文件吗？")) return;
+  }
+  try { if (typeof MUS !== "undefined" && MUS.homeOpen) closeMusicHome(); } catch { /* ignore */ }
+  try { if (cocraftIsOpen()) setCocraft(false); } catch { /* ignore */ }   // 都是右侧抽屉 → 互斥
+  const box = $("code");
+  if (box) { box.classList.add("open"); box.setAttribute("aria-hidden", "false"); }
+  document.documentElement.classList.add("code-open");     // 分屏：面板内容让位
+  CODE.open = true;
+  syncToolsBtn();
+  { const ml = $("code-menu-list"); if (ml) ml.hidden = true; }
+  codeResetTo(root);
+  syncDrawerOverlap();
+  await codeOpenFile(path);
+  renderSessionTrees();          // 把左侧树里「当前打开的那个文件」高亮上
+}
+
 /** 把编码模式切到某个根目录：清空文件树 / 编辑器状态，重新列目录。 */
 function codeResetTo(dir) {
   CODE.root = dir;
@@ -8681,7 +11545,7 @@ function codeRenderTree() {
       if (it.dir) {
         const open = !!CODE.expanded[it.path];
         html += `<div class="tn" data-dir="${esc(it.path)}" style="padding-left:${pad}px" title="${esc(it.path)}">`
-          + `<span class="tw">${open ? "▾" : "▸"}</span><span class="nm">${esc(it.name)}</span></div>`;
+          + `<span class="tw ico">${treeIco(true, open)}</span><span class="nm">${esc(it.name)}</span></div>`;
         if (open) {
           const kids = CODE.data[it.path];
           if (kids) walk(kids, depth + 1);
@@ -8759,7 +11623,8 @@ async function codeFlushSave() {
 
 /* ---- 抽屉宽度可拖动（跟群聊一样：拖左边缘，落 localStorage） ---- */
 function codeApplyWidth(w) {
-  const max = Math.max(300, window.innerWidth - 300);   // 给面板至少留 300px
+  const z = uiZoom();
+  const max = Math.max(300, (window.innerWidth - 300) / z);   // 给面板至少留 300px
   const nw = Math.max(300, Math.min(w, max));
   document.documentElement.style.setProperty("--code-w", nw + "px");
 }
@@ -8769,14 +11634,14 @@ function codeInitResize() {
   if (!box || !grip) return;
   let dragging = false, startX = 0, startW = 0;
   grip.addEventListener("pointerdown", (e) => {
-    dragging = true; startX = e.clientX; startW = box.getBoundingClientRect().width;
+    dragging = true; startX = e.clientX; startW = box.getBoundingClientRect().width / uiZoom();
     box.classList.add("resizing");
     document.documentElement.classList.add("code-resizing");
     try { grip.setPointerCapture(e.pointerId); } catch { /* ignore */ }
     e.preventDefault();
   });
   grip.addEventListener("pointermove", (e) => {
-    if (dragging) codeApplyWidth(startW + (startX - e.clientX));   // 往左拖 = 变宽
+    if (dragging) codeApplyWidth(startW + (startX - e.clientX) / uiZoom());   // 往左拖 = 变宽
   });
   const end = (e) => {
     if (!dragging) return;
@@ -8926,37 +11791,53 @@ function initCode() {
    软件更新（GitHub Releases）：检查 / 一键静默更新（装完自动重启面板）
    ============================================================================ */
 
-let UPD = { busy: false, latest: "" };
+let UPD = { busy: false, latest: "", phase: "", lastError: "" };
+
+/** 设置里「软件更新」那一行的文案：**进度 / 失败原因一直可见**。
+ *  ⚠ 广播条会自动收（0.1.53 起非点击类型 5s），光靠它用户根本看不到失败原因 ——
+ *    而这条更新失败是**可操作**的信息，必须留一个长期可见的地方。 */
+function updNote(checkText) {
+  const note = $("upd-note");
+  if (!note) return;
+  const bits = [];
+  if (UPD.phase) bits.push(UPD.phase);
+  if (UPD.lastError) bits.push("⚠ " + UPD.lastError);
+  if (checkText) bits.push(checkText);
+  const s = bits.join("\u3000·\u3000") || "安装版可从 GitHub Releases 一键更新到最新；开发环境不支持";
+  note.textContent = s;
+  note.title = s;
+}
 
 async function updCheck(force) {
-  const note = $("upd-note"), cur = $("upd-cur"), apply = $("upd-apply"), chk = $("upd-check");
+  const cur = $("upd-cur"), apply = $("upd-apply"), chk = $("upd-check");
   if (chk) chk.disabled = true;
   try {
     const r = await api("/update/check" + (force ? "?force=1" : ""));
     const d = (r && r.data) || {};
     if (cur) { cur.textContent = d.current ? ("v" + d.current) : "开发环境"; cur.title = d.current || ""; }
     if (!d.supported) {
-      if (note) note.textContent = d.reason || "开发环境 / 非安装版，不支持在线更新";
+      updNote(d.reason || "开发环境 / 非安装版，不支持在线更新");
       if (apply) apply.hidden = true;
       return d;
     }
     if (!d.ok) {
-      if (note) note.textContent = d.reason || "检查失败";
+      updNote(d.reason || "检查失败");
       if (apply) apply.hidden = true;
       return d;
     }
     if (d.hasUpdate) {
       UPD.latest = d.latest || "";
-      if (note) note.textContent = "发现新版本 v" + d.latest + "（当前 v" + d.current + "）";
+      updNote("发现新版本 v" + d.latest + "（当前 v" + d.current + "）");
       if (apply) { apply.hidden = false; apply.textContent = "立即更新到 v" + d.latest; }
       if (force) setBanner("软件有新版本 v" + d.latest + "：点「立即更新」自动更新并重启");
     } else {
-      if (note) note.textContent = "已是最新版本（v" + d.current + "）";
+      updNote("已是最新版本（v" + d.current + "）");
       if (apply) apply.hidden = true;
     }
     return d;
   } catch (err) {
-    if (note) note.textContent = "检查失败：" + (err && err.message ? err.message : err);
+    UPD.lastError = "检查失败：" + (err && err.message ? err.message : err);
+    updNote();
     if (apply) apply.hidden = true;
     return null;
   } finally {
@@ -8969,17 +11850,96 @@ async function updApply() {
   const latest = UPD.latest ? ("v" + UPD.latest) : "最新版";
   if (!confirm("下载并安装 " + latest + " 吗？\n安装是静默的，装完面板会自动重启。")) return;
   UPD.busy = true;
+  UPD.lastError = "";
   const apply = $("upd-apply");
   if (apply) { apply.disabled = true; apply.textContent = "正在下载…"; }
-  setBanner("正在下载并静默更新，安装完成后面板会自动重启…");
+  // ★ 下载 ~200MB 要好几分钟：广播条必须**常驻**，否则 5 秒后自己消失，用户看着像"没反应"
+  UPD.phase = "正在下载并静默更新（约 200 MB，请勿关闭面板）…";
+  setBanner(UPD.phase, { sticky: true });
+  updNote();
+  updPollStatus(true);
   try {
     const r = await api("/update/apply", { method: "POST" });
     if (apply) apply.textContent = "更新中…（装完自动重启）";
-    setBanner((r && r.message) || "已开始更新…");
+    UPD.phase = (r && r.message) || "已开始更新…";
+    setBanner(UPD.phase + (r && r.source ? "（下载源：" + r.source + "）" : ""), { sticky: true });
+    updNote();
   } catch (err) {
     UPD.busy = false;
+    updPollStatus(false);
     if (apply) { apply.disabled = false; apply.textContent = "立即更新"; }
-    setBanner("更新失败：" + (err && err.message ? err.message : err));
+    UPD.phase = "";
+    UPD.lastError = "更新失败：" + (err && err.message ? err.message : err);
+    setBanner(UPD.lastError + "（详见 设置 →「软件更新」）", { sticky: true });   // 原因常驻，别 5 秒就没了
+    updNote();
+  }
+}
+
+/** 更新期间每 2s 看一次后端阶段（下载中 / 安装中），把进度写进设置那一行 + 广播条。 */
+let updPollT = null;
+function updPollStatus(on) {
+  if (!on) { if (updPollT) { clearInterval(updPollT); updPollT = null; } return; }
+  if (updPollT) return;
+  const PH = { downloading: "正在下载安装包…", installing: "正在安装（面板即将自动重启）…",
+               started: "正在安装（面板即将自动重启）…" };
+  const tick = async () => {
+    try {
+      const r = await api("/update/status");
+      const d = (r && r.data) || {};
+      if (d.phase === "done") {
+        UPD.phase = "已更新完成"; UPD.lastError = "";
+        setBanner("已更新到 v" + (d.version || "?") + (d.fromVersion ? "（原 v" + d.fromVersion + "）" : ""),
+                  { sticky: true });
+        updNote(); updPollStatus(false); return;
+      }
+      if (d.phase === "failed") {
+        UPD.phase = ""; UPD.lastError = "上次更新失败：" + (d.error || "未知原因");
+        setBanner(UPD.lastError + "（详见 设置 →「软件更新」）", { sticky: true });
+        updNote(); updPollStatus(false); return;
+      }
+      const label = PH[d.phase];
+      if (label) {
+        UPD.phase = label + "（约 200 MB，请勿关闭面板）";
+        setBanner(UPD.phase, { sticky: true });
+        updNote();
+      }
+    } catch { /* 面板正在被安装器杀掉 → 忽略 */ }
+  };
+  updPollT = setInterval(tick, 2000);
+  tick();
+}
+
+/** GitHub Token 那一行：**只显示掩码**（明文不进界面，跟「模型 API Key」同一个规矩）。 */
+async function updLoadToken() {
+  const v = $("upd-token-var");
+  try {
+    const r = await api("/update/token");
+    const d = (r && r.data) || {};
+    if (v) {
+      v.textContent = d.set ? (d.mask + (d.source === "env" ? "（环境变量）" : "")) : "未设置";
+      v.title = d.set ? "已设置：更新检查额度 5000 次/小时" : "未设置：匿名只有 60 次/小时/IP";
+    }
+  } catch {
+    if (v) v.textContent = "读取失败";
+  }
+}
+
+async function updSaveToken() {
+  const inp = $("upd-token-value");
+  const btn = $("upd-token-save");
+  if (!inp) return;
+  const t = String(inp.value || "").trim();
+  if (btn) btn.disabled = true;
+  try {
+    await api("/update/token", { method: "POST", body: JSON.stringify({ token: t }) });
+    inp.value = "";
+    await updLoadToken();
+    setBanner(t ? "已保存 GitHub Token：更新检查额度提到 5000 次/小时" : "已清除 GitHub Token", { ms: 3000 });
+    updCheck(true);                        // 后端已清缓存 → 立刻重查一次
+  } catch (err) {
+    setBanner("保存 GitHub Token 失败：" + (err && err.message ? err.message : err), { sticky: true });
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -8987,6 +11947,10 @@ function initUpdate() {
   const chk = $("upd-check"), apply = $("upd-apply");
   if (chk) chk.addEventListener("click", () => updCheck(true));
   if (apply) apply.addEventListener("click", updApply);
+  const ts = $("upd-token-save"), tv = $("upd-token-value");
+  if (ts) ts.addEventListener("click", updSaveToken);
+  if (tv) tv.addEventListener("keydown", (e) => { if (e.key === "Enter") updSaveToken(); });
+  updLoadToken();                          // 只回掩码
   // 后台自动查一次（不打扰）；有新版就只在横幅提示，去设置里点更新
   setTimeout(() => {
     updReportStatus();                     // 先报告"上一次更新"的结果（如有）
@@ -9006,12 +11970,16 @@ async function updReportStatus() {
     const phase = d.phase;
     if (!phase) return;
     if (phase === "done") {
-      setBanner("已更新到 v" + (d.version || "?") + (d.fromVersion ? "（原 v" + d.fromVersion + "）" : ""));
+      UPD.phase = "已更新到 v" + (d.version || "?") + (d.fromVersion ? "（原 v" + d.fromVersion + "）" : "");
+      setBanner(UPD.phase, { sticky: true });
     } else if (phase === "failed") {
-      setBanner("上次更新失败：" + (d.error || "未知原因") + "（可在「设置 → 软件更新」重试）");
+      UPD.lastError = "上次更新失败：" + (d.error || "未知原因");
+      setBanner(UPD.lastError + "（详见 设置 →「软件更新」）", { sticky: true });
     } else {
-      setBanner("上次更新似乎未完成（" + phase + "）：" + (d.error || "可能被中断") + "；可到「设置 → 软件更新」重试");
+      UPD.lastError = "上次更新似乎未完成（" + phase + "）：" + (d.error || "可能被中断");
+      setBanner(UPD.lastError + "；可到 设置 →「软件更新」重试", { sticky: true });
     }
+    updNote();                                 // ★ 同时落到设置那一行（长期可见，广播条会收）
     await api("/update/ack", { method: "POST" });
   } catch { /* ignore */ }
 }
@@ -9032,13 +12000,27 @@ async function updReportStatus() {
   initUpdate();
   // 更新提示：点横幅 / Ctrl+Shift+R 都能刷新（原生 WebView2 里快捷键不一定触发重载）
   const bnEl = $("banner");
-  if (bnEl) bnEl.addEventListener("click", () => { if (updateReady) safeReload(); });
+  if (bnEl) bnEl.addEventListener("click", () => { if (bannerAction) bannerAction(); else if (updateReady) safeReload(); });
   document.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "R" || e.key === "r") && updateReady) {
       e.preventDefault();
       safeReload();
     }
   });
+  // ★Ctrl + 滚轮 = 界面缩放（和设置里的「界面缩放」滑块**同一个值**，一起落 localStorage）
+  (function initZoomWheel() {
+    let want = null, raf = -1;
+    window.addEventListener("wheel", (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();                     // 关键是拦住默认行为：别让浏览器/WebView2 再叠一层原生缩放
+      want = Math.max(50, Math.min(150, (Number(SET.zoom) || 100) + (e.deltaY < 0 ? 5 : -5)));
+      if (raf !== -1) return;                 // rAF 节流：滚轮一秒几十个事件，别每次都重算设置
+      raf = requestAnimationFrame(() => {
+        raf = -1;
+        if (want != null) { setSetting("zoom", want); want = null; }
+      });
+    }, { passive: false });
+  })();
   initPetals();
   initSidebar();
   initBrandName();
@@ -9056,9 +12038,11 @@ async function updReportStatus() {
   initMusicAudio();
   restoreMusicState();                   // 刷新后面板内歌曲信息 / 队列 / 进度恢复
   initSettings();
+  initTrust();                           // 顶栏「信任」：权限等级 / 待批准 / 始终允许
   // 自定义素材（头像 / 空会话主图与贴纸）：拉回来后再画一次首屏（接口没有就安静跳过）
   loadAppearance().then(() => refreshAppearanceArt());
   initModelPicker();
+  initCtxChip();                         // 上下文「还剩多少」小条（点一下看详细）
   initAsk();
   initSkillPicker();
   initThemes();

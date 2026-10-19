@@ -2,16 +2,18 @@
 
 > 曾用名 **opencode-ui**（仓库已改名为 `cocraft`，旧链接 GitHub 会自动重定向）。
 
-一个**自建的 OpenCode 前端**：不修改官方桌面版，独立运行、外观完全自控，并配套一个守护进程实现
-「**启动 OpenCode → 拉起面板**」「**关掉面板 → 关掉 OpenCode**」的联动。
+一个**本地优先的多智能体 AI 协作台**：既能把 OpenCode 当对话引擎，也能用 ACP 驱动 codex / claude / opencode 等外部 agent；
+面板独立运行、外观完全自控，并配套守护进程实现「启动面板 / 关窗联动」。
 
 - 前端是**原生 HTML/CSS/JS**（无 Node、无 npm、无构建步骤）
 - 后端是 **Python 3.12 标准库**（零第三方依赖即可跑起来）
 - 项目目录可放在任意位置，下文用 `%PROJECT%` 表示（例如 `D:\opencode-ui`）
 
-> 从零复现见 [`docs/REPRODUCE.md`](docs/REPRODUCE.md)。
-> 对话引擎 / ACP 桥的契约与踩坑见 [`docs/ACP.md`](docs/ACP.md)。
-> 开发笔记 `AGENTS.md` 与 `docs/PROGRESS.md` 属于**本机文件，不随仓库发布**。
+> **0.2.0 起**：新增**可逆执行**（隔离区 / 撤销这一轮）、**多智能体主动编排**（角色 / 派活 / 对比 / 仲裁 / 建组）、
+> **信任面板**（权限等级 / 待批 / 始终允许撤销）、**上下文余量**。详见 [`CHANGELOG.md`](CHANGELOG.md)
+> 与 [`docs/RELEASE-0.2.0.md`](docs/RELEASE-0.2.0.md)。
+> 从零复现见 [`docs/REPRODUCE.md`](docs/REPRODUCE.md)；对话引擎 / ACP 桥见 [`docs/ACP.md`](docs/ACP.md)；
+> 发布流程见 [`docs/RELEASE.md`](docs/RELEASE.md)。
 
 ---
 
@@ -28,12 +30,10 @@
 python packaging\build.py            :: 产出 dist\cocraft-setup-<版本>.exe
 ```
 
-- **核心必装**：面板 + 后端 + 嵌入式 Python（不用系统装 Python）。
-- **随包 agent（默认勾）**：Codex 适配器 + Claude Code 适配器（**不含 Claude 本体**）+ node，装完就有可用的 ACP agent。
-- **可选组件（默认不勾）**：音乐服务（网易云/QQ 搜歌放歌）、音频频谱 —— 不装则面板里相应位置
-  会明确显示「未安装（可选组件）」，其余功能不受影响。
-- **不带 OpenCode、不带任何密钥**：引擎默认 `acp`（面板独立运行）；装了 OpenCode 的机器上
-  「设置 → 对话引擎」里也能切到 `opencode`，agentlist 里会自动出现 `opencode-acp`。
+- **核心必装**：面板 + 后端 + 嵌入式 Python + 面板终端 + 音乐服务（`core / terminal / panel / music` 不可取消）。
+- **随包 agent（可选，默认勾选）**：Codex 适配器 + Claude Code 适配器（**不含 Claude 本体**）+ OpenCode（原生 exe）；
+  node 跟着两个 JS 适配器自动安装。全不勾也能装，之后可在面板里「扫描本机 Agent」或「直接 npm 安装」。
+- **不带任何密钥**：引擎默认跟随本机可用项；装了 OpenCode 的机器上「设置 → 对话引擎」也能切到 `opencode`。
 - **可一键更新**：装的是带更新功能的版本后，**设置 →「软件更新」→ 检查更新 / 立即更新**即可升到最新
   GitHub Release（静默安装，装完面板自动重启）。⚠ 更早的版本没有这个入口，需要**手工装一次**新版。
 - **模型 API Key 由你自己给**（三条路任选）：
@@ -65,24 +65,27 @@ python packaging\build.py            :: 产出 dist\cocraft-setup-<版本>.exe
 
 | 分类 | 功能 |
 | --- | --- |
-| **会话** | 列表 / 搜索 / 新建 / 删除（含二次确认）/ **用第一句提问自动命名**；侧栏每项可展开「详细信息」（ID、目录、模型、时间、Token、花费、结果） |
-| **消息** | 流式增量渲染（文本 / 思考 / 工具调用）、**打字机效果**、Markdown 渲染（GFM 表格 / 列表 / 标题 / 引用 / 链接 / 代码块）、生成中可**中断** |
+| **会话** | 列表 / 搜索 / 新建 / 删除（含二次确认）/ **用第一句提问自动命名**；侧栏每项可展开「详细信息」；**消息往上翻页**（视口锚定、刷新不丢） |
+| **消息** | 流式增量渲染（文本 / 思考 / 工具调用）、**打字机效果**、Markdown（GFM 表格 / 列表 / 标题 / 引用 / 链接 / 代码块）、生成中可**中断** |
+| **可逆执行** | **破坏性命令先隔离再放行**；**撤销这一轮**（改/增/删/改名 + 行级 diff + 一键退回，撤销本身也可逆）；工具菜单「隔离区」可恢复 / 删除 |
+| **多智能体** | 角色（实现 / 审查 / 测试 / 调研，只注入本人）、**派活**（一条 `@a @b` 并行）、**并排对比**（2 人逐行差异）、**结果仲裁**（推荐 X 可点跳列）、**一键建组**（可自定义预设、建完自动派第一活） |
+| **信任** | 输入框「权限 ▾ → 信任面板…」：权限 **5 档**集中切换（放宽要确认、一键收紧）、**待批准**（会话 + 群聊）、**最近「始终允许」**逐条撤销 |
+| **上下文** | 输入框左下角「上下文 剩 X%」：OpenCode 用模型上限 + 上一条 tokens；ACP 用 agent 上报；拿不到不编数字 |
 | **附件** | 粘贴 / 拖拽 / 选择文件；图片自动压缩后以 `data:` URL 发送；**点击可看大图** |
 | **弹窗交互** | **form 选择**（含"自己说"自由输入、忽略）、**权限申请**（说明这次要什么、为什么；ACP 还会带模型的想法节选） |
-| **模型** | 顶栏切换（按 provider 分组 + 搜索 + **思考强度 variants**）、官方品牌图标（本地 SVG）、新会话自动绑定默认模型 |
-| **对话引擎** | 默认 `opencode`；可切 `acp`（ACP 桥驱动外部 agent）；**agentlist** 可切换 / 新增 / 删除 agent |
-| **音乐** | QQ音乐(SMTC) 联动 + **面板内直接搜歌放歌**（网易云 / QQ，非官方接口）；播放条常驻可折叠、可拖动进度、自动连播 / 随机、刷新后可续播；**音乐主页**（推荐歌单 / 我的歌单 + 当前播放列表）；真频谱 |
-| **主题 / 视觉** | 昼夜两套主题（和纸白+绯红 / 夜墨+金）、动态壁纸（Wallpaper Engine 视频原片，两层交叉淡入切主题）、毛玻璃与亮度可调、落樱 |
-| **系统联动** | 任务栏自动隐藏（面板开着且未最小化时）、关面板连带关 OpenCode、面板最小化自动恢复任务栏 |
-| **歌词** | 播放 QQ音乐 / 面板内歌曲时显示歌词，外文歌**自动翻译**成中文（带缓存） |
-| **可调项** | 名字 / 小标签、亮度、毛玻璃、动态壁纸速度与目录、任务栏、两侧音频条、落樱、歌词翻译、引擎与 agent……全部存 `localStorage` |
+| **轨迹** | 工具**翻成人话**（中文摘要 + 真输出 + 真 diff）；默认折叠、出错自动展开、可拖宽；主界面每轮一行「进展」 |
+| **模型 / 引擎** | 顶栏切模型（provider 分组 + 搜索 + 思考强度）、**对话引擎** `opencode` / `acp`、**agentlist** 扫描 / 新增 / 删除 / 面板内 npm 安装 |
+| **音乐** | QQ音乐(SMTC) 联动 + **面板内直接搜歌放歌**（网易云 / QQ，非官方接口）；播放条常驻可折叠、可拖动进度、自动连播 / 随机、刷新后续播；音乐主页；真频谱 |
+| **主题 / 视觉** | 昼夜两套主题、动态壁纸（Wallpaper Engine 视频原片，两层交叉淡入）、液态玻璃、毛玻璃与亮度可调、落樱 |
+| **系统联动** | 任务栏自动隐藏（面板开着且未最小化时）、关面板连带关 OpenCode、面板最小化自动恢复任务栏、托盘气泡 / 闪任务栏 |
+| **可调项** | 名字 / 小标签、亮度、模糊、界面缩放、动态壁纸速度与目录、任务栏、两侧音频条、落樱、歌词翻译、引擎与 agent……设置存 `localStorage` / `runtime/state` |
 
 ---
 
 ## 3. 架构与数据流
 
 ```text
-面板窗口（Edge --app，独立 profile）
+面板窗口（WebView2 原生窗口；没有组件时退回 Edge --app；独立 profile）
         │  http://127.0.0.1:8787
         ▼
 backend/server.py  ──  静态前端 + 反向代理 + 本地服务
@@ -196,6 +199,11 @@ powershell -ExecutionPolicy Bypass -File "%PROJECT%\scripts\install-startup.ps1"
 | 当前对话引擎 | `runtime/state/_engine.json` |
 | ACP agent 注册表（**含 API key**） | `runtime/state/_acp_agents.json` |
 | ACP 会话 + 消息（持久化） | `runtime/state/_acp_sessions.json` |
+| 权限等级 | `runtime/state/_perm_level.json` |
+| 权限「始终允许」记忆 | `runtime/state/_acp_always.json` |
+| 可逆执行：隔离区 | `runtime/quarantine/<scope>/<ts>/` |
+| 可逆执行：工作区快照 | `runtime/snapshots/`（内容寻址仓 + 清单） |
+| 群聊 AI 成员 | `runtime/state/_cocraft_agents.json`（含 agent token，仅本机） |
 | QQ/SMTC 状态 | `runtime/state/_music.json` |
 | 真频谱 | `runtime/state/_spectrum.json` |
 | 歌词翻译缓存 | `runtime/state/_lyrics_zh.json` |
@@ -229,7 +237,8 @@ powershell -ExecutionPolicy Bypass -File "%PROJECT%\scripts\install-startup.ps1"
 cd /d %PROJECT%
 python tools\jsbalance.py frontend\app.js     :: JS 括号配平 + 函数重名
 python tools\check_ids.py                     :: DOM id 引用是否都存在
-python tools\check_features.py                :: ★功能体检：逐条断言（app.js + index.html + style.css）
+python tools\check_features.py                :: ★功能体检：逐条断言（app.js + index.html + style.css + 后端）
+python tools\run_suite.py                     :: ★23 套无头回归（需要 8787 静态服务；CI 用 --ci）
 python tools\inspect_ui.py --shot resources\screenshots\panel.png   :: ★无头渲染看真实界面（可出图）
 python tools\grep.py -F "关键字" frontend      :: ★快搜（默认跳过 runtime 等大目录）
 python -m py_compile backend\server.py backend\watch.py backend\taskbar.py
@@ -251,9 +260,13 @@ python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1
 - 面板内的音乐接口（网易云 / QQ）都是**非官方接口**，可能随平台调整失效；会员/付费曲目受账号权限限制。
 - **只在页面里播 QQ音乐音频做不到**（DRM + vkey）；让 QQ音乐客户端播指定歌曲也做不到（`qqmusic://` 协议未注册）。
 - 壁纸只支持 Wallpaper Engine 的 **video** 类型；`scene` / `application` 已移除（私有格式、链路脆）。
-- form / 权限弹窗目前只轮询**当前会话**；历史消息只取最近 80 条（接口支持 cursor，尚未做翻页）。
+- **可逆执行是"尽力而为"的安全网，不是事务系统**：只保得住能识别出的目标；codex 不报路径、猜不出时会**如实说"这次没能预先隔离"**。
+- **破坏性操作永远需要确认**（等级再宽也一样）；`all` 档连工作区外也放行。
+- ACP agent 能力不一致：部分 agent 不上报上下文用量 / 权限路径；界面会标注「—」或「不支持」。
+- form / 权限弹窗目前只轮询**当前会话**。
 - 关面板会关闭 OpenCode（这是设计），做相关实验前请按 `docs/REPRODUCE.md` §8 放 `runtime/no-kill` **并重启守护进程**。
 - 本仓库**不含**本机运行数据、开发笔记与同人图素材（见 `.gitignore` / `docs/REPRODUCE.md`）。
+- 当前只有 **Windows 10/11 x64** 安装包；未做 macOS / Linux。
 
 ---
 

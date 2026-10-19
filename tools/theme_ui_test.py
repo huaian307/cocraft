@@ -61,25 +61,28 @@ TEST = """<script>
   async function run() {
     var out = { errs: window.__probeErr.slice() };
     try {
-      // 双模式主题：默认深色
+      // ⚠ 2026-10-16 修正：**夜主题已在 `ui 0.1.50` 删除**（只剩「昼」`data-theme="hiru"`），
+      //   所以这里不再有「点 夜/昼 按钮」的玩法 —— 断言改成"那个按钮确实不存在"，
+      //   并且**不硬编码颜色值**（拿应用前的 `--paper` 当基准比大小），免得主题包一改就误报。
+      //   ⚠ 还必须**先回内置再取基准**：探针页的 localStorage 会跨次复用，上次跑完留下的用户主题
+      //     会让"基准"本身就是某个主题的颜色 → 后面的比较全错。
+      applyTheme("hiru");
+      await sleep(250);
+      out.paperBefore = paper();
+      out.baseBefore = document.documentElement.dataset.theme || "";
+      out.hasNightBtn = !!document.getElementById("btn-theme");
+
+      // 用户主题（双模式包）：套上后 data-theme-user 生效、变量真的变了
       await applyUserTheme("cocraft-tech");
       out.techUser = themeUser();
       out.techBase = document.documentElement.dataset.theme || "";
       out.techPaper = paper();
       out.techModes = _userThemeModes.slice();
-      out.btnDisabledDual = document.getElementById("btn-theme").disabled;
 
-      // 关键：点「夜/昼」应在主题内切换，而不是回内置
-      document.getElementById("btn-theme").click();
-      await sleep(900);
-      out.afterToggleUser = themeUser();
-      out.afterToggleBase = document.documentElement.dataset.theme || "";
-      out.afterTogglePaper = paper();
-
-      // 单模式主题：按钮禁用、不丢主题
+      // 单模式主题：变量照样生效（不再有"按钮禁用"这回事 —— 按钮已经没了）
       await applyUserTheme("cocraft-dark");
       out.singleModes = _userThemeModes.length;
-      out.singleDisabled = document.getElementById("btn-theme").disabled;
+      out.singleUser = themeUser();
       out.singlePaper = paper();
 
       // 工坊列表
@@ -104,7 +107,6 @@ TEST = """<script>
       if (rstBtn) { rstBtn.click(); await sleep(400); }
       out.afterResetUser = themeUser();
       out.afterResetPaper = paper();
-      out.afterResetBtnDisabled = document.getElementById("btn-theme").disabled;
 
       // 图标槽
       setThemeIcons({ tools: "/assets/cocraft.ico" });
@@ -116,6 +118,7 @@ TEST = """<script>
       applyTheme("hiru");
       out.afterRevertUser = document.documentElement.dataset.themeUser || "";
       out.afterRevertPaper = paper();
+      out.afterRevertBase = document.documentElement.dataset.theme || "";
       out.styleCleared = (function () { var s = document.getElementById("cocraft-theme"); return !s || !s.textContent; })();
       out.activeCards = document.querySelectorAll("#th-list .wp-it.th-on").length;
     } catch (e) {
@@ -188,32 +191,32 @@ def main() -> int:
     d = json.loads(m.group(1))
 
     checks = [
+        ("★夜主题已删：页面上没有「夜/昼」按钮（`#btn-theme`）", d.get("hasNightBtn") is False),
+        ("底盘是「昼」`data-theme=hiru`", d.get("baseBefore") == "hiru" and d.get("techBase") == "hiru"),
         ("双模式：用户主题生效", d.get("techUser") == "cocraft-tech"),
-        ("双模式：默认深色底盘", d.get("techBase") == "yoru"),
-        ("双模式：深色变量生效", d.get("techPaper") == "#0d1117"),
-        ("双模式：支持两种明暗", (d.get("techModes") or []) == ["light", "dark"] or len(d.get("techModes") or []) == 2),
-        ("双模式：按钮可用", d.get("btnDisabledDual") is False),
-        ("★切昼夜后主题仍在", d.get("afterToggleUser") == "cocraft-tech"),
-        ("★切昼夜后底盘变浅色", d.get("afterToggleBase") == "hiru"),
-        ("★切昼夜后换浅色变量", d.get("afterTogglePaper") == "#f6f8fb"),
+        ("★双模式：用户主题**真的换了变量**（`--paper` 与内置不同）",
+         bool(d.get("techPaper")) and d.get("techPaper") != d.get("paperBefore")),
+        ("双模式：主题包自带两套明暗（light+dark）", len(d.get("techModes") or []) == 2),
         ("单模式：只一种明暗", d.get("singleModes") == 1),
-        ("单模式：按钮禁用", d.get("singleDisabled") is True),
-        ("单模式：变量仍生效", d.get("singlePaper") == "#0d1117"),
+        ("单模式：用户主题仍生效", d.get("singleUser") == "cocraft-dark"),
+        ("单模式：变量仍生效", bool(d.get("singlePaper"))
+         and d.get("singlePaper") != d.get("paperBefore")),
         ("★找得到内置卡片", d.get("foundBuiltinCard") is True),
         ("★点内置卡片能恢复（主题清掉）", d.get("cardUser") == ""),
-        ("★点内置卡片能恢复（变量回默认）", d.get("cardPaper") == "#faf7f2"),
+        ("★点内置卡片能恢复（变量回内置值）", d.get("cardPaper") == d.get("paperBefore")),
         ("★找得到「恢复内置」按钮", d.get("foundReset") is True),
         ("★「恢复内置」清掉主题", d.get("afterResetUser") == ""),
-        ("★「恢复内置」保持当前明暗（回到内置夜）", d.get("afterResetPaper") == "#141110"),
-        ("★「恢复内置」后按钮可用", d.get("afterResetBtnDisabled") is False),
+        ("★「恢复内置」变量回内置值（不再有「回内置夜」这回事）",
+         d.get("afterResetPaper") == d.get("paperBefore")),
         ("图标槽：加上", d.get("iconOn") is True),
         ("图标槽：清掉", d.get("iconOff") is True),
         ("恢复内置：清 data-theme-user", d.get("afterRevertUser") == ""),
-        ("恢复内置：变量回默认", d.get("afterRevertPaper") == "#faf7f2"),
+        ("恢复内置：变量回内置值", d.get("afterRevertPaper") == d.get("paperBefore")),
+        ("恢复内置：底盘仍是 hiru（夜主题已删）", d.get("afterRevertBase") == "hiru"),
         ("恢复内置：样式清空", d.get("styleCleared") is True),
-        ("内置主题 2 个", d.get("builtinCount") == 2),
+        ("内置主题 1 个（夜主题已删，只剩昼）", d.get("builtinCount") == 1),
         ("已安装 ≥ 3 个", (d.get("installedCount") or 0) >= 3),
-        ("列表渲染出卡片", (d.get("listCards") or 0) >= 5),
+        ("列表渲染出卡片", (d.get("listCards") or 0) >= 4),
         ("当前主题唯一高亮", (d.get("activeCards") or 0) == 1),
         ("无 JS 未捕获错误", not d.get("jsErrors")),
     ]

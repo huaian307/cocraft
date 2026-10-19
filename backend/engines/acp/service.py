@@ -153,6 +153,7 @@ def _perm_detail(tc: dict) -> str:
 # ACP 本身没有"读历史"的接口，但 opencode 这个库我们能读 → 把历史真读进来显示。
 # ⚠ 只读、绝不写；读不到（库不在 / 锁住 / 表变了）就回空，退回"指针 + 接回"的老行为。
 _OPENCODE_DB = os.path.join(os.path.expanduser("~"), ".local", "share", "opencode", "opencode.db")
+_PRUNE_EVERY = 5.0        # 跟 OpenCode 共享库「对账」的最小间隔（秒）——别每次列会话都查库
 
 
 def _opencode_db() -> str:
@@ -176,6 +177,27 @@ def _opencode_query(sql: str, args=()) -> list:
             con.close()
     except Exception:  # noqa: BLE001
         return []
+
+
+def _opencode_session_ids():
+    """OpenCode 共享库里**现有**的会话 id 集合。
+
+    ⚠ 读不到（没装 / 被锁 / 表结构变了）→ 返回 **None**（不是空集合！）：
+      调用方据此**放弃同步**，绝不能把"读不到"当成"全都删了"。
+    """
+    path = _opencode_db()
+    if not path:
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True)
+        try:
+            rows = con.execute("select id from session_v2").fetchall()
+        finally:
+            con.close()
+        return {str(r[0]) for r in rows if r and r[0]}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _opencode_message_counts(ids) -> dict:
@@ -404,6 +426,7 @@ class AcpService:
         self._alias = {}
         self._seen_kinds = set()   # 诊断：见过哪些 session/update 类型（第一次出现记一行到 acp.log）
         self._sessions_file = os.path.join(STATE_DIR, "_acp_sessions.json")
+        self._prune_at = 0.0      # 上次跟 OpenCode 共享库对账的时间（别每次 list_sessions 都查库）
         self._load()               # 重启后把上次的会话/消息读回来
 
     # ---------------- 事件订阅 ----------------
@@ -526,6 +549,58 @@ class AcpService:
         # ★ 合并「同一条对话」的重复本地会话（引擎/agent 切换造成的），顺便把它从盘里清掉
         if self._dedupe_duplicates():
             self._save()
+        # ★ 跟 OpenCode 共享库对一次账：**在 OpenCode 客户端里删掉的会话，别在 ACP 里继续留着**
+        self._prune_deleted_at_source(force=True)
+
+    def _prune_deleted_at_source(self, force: bool = False) -> bool:
+        """把「OpenCode 里已经删掉」的本地会话清掉（只对 opencode-acp 有效）。
+
+        为什么需要：opencode-acp 与桌面端**共用同一个 SQLite**，但删除动作不会通知我们；
+        以前本地 `_acp_sessions.json` 会一直留着 → ACP 会话列表里"删了还在"。
+
+        安全阀（三条，别省）：
+          * 只对 `_is_opencode()` 的 agent 做（别的 agent 没有这个共享库）；
+          * **库读不到 → 什么都不做**（`_opencode_session_ids()` 回 None，不是空集合）；
+          * 只比对**能和 agent 对应上的 id**：`agentSessionId`，或 `ses_` 形状的 id；
+            没有绑定过 agent 的本地草稿不碰（可能是本地唯一的历史）。
+        """
+        if not self._is_opencode():
+            return False
+        now = now_ms() / 1000.0
+        if not force and now - self._prune_at < _PRUNE_EVERY:
+            return False
+        self._prune_at = now
+        ids = _opencode_session_ids()
+        if ids is None:
+            return False
+        drop = []
+        with self._lock:
+            for sid in list(self._order):
+                s = self._sessions.get(sid) or {}
+                if not self._owns(s):
+                    continue
+                asid = str(s.get("agentSessionId") or "").strip()
+                sid = str(sid)
+                target = asid or (sid if sid.startswith("ses_") else "")
+                if not target:                     # 本地草稿（没绑过 agent）→ 不动
+                    continue
+                if target in ids or sid in ids:    # 库里还在（两种 id 任一命中都算）
+                    continue
+                drop.append(sid)
+            for sid in drop:
+                self._sessions.pop(sid, None)
+                if sid in self._order:
+                    self._order.remove(sid)
+                self._bound.discard(sid)
+                for a, l in list(self._alias.items()):
+                    if l == sid:
+                        self._alias.pop(a, None)
+        if not drop:
+            return False
+        self._save()
+        self._log("[acp] 同步删除：OpenCode 里已删的会话 %d 条（%s）"
+                  % (len(drop), "、".join(drop[:3])))
+        return True
 
     @staticmethod
     def _first_user_text(s) -> str:
@@ -1603,9 +1678,30 @@ class AcpService:
         return (s.get("agent") or "dsh") == self.agent_id
 
     def _is_opencode(self) -> bool:
-        """这个 agent 是不是 OpenCode 自带的 ACP（能读共享会话库做"真导入"）。"""
-        cmd = " ".join(str(x) for x in (self.command or [])).lower()
-        return ("opencode" in cmd) and ("acp" in cmd)
+        """这个 agent 是不是 OpenCode 自带的 ACP（能读共享会话库做"真导入"）。
+
+        ⚠ 不能只看命令字符串里有没有 "opencode" —— 本项目目录就叫 `opencode-ui`，
+          任何 `D:\\opencode-ui\\...\\acp_mock_agent.py` 都会命中（写测试时踩过：
+          假 agent 被当成 OpenCode，会话被"同步删除"）。判据改成：
+          ① 参数里真有一个 `acp` 子命令；**并且**
+          ② 可执行文件 / 包名确实是 OpenCode（`opencode-cli.exe` / `opencode-ai` / provider=opencode）。
+        """
+        cmd = [str(x or "") for x in (self.command or [])]
+        if not cmd:
+            return False
+        norm = [x.lower().replace("\\", "/") for x in cmd]
+        has_acp = any(t == "acp" or t.endswith("/acp") for t in norm[1:])
+        if not has_acp:
+            return False
+        if str(self.provider_id or "").lower() == "opencode":
+            return True
+        for x in norm:
+            base = x.rsplit("/", 1)[-1]
+            if base in ("opencode", "opencode.exe", "opencode-cli", "opencode-cli.exe"):
+                return True
+            if x in ("opencode-ai", "opencode") or "/opencode-ai/" in x:
+                return True
+        return False
 
     def _public(self, s) -> dict:
         # ⚠ 带上 `agentSessionId`：切引擎时前端要靠它去对面找同一条会话（接续）。
@@ -1637,6 +1733,9 @@ class AcpService:
         return pub
 
     def list_sessions(self) -> list:
+        # ★ 跟 OpenCode 共享库对账（节流）：在 OpenCode 客户端里删掉的会话，这里也会消失。
+        #   读不到库时 `_prune_deleted_at_source()` 什么都不做（不误删）。
+        self._prune_deleted_at_source()
         with self._lock:
             return [self._public(self._sessions[i]) for i in reversed(self._order)
                     if i in self._sessions and self._owns(self._sessions[i])]

@@ -37,11 +37,11 @@ MAX_CSS_BYTES = 1024 * 1024       # 单个 CSS 上限
 MAX_IMG_BYTES = 6 * 1024 * 1024   # 远程预览图上限
 
 # 内置主题（真正实现在 frontend/style.css，这里只做清单）
+# ⚠ 夜主题已在 `ui 0.1.50` 删除（CSS 全没了）→ **清单里只留「昼」**。
+#   以前这里还挂着一个 `yoru`，于是「主题工坊」会列出一张点不出效果的死卡片（2026-10-16 修）。
 BUILTIN = [
     {"id": "hiru", "name": "昼（内置）", "author": "cocraft", "version": "内置",
      "description": "内置白昼主题", "mode": "light", "builtin": True},
-    {"id": "yoru", "name": "夜（内置）", "author": "cocraft", "version": "内置",
-     "description": "内置夜晚主题", "mode": "dark", "builtin": True},
 ]
 
 _URL_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.I)
@@ -187,12 +187,29 @@ def _pub(meta: dict, builtin: bool = False) -> dict:
     }
 
 
+def _is_builtin(tid: str) -> bool:
+    return any(b.get("id") == tid for b in BUILTIN)
+
+
 def read_active() -> str:
+    """当前生效的主题 id。
+
+    ★**兜底**：内置主题被删（例如 `yoru` 在 `ui 0.1.50` 随夜主题一起没了）/ 主题被卸掉了 →
+    一律回落到「hiru」。否则老状态会让启动套一个**不存在的主题**（界面上看不出哪里坏了）。
+    """
     try:
         with open(THEME_STATE_FILE, "r", encoding="utf-8") as fh:
-            return str(json.load(fh).get("id") or "hiru")
+            tid = str(json.load(fh).get("id") or "hiru")
     except Exception:  # noqa: BLE001
         return "hiru"
+    if _is_builtin(tid):
+        return tid
+    try:
+        if valid_id(tid) and os.path.isdir(theme_dir(tid)):
+            return tid
+    except Exception:  # noqa: BLE001
+        pass
+    return "hiru"
 
 
 def write_active(tid: str) -> None:
@@ -244,9 +261,11 @@ def list_installed() -> list:
 def get_theme(tid: str, mode: str = "") -> dict:
     """完整主题负载（给前端套用）：vars/css/icons/background（按 mode 合并）。内置只回身份信息。"""
     tid = str(tid or "").strip()
-    if tid in ("hiru", "yoru"):
-        return {"ok": True, "id": tid, "mode": "dark" if tid == "yoru" else "light",
-                "modes": ["light", "dark"], "builtin": True}
+    if tid == "yoru":
+        tid = "hiru"                     # ⚠ 夜主题已删：旧的引用一律当「昼」，别把启动搞挂
+    if tid == "hiru":
+        return {"ok": True, "id": "hiru", "mode": "light",
+                "modes": ["light"], "builtin": True}
     if not valid_id(tid):
         raise ValueError("非法的主题 id：%s" % tid)
     folder = theme_dir(tid)

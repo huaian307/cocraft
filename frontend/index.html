@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft · 絵梨衣</title>
 <link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style.css?v=0.1.56">
+<link rel="stylesheet" href="/style.css?v=0.2.0">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -91,6 +91,8 @@
         <div id="tm-dir" class="om-dir">—</div>
         <button type="button" data-tool="term" id="tm-term">面板终端</button>
         <button type="button" data-tool="code" id="tm-code">编码模式</button>
+        <button type="button" data-tool="quar" id="tm-quar">隔离区（可恢复）</button>
+        <button type="button" data-tool="undo" id="tm-undo">撤销这一轮</button>
       </div>
       <div id="hub-menu" class="open-menu hub-grid" hidden>
         <div class="om-dir">工具（点图标启动）</div>
@@ -112,6 +114,7 @@
       <div id="spec-left" class="spec-side" aria-hidden="true"></div>
       <div id="spec-right" class="spec-side" aria-hidden="true"></div>
       <section id="messages" aria-live="polite">
+        <div id="msg-more" class="msg-more" hidden></div>
         <div id="msg-static">
           <div class="error-box">界面脚本没加载成功 —— 请按 Ctrl+Shift+R 强制刷新。</div>
         </div>
@@ -199,6 +202,7 @@
         <div class="composer-foot">
           <button type="button" id="btn-perm" class="perm-btn" title="权限授予等级（点开选择）" data-level="ask">权限：全部询问 ▾</button>
           <button type="button" id="btn-skill" class="perm-btn" title="技能 / 斜杠命令（点开选择）">技能 ▾</button>
+          <button type="button" id="ctx-chip" class="perm-btn ctx-chip" title="上下文用量（还剩多少）" hidden>上下文 —</button>
         </div>
       </div>
       <input type="file" id="file-input" multiple hidden>
@@ -317,20 +321,61 @@
         <div class="cc-menu-row">
           <span>AI 成员<i>（绑定 ACP agent；被 @ 时自动回）</i></span>
           <div id="cc-ai-list" class="cc-ai-list"></div>
-          <div class="cc-inline">
-            <input id="cc-ai-name" type="text" placeholder="名字（@它用，英文/数字）">
-            <select id="cc-ai-engine" class="cc-ai-engine" title="用哪个 ACP agent 当大脑"></select>
-            <button type="button" id="cc-ai-add">＋ 建</button>
+          <!-- ★新建成员：**两行**放（名字＋建 / 大脑＋角色＋建组），别再把五个控件挤成一行 -->
+          <div class="cc-ai-add">
+            <div class="cc-inline">
+              <input id="cc-ai-name" type="text" placeholder="名字（@它用，英文/数字）">
+              <button type="button" id="cc-ai-add">＋ 建</button>
+            </div>
+            <div class="cc-inline">
+              <select id="cc-ai-engine" class="cc-ai-engine" title="用哪个 ACP agent 当大脑"></select>
+              <select id="cc-ai-role" class="cc-ai-role" title="角色：只注入它自己的提示词（别人看不到）"></select>
+              <button type="button" id="cc-team-open" class="cc-ai-b" title="一次建一组（实现 + 审查 + 测试）">＋ 一键建组…</button>
+            </div>
+          </div>
+          <!-- ★主动编排：一键建组（几个角色 + 各绑大脑 → 自动进群 + 开应答）
+               ★自定义预设：当前这几行可以「存为预设」；内置的不能删（只能另存）。
+               ★建完自动派第一活：下面那个输入框非空 → 建完就发 `@a @b 任务`。 -->
+          <div id="cc-team" class="cc-team" hidden>
+            <div class="cc-team-hd">
+              <b>一键建组</b>
+              <select id="cc-team-preset" class="cc-ai-engine" title="组的预设（内置 + 你存过的）"></select>
+              <button type="button" id="cc-team-save" class="cc-team-mini" title="把当前这几行角色/名字存成预设">存为预设</button>
+              <button type="button" id="cc-team-del" class="cc-team-mini" title="删除当前自定义预设（内置不能删）">删</button>
+              <span class="cc-team-sp"></span>
+              <button type="button" id="cc-team-go" class="cc-ai-b on">建组</button>
+              <button type="button" id="cc-team-x" class="cc-team-x" title="收起">×</button>
+            </div>
+            <div id="cc-team-rows" class="cc-team-rows"></div>
+            <input type="text" id="cc-team-task" class="cc-team-task" maxlength="200"
+                   placeholder="建完自动派第一活（可留空，例：各出一个实现方案）" autocomplete="off">
+            <div id="cc-team-note" class="cc-team-note"></div>
           </div>
         </div>
       </div>
       <div id="cc-msgs" class="cc-msgs"></div>
       <!-- ★群聊权限申请：**输入框上方的小弹窗**（由 ccPermRender() 填；点按钮 = 在群里发 `@agent 可以`） -->
       <div id="cc-perm" class="cc-perm" hidden></div>
+      <!-- ★主动编排：派活台（选几个 AI 成员 → 一条消息同时 @ 他们 → 各自**并行**干；
+           结果汇总在消息流末尾那张「派活」卡里） -->
+      <div id="cc-dis" class="cc-dis" hidden>
+        <div class="cc-dis-hd">
+          <b>派活</b>
+          <span class="cc-dis-tip">选成员（可多选）→ 一条消息 @ 到全部 → 他们各自独立并行</span>
+          <button type="button" id="cc-dis-close" class="cc-dis-x" title="收起">×</button>
+        </div>
+        <div id="cc-dis-members" class="cc-dis-members"></div>
+        <textarea id="cc-dis-task" rows="2" placeholder="要他们做什么……（会作为一条 @他们 的消息发进群里）"></textarea>
+        <div class="cc-dis-ft">
+          <span id="cc-dis-note" class="cc-dis-note"></span>
+          <button type="button" id="cc-dis-go" class="primary">派活</button>
+        </div>
+      </div>
       <form id="cc-send-form" class="cc-send">
         <textarea id="cc-send" rows="1" placeholder="说点什么……（Enter 发送，Shift+Enter 换行；📎 可发文件）"></textarea>
         <button type="button" id="cc-attach" title="发送文件（图片会直接预览）">📎</button>
         <input type="file" id="cc-file" hidden>
+        <button type="button" id="cc-dispatch" title="派活：选几个 AI 成员，一句话让他们并行干">派活</button>
         <button type="submit" class="primary">发送</button>
       </form>
     </div>
@@ -374,10 +419,12 @@
 
 <!-- 轨迹：思考过程 + 工具调用（**从左侧会话列表边界向右推出**，盖住会话区左侧） -->
 <aside id="trace" class="trace" aria-label="轨迹" aria-hidden="true">
+  <div id="trace-resize" class="trace-resize" title="拖动调整宽度"></div>
   <div class="trace-head">
     <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-    <span class="tr-cap">轨迹</span><b>思考 · 工具</b>
+    <span class="tr-cap">轨迹</span><b>思考 · 工具 · 系统通知</b>
     <span class="tr-spacer"></span>
+    <button type="button" id="trace-all" class="trace-x" title="展开 / 收起全部">展开全部</button>
     <button type="button" id="trace-close" class="trace-x" title="收起">×</button>
   </div>
   <div id="trace-body" class="trace-body"></div>
@@ -393,15 +440,15 @@
     </div>
     <div class="cfg-body">
       <div class="cfg-row">
-        <label>对话引擎<i id="cfg-engine-note">加载中…</i></label>
+        <label>对话引擎<i data-live id="cfg-engine-note">加载中…</i></label>
         <select id="cfg-engine"></select>
       </div>
       <div class="cfg-row" id="cfg-acp-row" hidden>
-        <label>ACP 代理<i id="cfg-acp-note">选择要驱动的 agent（Codex / Claude / dsh / …）</i></label>
+        <label>ACP 代理<i data-live id="cfg-acp-note">选择要驱动的 agent（Codex / Claude / dsh / …）</i></label>
         <button id="cfg-acp-btn">agentlist…</button>
       </div>
       <div class="cfg-row wide" id="cfg-key-row">
-        <label>模型 API Key<i id="cfg-key-note">写进共享基线的环境变量；只存本机 runtime/state，不进安装包</i></label>
+        <label>模型 API Key<i id="cfg-key-note" data-live>写进共享基线的环境变量；只存本机 runtime/state，不进安装包</i></label>
         <div class="cfg-ctl">
           <span class="cfg-key-var mono" id="cfg-key-var" title="变量名按当前 agent 的品牌自动决定（不用手填）">DEEPSEEK_API_KEY</span>
           <input type="password" id="cfg-key-value" placeholder="sk-…（留空=清除）" autocomplete="off">
@@ -413,11 +460,19 @@
         <button id="cfg-setup">运行向导…</button>
       </div>
       <div class="cfg-row wide">
-        <label>软件更新<i id="upd-note">安装版可从 GitHub Releases 一键更新到最新；开发环境不支持</i></label>
+        <label>软件更新<i data-live id="upd-note">安装版可从 GitHub Releases 一键更新到最新；开发环境不支持</i></label>
         <div class="cfg-ctl">
           <span class="cfg-key-var mono" id="upd-cur" title="当前版本">—</span>
           <button type="button" id="upd-check">检查更新</button>
           <button type="button" id="upd-apply" hidden>立即更新</button>
+        </div>
+      </div>
+      <div class="cfg-row wide">
+        <label>GitHub Token<i id="upd-token-note">可选。匿名查 GitHub 只有 60 次/小时/IP，共享梯子/代理容易被别人一起刷没 → 检查更新就失败；填一个 token 提到 5000 次/小时/账号。只读公开仓库的 classic token 不勾任何 scope 即可，明文只存本机</i></label>
+        <div class="cfg-ctl">
+          <span class="cfg-key-var mono" id="upd-token-var" title="当前状态">未设置</span>
+          <input type="password" id="upd-token-value" placeholder="ghp_…（留空=清除）" autocomplete="off">
+          <button type="button" id="upd-token-save">保存</button>
         </div>
       </div>
       <div class="cfg-row">
@@ -496,6 +551,11 @@
         <output id="cfg-blur-out"></output>
       </div>
       <div class="cfg-row">
+        <label>界面缩放<i>整个界面等比放大/缩小（文字、间距、图标一起），像浏览器缩放；100% = 原样</i></label>
+        <input type="range" id="cfg-zoom" min="50" max="150" step="5">
+        <output id="cfg-zoom-out"></output>
+      </div>
+      <div class="cfg-row">
         <label>动态壁纸速度<i>收起侧栏时的播放速度（100 = 原速）</i></label>
         <input type="range" id="cfg-rate" min="50" max="130" step="5">
         <output id="cfg-rate-out"></output>
@@ -503,6 +563,10 @@
       <div class="cfg-row">
         <label>液态玻璃<i>面板变成半透明磨砂玻璃、壁纸从后面透出（关掉 = 回到纸面面板）</i></label>
         <button id="cfg-glass" class="cfg-toggle">开</button>
+      </div>
+      <div class="cfg-row">
+        <label>每轮工作区快照<i>每发一条消息前给会话工作目录留一次底，之后可「撤销这一轮」。默认关 —— 只保留破坏性操作的隔离区（那一条不受此开关影响）</i></label>
+        <button id="cfg-turnsnap" class="cfg-toggle">关</button>
       </div>
       <div class="cfg-row">
         <label>收起时播放动态壁纸<i>关掉就用静态壁纸</i></label>
@@ -513,7 +577,7 @@
         <button id="cfg-taskbar" class="cfg-toggle">开</button>
       </div>
       <div class="cfg-row">
-        <label>面板窗口<i id="cfg-window-note">开启面板时用哪种窗口；改完关掉面板再开生效</i></label>
+        <label>面板窗口<i data-live id="cfg-window-note">开启面板时用哪种窗口；改完关掉面板再开生效</i></label>
         <select id="cfg-window">
           <option value="auto">自动（能用软件窗口就用）</option>
           <option value="native">软件窗口（WebView2）</option>
@@ -727,6 +791,87 @@
   </div>
 </div>
 
+<div id="quar" class="wp" hidden>
+  <div class="wp-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">可逆执行</span><b>隔离区</b><i class="mk-cap">quarantine</i>
+      <button id="quar-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="wp-cur muted" id="quar-note">破坏性操作<b>放行前</b>会自动把要动的文件<b>复制</b>一份到这里 —— <b>不信 OS 回收站</b>（2026-10-13 那次事故，回收站里没有任何内容实体，21 项真没了）。点「恢复」把文件放回<b>原路径</b>。</div>
+    <div class="wp-list" id="quar-list"></div>
+    <div class="wp-foot">
+      <span class="muted" id="quar-foot"></span>
+      <button id="quar-open">打开隔离区目录</button>
+      <button id="quar-reload">刷新</button>
+    </div>
+  </div>
+</div>
+
+<div id="cmp" class="wp" hidden>
+  <div class="wp-box cmp-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">主动编排</span><b>多方案对比</b><i class="mk-cap">compare</i>
+      <button id="cmp-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="wp-cur muted" id="cmp-task"></div>
+    <div class="cmp-cols" id="cmp-cols"></div>
+    <div id="cmp-arb" class="cmp-arb"></div>
+    <div id="cmp-diff" class="cmp-diff" hidden></div>
+    <div class="wp-foot">
+      <span class="muted" id="cmp-note"></span>
+      <button id="cmp-diff-btn" hidden>逐行差异</button>
+      <button id="cmp-reload">刷新</button>
+    </div>
+  </div>
+</div>
+
+<!-- ★信任面板（方向 3 第一块）：当前权限等级 + 每档含义 + 一键切换 + 待批准 + 最近「始终允许」 -->
+<div id="trust" class="wp" hidden>
+  <div class="wp-box trust-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">信任</span><b>权限与批准</b><i class="mk-cap">trust</i>
+      <button id="trust-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="trust-body">
+      <div id="trust-cur" class="trust-cur"></div>
+
+      <div class="trust-sec"><b>权限等级</b><span class="muted">越往下越宽 · 点一下就切换</span></div>
+      <div id="trust-levels" class="trust-levels"></div>
+
+      <div class="trust-sec"><b>待你批准</b><span class="muted" id="trust-pend-note"></span></div>
+      <div id="trust-pend" class="trust-list"></div>
+
+      <div class="trust-sec"><b>最近「始终允许」</b><span class="muted">只对 ACP 引擎 · 逐条可撤销</span></div>
+      <div id="trust-always" class="trust-list"></div>
+    </div>
+    <div class="wp-foot">
+      <span class="muted" id="trust-foot">收紧随时可以；放宽请想清楚（破坏性操作永远会问）。</span>
+      <button id="trust-tighten" title="立刻切到「全部询问」——一键收紧">立即收紧</button>
+      <button id="trust-reload">刷新</button>
+    </div>
+  </div>
+</div>
+
+<div id="undo" class="wp" hidden>
+  <div class="wp-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">可逆执行</span><b>撤销这一轮</b><i class="mk-cap">undo</i>
+      <button id="undo-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="wp-cur muted" id="undo-note">你每发一条消息，面板会在 agent <b>动手前</b>给会话工作目录落一次快照（增量、约 10ms）。这里列出<b>这一轮改了哪些文件</b>，可以整体退回。</div>
+    <div class="wp-list" id="undo-list"></div>
+    <div class="wp-foot">
+      <span class="muted" id="undo-foot"></span>
+      <button id="undo-reload">重新对比</button>
+      <button id="undo-run">撤销这一轮</button>
+    </div>
+  </div>
+</div>
+
 <div id="newsess" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
@@ -781,7 +926,7 @@
     <div class="wp-cur muted" id="agents-cur"></div>
     <div class="wp-list" id="agents-list"></div>
     <div class="wp-foot">
-      <span class="muted">切换会重启 ACP 子进程；命令 / 路径鼠标悬停可见；provider 只影响模型图标</span>
+      <span class="muted">切换会重启 ACP 子进程；命令 / 路径鼠标悬停可见；provider 只影响模型图标。<b>想补装随包的 Codex / Claude / OpenCode：重跑安装包、只勾缺的那个</b>（覆盖安装保留设置）</span>
       <button id="agents-add">＋ 扫描本机 / 新增…</button>
       <button id="agents-detect">自动检测</button>
       <button id="agents-edit">编辑当前 agent…</button>
@@ -836,6 +981,12 @@
       <button id="anew-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="wp-cur muted" id="anew-cur">扫描中…</div>
+    <!-- ★面板内安装 agent（联网 npm；装到 <app>\agents\npm\<id>，不碰随包的那几个） -->
+    <div id="anew-install" class="anew-install">
+      <div class="anew-i-hd"><b>没装？直接在这里装</b><span class="muted" id="anew-i-note"></span></div>
+      <div id="anew-i-list" class="anew-i-list"></div>
+      <div id="anew-i-log" class="anew-i-log" hidden></div>
+    </div>
     <div class="wp-list" id="anew-list"></div>
     <div class="wp-foot">
       <span class="muted">扫描本机常见位置（PATH / npm / Programs / 随包目录…）；没找到就用「选择文件夹」指向 agent 目录</span>
@@ -868,7 +1019,7 @@
         <select id="setup-model"></select>
       </div>
       <div class="cfg-row wide" id="setup-key-row" hidden>
-        <label>模型 API Key<i id="setup-key-note">没有 Key 时 agent 会回「Missing environment variable」。只存本机，不进安装包</i></label>
+        <label>模型 API Key<i id="setup-key-note" data-live>没有 Key 时 agent 会回「Missing environment variable」。只存本机，不进安装包</i></label>
         <div class="cfg-ctl">
           <span class="cfg-key-var mono" id="setup-key-var" title="变量名按当前 agent 的品牌自动决定（不用手填）">DEEPSEEK_API_KEY</span>
           <input type="password" id="setup-key-value" placeholder="sk-…（可留空，稍后在设置里填）" autocomplete="off">
@@ -898,7 +1049,7 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/app.js?v=0.1.56"></script>
+<script src="/app.js?v=0.2.0"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

@@ -47,6 +47,7 @@ if HERE in sys.path:
     sys.path.remove(HERE)
 sys.path.insert(0, HERE)
 
+import agent_install
 import cleanup
 import engines
 import external
@@ -55,6 +56,7 @@ import netsafe
 import procutils
 import pty as pty_term
 import skills_install
+import snapshots
 import themes
 import updater
 from engines.base import HOP_BY_HOP, EngineError
@@ -135,6 +137,13 @@ UPSTREAM = {"url": None, "auth": None, "version": None}
 # /bye 是页面在关闭瞬间发出的"再见"，让判定从"等超时"变成"立刻"。
 LAST_BEAT = {"t": 0.0, "count": 0, "bye": 0.0}
 BEAT_TIMEOUT = 8.0          # 心跳断档多久算"页面没了"（正常 4 秒一次；窗口被强杀时靠它兜底）
+
+# ★ 本进程的启动时刻（≈ import server.py 的时刻）。
+#   用途：`/healthz` 回 `pid` / `started` → **一条命令就能确认"新代码到底加载了没有"**。
+#   ⚠ 光看 `/healthz` 的 `ui` 版本号**判断不了**：那是每次请求现读 index.html 得到的
+#   （改了前端就变），跟"后端进程是不是新的"无关 —— 2026-10-14 就因此误判过一次"已重启"。
+SERVER_STARTED = time.time()
+SERVER_PID = os.getpid()
 
 
 # ============================ QQ音乐联动 ============================
@@ -570,6 +579,25 @@ def write_panel_window_pref(mode: str) -> bool:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"mode": mode}, fh, ensure_ascii=False)
         os.replace(tmp, PANEL_WINDOW_FILE)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---- ★B3：权限申请「强提醒」----
+# 面板把要提醒的内容写进 _notify.json；独立托盘进程（tray_host.py）轮询它 →
+# 弹系统气泡（icon.notify）+ 让窗口闪任务栏。面板没开托盘（浏览器模式）时这里只是写个文件，无害。
+NOTIFY_FILE = os.path.join(STATE_DIR, "_notify.json")
+
+
+def write_notify(title: str, body: str, flash: bool = True) -> bool:
+    """写一条「强提醒」（原子写）。tray_host.py 靠 ts 变化判定"是新的一条"。"""
+    try:
+        tmp = NOTIFY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"title": title, "body": body, "flash": bool(flash), "ts": time.time()},
+                      fh, ensure_ascii=False)
+        os.replace(tmp, NOTIFY_FILE)
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -1374,6 +1402,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._panel_taskbar(method)
             elif path == "/panel/window":
                 self._panel_window(method)
+            elif path == "/panel/notify":
+                # ★B3：面板请求「强提醒」（写 _notify.json → 托盘弹气泡 + 闪任务栏）
+                self._panel_notify(method)
             elif path == "/engine/status":
                 self._engine_status()
             elif path == "/engine":
@@ -1407,6 +1438,50 @@ class Handler(BaseHTTPRequestHandler):
                     n = 200
                 self._send_json(200, {"ok": True, "tail": eng.log_tail(n),
                                       "path": acp_agents.ROOT_DIR})
+            elif path == "/engine/acp/prewarm":
+                # ★预热 ACP agent 的子进程（冷启动实测 ~5.4s → 起来后再用 ~0.5s）。
+                #   面板启动 / 切引擎 / 切 agent 都会自动预热；这里给前端一个显式入口，
+                #   用来堵「服务早就起了、但 agent 进程已经死了 / 从没起来过」那个缺口。
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                eng = engines.get_engine("acp")
+                running = eng.service_running()
+                if not running:
+                    threading.Thread(target=eng.prewarm, daemon=True).start()
+                self._send_json(200, {"ok": True, "running": running, "prewarming": not running})
+            elif path == "/agent/catalog":
+                # ★面板内「安装 Agent」：可装的 npm 适配器 + 现在能不能装
+                self._send_json(200, {"ok": True, "data": {"items": agent_install.catalog(),
+                                                           "root": agent_install.INSTALL_ROOT,
+                                                           "status": agent_install.status()}})
+            elif path == "/agent/install/status":
+                self._send_json(200, {"ok": True, "data": agent_install.status()})
+            elif path == "/agent/install":
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                b = self._read_json_body() or {}
+                try:
+                    res = agent_install.install(str(b.get("id") or b.get("pkg") or ""),
+                                                pkg=str(b.get("pkg") or ""),
+                                                registry=str(b.get("registry") or ""))
+                except (ValueError, RuntimeError) as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(200, res)
+            elif path == "/agent/uninstall":
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                b = self._read_json_body() or {}
+                try:
+                    res = agent_install.uninstall(str(b.get("id") or ""),
+                                                  delete_files=bool(b.get("delete", True)))
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(200, res)
             elif path == "/engine/acp/agents":
                 self._acp_agents(method)
             elif path == "/qq/state":
@@ -1449,6 +1524,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/projectroot":
                 # 新建项目的默认位置 = 对应 agent 的目录
                 self._projectroot()
+            elif path == "/quarantine" or path.startswith("/quarantine/"):
+                # ★可逆执行：隔离区（破坏性操作放行前的备份 → 一键恢复）
+                self._quarantine_api(method, path)
+            elif path == "/snapshot" or path.startswith("/snapshot/"):
+                # ★可逆执行：工作区快照（引擎无关；diff / 撤销这一轮 的底座）
+                self._snapshot_api(method, path)
             elif path == "/update/check":
                 self._update_check()
             elif path == "/update/status":
@@ -1457,6 +1538,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._update_ack(method)
             elif path == "/update/apply":
                 self._update_apply(method)
+            elif path == "/update/token":
+                self._update_token(method)
             elif path == "/appearance":
                 self._appearance(method)
             elif path == "/appearance/img":
@@ -1538,6 +1621,11 @@ class Handler(BaseHTTPRequestHandler):
     def _healthz(self):
         code, body = engines.active_engine().healthz()
         body["ui"] = ui_version()
+        # ★ 后端进程身份：确认"新代码加载了没有"看这两个（别看 ui —— 那是现读 index.html 的）
+        body["pid"] = SERVER_PID
+        body["started"] = int(SERVER_STARTED)
+        body["startedAt"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(SERVER_STARTED))
+        body["uptime"] = int(max(0, time.time() - SERVER_STARTED))
         self._send_json(code, body)
 
     # ---------- 面板心跳 ----------
@@ -1601,6 +1689,26 @@ class Handler(BaseHTTPRequestHandler):
             "nativeAvailable": panel_native_available(),
             "note": "下次开窗生效；已开着的窗口关掉重开才会换",
         })
+
+    def _panel_notify(self, method: str):
+        """★B3：面板请求「强提醒」（权限申请之类）。
+
+        POST {title, body, flash} → 写 `runtime/state/_notify.json`；
+        独立托盘进程（tray_host.py）轮询它 → `icon.notify()` 弹系统气泡，
+        并让窗口进程闪任务栏（`_panel_cmd.json` 的 `flash` 命令）。
+        面板没在跑托盘（浏览器窗口模式）时只是写个文件，无害。
+        """
+        if method == "GET":
+            self._send_json(200, {"ok": True, "note": "POST {title, body, flash} 才写提醒文件"})
+            return
+        if method != "POST":
+            self._send_json(405, {"error": "GET or POST only"})
+            return
+        body = self._read_json_body() or {}
+        title = str(body.get("title") or "cocraft")[:120]
+        text = str(body.get("body") or "")[:400]
+        ok = write_notify(title, text, bool(body.get("flash", True)))
+        self._send_json(200 if ok else 500, {"ok": ok})
 
     # ---------- 引擎（跟哪个 agent 对话）----------
 
@@ -2072,6 +2180,148 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "data": data})
 
+    # ---------- ★可逆执行：隔离区 + 工作区快照（引擎无关） ----------
+
+    def _quarantine_api(self, method: str, path: str):
+        """隔离区：列出 / 详情 / 一键恢复 / 删除 / 手动追加。
+
+        「先隔离再放行」的产物在这里；恢复 = 把备份拷回**原路径**（目标已存在则不静默覆盖）。
+        """
+        sub = path[len("/quarantine"):].strip("/")
+        if sub in ("", "list"):
+            if method != "GET":
+                self._send_json(405, {"error": "GET only"})
+                return
+            self._send_json(200, {"ok": True, "data": {
+                "items": snapshots.list_quarantine(),
+                "stats": snapshots.stats()}})
+            return
+        if sub == "get":
+            qid = (parse_qs(urlsplit(self.path).query).get("id") or [""])[0]
+            rec = snapshots.load_quarantine(qid)
+            if not rec:
+                self._send_json(404, {"ok": False, "error": "找不到隔离记录"})
+                return
+            self._send_json(200, {"ok": True, "data": rec})
+            return
+        if sub == "restore" and method == "POST":
+            b = self._read_json_body() or {}
+            try:
+                res = snapshots.restore_quarantine(str(b.get("id") or ""),
+                                                   srcs=b.get("srcs"),
+                                                   override=bool(b.get("override")))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(200, res)
+            return
+        if sub in ("drop", "delete") and method == "POST":
+            b = self._read_json_body() or {}
+            ids = b.get("ids") if isinstance(b.get("ids"), list) else [b.get("id")]
+            done = []
+            for one in ids:
+                if not one:
+                    continue
+                try:
+                    snapshots.drop_quarantine(str(one))
+                    done.append(str(one))
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+            self._send_json(200, {"ok": True, "dropped": done})
+            return
+        if sub == "add" and method == "POST":
+            b = self._read_json_body() or {}
+            root = str(b.get("root") or "")
+            paths = b.get("paths") if isinstance(b.get("paths"), list) else []
+            if not paths and b.get("path"):
+                paths = [b.get("path")]
+            cmd = str(b.get("cmd") or "")
+            if not paths and cmd:
+                paths = snapshots.guess_targets(cmd, root)["targets"]
+            try:
+                rec = snapshots.quarantine_paths(root, paths,
+                                                 scope=str(b.get("scope") or "manual"),
+                                                 note=str(b.get("note") or ""), cmd=cmd)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+                return
+            self._send_json(200, {"ok": True, "data": rec})
+            return
+        self._send_json(404, {"ok": False, "error": "unknown quarantine route"})
+
+    def _snapshot_api(self, method: str, path: str):
+        """工作区快照：列 / 落 / 比 / 撤销（引擎无关，不依赖 git）。"""
+        sub = path[len("/snapshot"):].strip("/")
+        q = parse_qs(urlsplit(self.path).query)
+        scope = (q.get("scope") or ["panel"])[0]
+        if sub in ("", "list"):
+            self._send_json(200, {"ok": True, "data": {"items": snapshots.list_snapshots(scope)}})
+            return
+        if sub == "info":
+            self._send_json(200, {"ok": True, "data": {"latest": snapshots.list_snapshots(scope)[:1],
+                                                       "stats": snapshots.stats()}})
+            return
+        if sub == "take" and method == "POST":
+            b = self._read_json_body() or {}
+            try:
+                res = snapshots.take_snapshot(str(b.get("root") or ""),
+                                              str(b.get("scope") or scope),
+                                              label=str(b.get("label") or ""),
+                                              with_content=bool(b.get("content", True)))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(200, {"ok": True, "data": res})
+            return
+        if sub == "diff":
+            base = (q.get("base") or ["latest"])[0]
+            man = snapshots.load_manifest(scope, base) if base != "latest" else snapshots.latest_manifest(scope)
+            if not man:
+                self._send_json(404, {"ok": False, "error": "还没有快照（先 take 一次）"})
+                return
+            root = (q.get("root") or [""])[0] or man.get("root") or ""
+            try:
+                cur = snapshots.scan(root)
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            d = snapshots.diff_manifests(man, cur)
+            d["base"] = {"ts": base, "taken_at": man.get("taken_at"), "root": man.get("root")}
+            self._send_json(200, {"ok": True, "data": d})
+            return
+        if sub == "file":
+            ts = (q.get("ts") or ["latest"])[0]
+            rel = (q.get("path") or [""])[0]
+            man = snapshots.load_manifest(scope, ts) if ts != "latest" else snapshots.latest_manifest(scope)
+            if not man:
+                self._send_json(404, {"ok": False, "error": "还没有快照"})
+                return
+            base_sha = ((man.get("files") or {}).get(rel.replace("\\", "/")) or {}).get("hash") or ""
+            self._send_json(200, {"ok": True, "data": snapshots.line_diff(
+                base_sha, "", rel, root=man.get("root") or "")})
+            return
+        if sub == "undo" and method == "POST":
+            b = self._read_json_body() or {}
+            try:
+                res = snapshots.undo_snapshot(str(b.get("scope") or scope), str(b.get("ts") or ""),
+                                             paths=b.get("paths"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(200, res)
+            return
+        if sub == "drop" and method == "POST":
+            b = self._read_json_body() or {}
+            try:
+                res = snapshots.drop_snapshot(str(b.get("scope") or scope), str(b.get("ts") or ""))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            self._send_json(200, res)
+            return
+        self._send_json(404, {"ok": False, "error": "unknown snapshot route"})
+
     # ---------- 软件更新（查 GitHub Releases 最新版 / 一键静默更新） ----------
 
     def _update_check(self):
@@ -2095,6 +2345,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         res = updater.apply_update()
         self._send_json(200 if res.get("ok") else 400, res)
+
+    def _update_token(self, method: str):
+        """GitHub Token（可选）：GET 只回**掩码**；POST `{token}`，留空 = 清除。
+
+        ★ 匿名查 GitHub API 只有 60 次/小时/IP，共享出口很容易被刷没；带 Token 是 5000 次/小时/账号。
+          明文只落本机 `runtime/state/_github_token.json`，**只在直连 api.github.com 时使用**（不发给镜像代理）。
+        """
+        if method == "GET":
+            self._send_json(200, {"ok": True, "data": updater.read_token_info()})
+            return
+        if method != "POST":
+            self._send_json(405, {"error": "GET or POST only"})
+            return
+        b = self._read_json_body() or {}
+        self._send_json(200, {"ok": True, "data": updater.write_token(b.get("token"))})
 
     def _appearance(self, method: str):
         """自定义外观（头像 / 空会话素材）：GET 读当前，POST 设置或清除。"""
@@ -2543,7 +2808,7 @@ class Handler(BaseHTTPRequestHandler):
             headers[key] = value
         req = urllib.request.Request(target, data=body, headers=headers, method=method)
         try:
-            upstream = urllib.request.urlopen(req, timeout=60)
+            upstream = netsafe.local_urlopen(req, timeout=60)      # ★ 本机音乐服务：别走系统代理
         except urllib.error.HTTPError as exc:
             upstream = exc
         except Exception as exc:  # noqa: BLE001
@@ -2582,14 +2847,52 @@ class Handler(BaseHTTPRequestHandler):
         ca.remember_token(token)      # ★ 内存里记一份（桥的心跳要用 owner 身份发）
         sub = path[len("/ccagent"):].strip("/")
         if method == "GET" and sub in ("", "list"):
-            self._send_json(200, {"ok": True, "base": ca.BASE, "agents": ca.list_agents()})
+            self._send_json(200, {"ok": True, "base": ca.BASE, "agents": ca.list_agents(),
+                                  "roles": ca.roles_public(),
+                                  "teamPresets": ca.team_presets()})
+            return
+        if method == "GET" and sub == "activity":
+            # ★C1：进行中活动卡 —— 面板按 `since`（seq）增量拉；`chat` 为空 = 全部会话。
+            #   ⚠ 走**面板轮询**而不是往群里发消息（不污染历史、不碰"只认拥有者批准"的审计语义）。
+            q = parse_qs(urlsplit(self.path).query)
+            since = (q.get("since") or ["0"])[0]
+            chat = (q.get("chat") or [""])[0] or None
+            self._send_json(200, dict({"ok": True}, **ca.activity(since, chat)))
+            return
+        if method == "GET" and sub == "changes":
+            # ★对比带上「文件改动」：这个成员从**派活前**到现在改了哪些文件（文件级）
+            q = parse_qs(urlsplit(self.path).query)
+            res = ca.changes((q.get("chat") or [""])[0], (q.get("aid") or [""])[0])
+            self._send_json(200, dict({"ok": True}, **res))
             return
         body = self._read_json_body() or {}
         try:
             if method == "POST" and sub == "create":
                 a = ca.create_agent(token, body.get("name"), body.get("display") or "",
-                                    body.get("engine") or "")
+                                    body.get("engine") or "", body.get("role") or "")
                 self._send_json(200, {"ok": True, "agent": a, "agents": ca.list_agents()})
+                return
+            if method == "POST" and sub == "team":
+                # ★主动编排：一键建组（几个角色 + 各绑大脑 → 自动进群 + 开应答）
+                #   `rows` 是前端**当前面板里那几行**（支持临时改角色/名字 + 同角色多人）
+                res = ca.create_team(token, body.get("chat_id"),
+                                     str(body.get("preset") or "dev"),
+                                     body.get("engines") if isinstance(body.get("engines"), dict) else None,
+                                     body.get("names") if isinstance(body.get("names"), dict) else None,
+                                     body.get("rows") if isinstance(body.get("rows"), list) else None)
+                self._send_json(200, res)
+                return
+            if method == "POST" and sub == "team/preset":
+                # ★自定义组预设：save / delete（内置的不能删，只能另存一份）
+                act = str(body.get("action") or "save").strip().lower()
+                if act == "delete":
+                    ca.delete_team_preset(body.get("id"))
+                    self._send_json(200, {"ok": True, "teamPresets": ca.team_presets()})
+                    return
+                p = ca.save_team_preset(body.get("label"), body.get("rows"),
+                                        str(body.get("id") or ""))
+                self._send_json(200, {"ok": True, "preset": p,
+                                      "teamPresets": ca.team_presets()})
                 return
             if method == "POST" and sub == "join":
                 a = ca.join(token, body.get("id"), body.get("chat_id"))

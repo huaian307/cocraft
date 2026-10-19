@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Static checks (py_compile / features / js / ids)
+        shell: pwsh
+        run: |
+          python -m py_compile backend/server.py backend/watch.py backend/cocraft_agents.py `
+            backend/snapshots.py backend/agent_install.py backend/themes.py `
+            backend/panel_window.py backend/tray_host.py backend/fsview.py `
+            backend/pty.py backend/pty_host.py backend/updater.py
+          python tools/check_features.py
+          python tools/jsbalance.py frontend/app.js
+          python tools/check_ids.py
+
+      - name: Start panel server on 8787
+        shell: pwsh
+        run: |
+          $env:OPENCODE_UI_ENGINE = "acp"
+          Start-Process -FilePath python -ArgumentList "backend/server.py"
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 500
+            try {
+              $r = Invoke-WebRequest http://127.0.0.1:8787/healthz -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -eq 200) { Write-Host "panel server ready"; exit 0 }
+            } catch {}
+          }
+          Write-Error "panel server did not start on 8787"
+          exit 1
+
+      - name: Headless regression suite (CI mode)
+        shell: pwsh
+        run: python tools/run_suite.py --ci
+
+      - name: Upload suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-logs
+          path: runtime/logs/suite/
+          if-no-files-found: ignore
+          retention-days: 7

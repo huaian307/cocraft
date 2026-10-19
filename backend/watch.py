@@ -69,6 +69,11 @@ ALIVE_URL = f"{URL}/alive"
 os.makedirs(LOGS_DIR, exist_ok=True)
 LOG = os.path.join(LOGS_DIR, "watch.log")
 
+# 与窗口进程/其它守护通信用的状态文件（都在 runtime/state 下）
+STATE_DIR = os.path.join(RUNTIME_DIR, "state")
+PANEL_CMD_FILE = os.path.join(STATE_DIR, "_panel_cmd.json")    # 给窗口进程的命令（与托盘同一条通道）
+WATCH_REQ_FILE = os.path.join(STATE_DIR, "_watch_req.json")    # 第二个守护留下的「请把面板显示出来」请求
+
 # 任务栏联动：同目录的 taskbar.py（缺失/出错都不影响守护主流程）
 try:
     if HERE in sys.path:
@@ -77,6 +82,15 @@ try:
     import taskbar as _taskbar
 except Exception:  # noqa: BLE001
     _taskbar = None
+
+# ★ 连本机面板要绕过系统代理（CPython 首次 urlopen 会缓存带代理的 opener，代理关掉后照样生效 → 10061）
+try:
+    if HERE in sys.path:
+        sys.path.remove(HERE)
+    sys.path.insert(0, HERE)
+    import netsafe as _netsafe
+except Exception:  # noqa: BLE001
+    _netsafe = None
 
 # 进程查询走纯 ctypes 的 procutils（不再起 tasklist —— 关机时它会弹 0xc0000142 模态框）。
 # 顺手打开"错误模式抑制"：本进程 + 所有子进程起不来时都不弹那个硬错误框。
@@ -210,6 +224,44 @@ def log(msg: str) -> None:
         pass
 
 
+def _write_json_atomic(path: str, data: dict) -> None:
+    """原子写一个小 JSON（写临时文件再 os.replace，读的人永远看到完整内容）。"""
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def panel_cmd(cmd: str) -> None:
+    """请**窗口进程**执行一条命令（`show` / `hide` / `toggle` / `quit` / `flash`）。
+
+    与托盘菜单用的是**同一条通道**：`runtime/state/_panel_cmd.json`，
+    由 `panel_window.py` 的 `_poll_cmd()` 每 0.35s 轮询一次。
+    """
+    _write_json_atomic(PANEL_CMD_FILE, {"cmd": cmd, "t": time.time()})
+
+
+def read_show_request() -> float:
+    """读「有人点了快捷方式、要求把面板显示出来」的请求时间戳（没有 → 0.0）。"""
+    try:
+        with open(WATCH_REQ_FILE, "r", encoding="utf-8") as fh:
+            return float(json.load(fh).get("t") or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def consume_show_request() -> None:
+    """处理掉一条「显示面板」请求（读过的请求不该再触发一次）。"""
+    try:
+        os.remove(WATCH_REQ_FILE)
+    except OSError:
+        pass
+
+
 _ps_state = {"broken": False}
 
 
@@ -306,7 +358,12 @@ def ensure_server() -> bool:
 def panel_status() -> dict:
     """面板状态：心跳 + 用户的任务栏开关（由 server.py 提供）。"""
     try:
-        with urllib.request.urlopen(ALIVE_URL, timeout=3) as r:
+        # ★ 本机面板：显式绕过系统代理（见 netsafe.local_urlopen）
+        if _netsafe is not None:
+            r0 = _netsafe.local_urlopen(ALIVE_URL, timeout=3)
+        else:
+            r0 = urllib.request.urlopen(ALIVE_URL, timeout=3)
+        with r0 as r:
             data = json.loads(r.read().decode("utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -735,9 +792,16 @@ def main() -> int:
             lock.bind((HOST, LOCK_PORT))
             lock.listen(1)
         except OSError:
-            log(f"端口 {LOCK_PORT} 已被占用 → 判定已有守护进程在运行，退出"
+            # ★根治「关过窗之后点快捷方式打不开面板」（见 AGENTS.md 踩坑 #46⑤）：
+            #   第二个守护**不再默默退出**，而是两件事一起做 ——
+            #   ① 立刻请窗口进程 `show()`（幂等；专治"窗口被收进托盘"那种看不见）；
+            #   ② 留一张请求条，让**正在跑的守护**解除「别开窗」抑制、必要时补开一个窗口
+            #      （窗口进程已经没了的那种情况）。
+            log(f"端口 {LOCK_PORT} 已被占用 → 已有守护进程在运行；已请求它把面板显示出来"
                 f"（若这是另一个副本：开发版用 8787/8788，安装版用 17887/17888，"
                 f"想换端口就改 runtime/state/_panel.json）")
+            panel_cmd("show")
+            _write_json_atomic(WATCH_REQ_FILE, {"t": time.time()})
             return 0
         atexit.register(restore_taskbar_if_marked)   # 守护退出（正常路径）时兜底恢复
 
@@ -782,6 +846,13 @@ def main() -> int:
     last_oc = time.time()
     quiet_log_at = 0.0                           # 「刚重启过、不联动」提示的防抖节流
     last_launch_try = 0.0                        # 「把 OpenCode 拉起来」的节流（引擎=opencode 时）
+    # 「显示面板」请求：启动时先记下已有时间戳（和托盘 _watch_notify 一个道理）——
+    # 免得把上一次会话遗留的请求又执行一遍。
+    req_seen = read_show_request()
+    # ★「待显示」标志：请求可能比「发现窗口关闭」来得**早**（心跳要 8s 才超时判定），
+    #   所以不能只当场请窗口 show() 就完事 —— 得把它记下来，等真的判定"窗口没了"时
+    #   **改成重新开窗**，而不是当成"用户要退出"（实测就是这个竞态让面板没回来）。
+    pending_show = False
 
     while True:
         # 反悔期内把 tick 收窄到"刚好够判定"，让联动准点执行（误差 < 50ms）
@@ -792,6 +863,22 @@ def main() -> int:
         now = time.time()
         if not port_open():
             ensure_server()
+
+        # ---- ⓪ 有人点了快捷方式吗？（第二个守护留下的请求）----
+        # 根治「关过窗之后点快捷方式打不开面板」：另一个守护起不来（锁被我们占着）时会写这张
+        # 请求条 —— 我们要做的是：① 请窗口进程 show()（幂等）；② 解除"别开窗"抑制，
+        # 这样即使窗口进程已经没了（步骤 ⑤）也会立刻补开一个。
+        req = read_show_request()
+        if req and req > req_seen:
+            req_seen = req
+            was_suppressed = bool(skip_open) or closed_at is not None
+            skip_open = False
+            closed_at = None
+            pending_show = True              # ★ 见循环前：请求可能早于"窗口已关闭"的判定
+            panel_cmd("show")
+            consume_show_request()
+            log("收到「显示面板」请求 → 已请窗口显示出来"
+                + ("（并解除「别开窗」抑制）" if was_suppressed else ""))
 
         # ---- ① 面板窗口还开着吗 ----
         status = panel_status()
@@ -816,6 +903,9 @@ def main() -> int:
         has_win, minimized = (panel_window_state(panel_pid) if (fresh and panel_pid)
                               else (False, False))
         taskbar_sync(bool(taskbar_pref and fresh and has_win and not minimized))
+        # 「待显示」请求已经兑现（面板真的在屏幕上）→ 清掉标志
+        if pending_show and fresh and has_win:
+            pending_show = False
 
         # ---- ② 由开 → 关：进入反悔期 ----
         if was_open and not fresh:
@@ -851,17 +941,24 @@ def main() -> int:
                     fresh = True
                 else:
                     taskbar_sync(False)          # 面板确实关了 → 恢复（只恢复我们藏过的）
-                    if should_kill_on_close(required, browser_alive=False):
-                        kill_opencode()
-                    closed_at = None
-                    skip_open = True             # 这是"我要退出"的意图
-                    log("反悔期结束 → 已执行联动")
-                    if not required:
-                        # 面板独立运行（ACP）：用户把窗口关了就是结束了 —— 恢复任务栏后**退出守护**。
-                        # 否则旧守护一直占着锁 + skip_open，用户再点快捷方式会"没反应"。
-                        restore_taskbar_if_marked()
-                        log("面板已关闭且不依赖 OpenCode → 守护退出")
-                        return 0
+                    if pending_show:
+                        # ★ 用户**刚点过快捷方式**（=「我要面板」）→ 这不能算退出意图：
+                        #   不联动关 OpenCode、不设 skip_open，交给步骤 ⑤ 立刻补开一个窗口。
+                        pending_show = False
+                        closed_at = None
+                        log("面板确实关了，但刚收到「显示面板」请求 → 不联动，改为重新开窗")
+                    else:
+                        if should_kill_on_close(required, browser_alive=False):
+                            kill_opencode()
+                        closed_at = None
+                        skip_open = True             # 这是"我要退出"的意图
+                        log("反悔期结束 → 已执行联动")
+                        if not required:
+                            # 面板独立运行（ACP）：用户把窗口关了就是结束了 —— 恢复任务栏后**退出守护**。
+                            # 否则旧守护一直占着锁 + skip_open，用户再点快捷方式会"没反应"。
+                            restore_taskbar_if_marked()
+                            log("面板已关闭且不依赖 OpenCode → 守护退出")
+                            return 0
 
         # ---- ④ OpenCode 状态（较贵，降频检查）----
         if now - last_oc >= POLL_SECONDS:

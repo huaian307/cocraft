@@ -55,18 +55,22 @@ CORE_FILES = ("AGENTS.md", "README.md")
 CORE_SKIP_FILES = ("refs.html", "refs_q.html")
 
 # 可选组件的 site-packages 来源（本机是 venv）。
-# ⚠ 2026-10-12 起安装包**不再随包 music / audio**（音乐服务 / 频谱），这里也就不再列它们；
-#   仅保留 terminal / panel（它们在 cocraft.iss 里是必选组件）。
+# ⚠ 2026-10-12 起安装包**不再随包 music / audio**；**2026-10-14 起 music 又加回来且是必选组件**
+#   （用户要求：音乐别让安装的人自己勾），audio（真频谱）仍然不随包（面板会退回 CSS 合成音频条）。
 VENV_SITE = {
     # 面板内终端（ConPTY / pywinpty）与原生窗口（pywebview / WebView2 + pystray 托盘）
     "terminal": os.path.join(ROOT, "runtime", "venvs", "terminal", "Lib", "site-packages"),
     "panel": os.path.join(ROOT, "runtime", "venvs", "panel", "Lib", "site-packages"),
+    # 音乐服务（网易云 / QQ 搜歌放歌：NeteaseCloudMusic + py-mini-racer）
+    "music": os.path.join(ROOT, "runtime", "venvs", "music", "Lib", "site-packages"),
 }
 # 打包时要踢掉的东西：pip/wheel/缓存/元数据（运行时不看）。
 SITE_SKIP_COMMON = ("pip", "pip-*", "wheel", "wheel-*", "__pycache__", "*.dist-info", "*.egg-info")
 SITE_SKIP = {
     "terminal": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
     "panel": SITE_SKIP_COMMON + ("setuptools", "setuptools-*", "pkg_resources"),
+    # ★ music **不能**踢 setuptools：NeteaseCloudMusic 要 `pkg_resources`（venv 里就锁了 setuptools<81）
+    "music": SITE_SKIP_COMMON,
 }
 
 # 随包 agent（codex 完整路线）
@@ -662,8 +666,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="打包 cocraft 安装包")
     ap.add_argument("--agents", default="codex,claude,opencode",
                     help="随包 agent：codex / claude / opencode（逗号分隔也行）/ all / none")
-    ap.add_argument("--components", default="terminal,panel",
-                    help="准备哪些组件：terminal,panel（默认都带；music,audio 需显式指定）")
+    ap.add_argument("--components", default="music,terminal,panel",
+                    help="准备哪些组件：music,terminal,panel（默认都带；music = 网易云/QQ 搜歌放歌，必选；audio 需显式指定）")
     ap.add_argument("--no-iss", action="store_true", help="只准备 payload，不编译安装包")
     ap.add_argument("--no-protect", action="store_true",
                     help="不做「档1 去源码」（调试用，保留 .py 源码）")

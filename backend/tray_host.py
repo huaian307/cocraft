@@ -42,6 +42,14 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _read_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--title", default="cocraft · 絵梨衣")
@@ -78,19 +86,60 @@ def main() -> int:
     )
     icon = pystray.Icon("cocraft", image, args.title, menu)
 
-    if args.parent_pid:
-        def _watch():
-            while True:
-                if not _pid_alive(args.parent_pid):
+    # ★B3：面板写 `_notify.json`（POST /panel/notify）→ 这里弹系统气泡 + 让窗口闪任务栏。
+    # 靠 `ts` 变大判定"是新的一条"；启动时先记下已有 ts，避免把上次遗留的又弹一遍。
+    notify_file = os.path.join(state_dir, "_notify.json")
+    seen = {"ts": 0.0}
+    _cur = _read_json(notify_file)
+    if isinstance(_cur, dict):
+        try:
+            seen["ts"] = float(_cur.get("ts") or 0)
+        except Exception:  # noqa: BLE001
+            seen["ts"] = 0.0
+
+    def _watch_notify():
+        while True:
+            data = _read_json(notify_file)
+            if isinstance(data, dict):
+                try:
+                    ts = float(data.get("ts") or 0)
+                except Exception:  # noqa: BLE001
+                    ts = 0.0
+                if ts > seen["ts"]:
+                    seen["ts"] = ts
+                    title = str(data.get("title") or args.title)
+                    body = str(data.get("body") or "")
                     try:
-                        icon.stop()
+                        icon.notify(body or title, title)
                     except Exception:  # noqa: BLE001
                         pass
-                    return
-                time.sleep(2)
-        threading.Thread(target=_watch, daemon=True).start()
+                    if data.get("flash", True):
+                        _write_cmd(state_dir, "flash")     # 让窗口进程闪任务栏
+            time.sleep(0.8)
 
-    icon.run()
+    def _watch_parent():
+        while True:
+            if not _pid_alive(args.parent_pid):
+                try:
+                    icon.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            time.sleep(2)
+
+    def _setup(_icon):
+        # ⚠ pystray 的规矩：**一旦传了自定义 setup，它就不会再帮你显示图标** ——
+        # 必须在这里自己 `visible = True`。见 pystray/_base.py 的 _start_setup：
+        #     if setup: setup(self)          # 自定义：什么都不做
+        #     else:     self.visible = True  # 默认：才 NIM_ADD
+        # （B3 把 _watch_notify 挪进 _setup 时漏了这一句 → 托盘图标从 ui 0.1.68 起一直没显示。）
+        _icon.visible = True
+        # 气泡要等图标就绪（icon.run 起来之后）才发得出去，所以轮询放这里启动。
+        threading.Thread(target=_watch_notify, daemon=True).start()
+        if args.parent_pid:
+            threading.Thread(target=_watch_parent, daemon=True).start()
+
+    icon.run(_setup)
     return 0
 
 

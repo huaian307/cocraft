@@ -64,9 +64,11 @@ Name: "chinese"; MessagesFile: "compiler:Default.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 ; —— 各目录的 payload 只有 build.py 备了才存在，这里按需声明 ——
-; ⚠ 2026-10-12 起：不再有 music / audio 组件；agent 与 terminal / panel 全部是**必选组件**。
+; ⚠ 2026-10-12 起：agent 与 terminal / panel 全部是**必选组件**；
+;   ★ 2026-10-14 起 **music 也随包、也是必选**（用户要求：音乐别让装的人自己勾）；audio（真频谱）仍不随包。
 #define HaveTerminal DirExists(AddBackslash(PayloadDir) + "components\terminal\site-packages")
 #define HavePanelDir DirExists(AddBackslash(PayloadDir) + "components\panel\site-packages")
+#define HaveMusic DirExists(AddBackslash(PayloadDir) + "components\music\site-packages")
 #define HaveAgent FileExists(AddBackslash(PayloadDir) + "agents\node\node.exe")
 #define HaveCodex DirExists(AddBackslash(PayloadDir) + "agents\codex\node_modules")
 #define HaveClaude DirExists(AddBackslash(PayloadDir) + "agents\claude\node_modules")
@@ -76,25 +78,33 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: checkedonce
 
 [Components]
-; ⚠ 2026-10-12 起：**全部必选（Flags: fixed）** —— 安装包不再提供可选组件，装即全带，用户不可取消。
+; ⚠ 2026-10-17 起：**agent 改成可选**（用户只装自己用的；装错了随时重跑本安装包补装 ——
+;   覆盖安装**保留 `runtime\`**，设置/会话/密钥都不丢）。
+;   核心 / 终端 / 原生窗口 / 音乐 仍然**必选**（他们不是"可选功能"，是面板的骨架）。
+;   ⚠ **Node 运行时不再单独占勾选项**：Codex / Claude 的适配器是 JS，没 node 跑不起来 →
+;     它的文件由 `Components: agent_codex or agent_claude` **带着装**；随包 OpenCode 是原生 exe，不需要 node。
 Name: "core";    Description: "核心（面板 + 后端 + 嵌入式 Python）"; Types: full compact custom; Flags: fixed
 #if HaveAgent
-Name: "agent_node";   Description: "Node 运行时（agent 适配器 / 随包 OpenCode 共用）"; Types: full compact custom; Flags: fixed
+; ⚠ Node 运行时**不再单独占一个勾选项**：它的文件由 `Components: agent_codex or agent_claude` 带着装
+;   （两个适配器都是 JS，没 node 跑不起来）；随包 OpenCode 是原生 exe，不需要 node。
 #endif
 #if HaveCodex
-Name: "agent_codex";  Description: "Codex 适配器 + 自带 codex CLI"; Types: full compact custom; Flags: fixed
+Name: "agent_codex";  Description: "Codex 适配器 + 自带 codex CLI（约 440 MB）"; Types: full compact custom
 #endif
 #if HaveClaude
-Name: "agent_claude"; Description: "Claude Code 适配器（自带 SDK 的 Claude Code CLI）"; Types: full compact custom; Flags: fixed
+Name: "agent_claude"; Description: "Claude Code 适配器（自带 SDK 的 Claude Code CLI）"; Types: full compact custom
 #endif
 #if HaveOpencode
-Name: "agent_opencode"; Description: "随包 OpenCode（npm opencode-ai）"; Types: full compact custom; Flags: fixed
+Name: "agent_opencode"; Description: "随包 OpenCode（原生 exe，不依赖 node）"; Types: full compact custom
 #endif
 #if HaveTerminal
 Name: "terminal"; Description: "面板内终端（ConPTY / pywinpty）"; Types: full compact custom; Flags: fixed
 #endif
 #if HavePanelDir
 Name: "panel";   Description: "原生软件窗口（WebView2 / pywebview + 托盘）"; Types: full compact custom; Flags: fixed
+#endif
+#if HaveMusic
+Name: "music";   Description: "音乐（网易云 / QQ 搜歌放歌 + 歌词）"; Types: full compact custom; Flags: fixed
 #endif
 
 [Files]
@@ -105,7 +115,7 @@ Source: "{#PayloadDir}\init_state.*";   DestDir: "{app}";          Flags: ignore
 Source: "{#PayloadDir}\VERSION";         DestDir: "{app}";          Flags: ignoreversion; Components: core
 ; —— 随包 agent ——
 #ifdef HaveAgent
-Source: "{#PayloadDir}\agents\node\*";    DestDir: "{app}\agents\node";   Flags: ignoreversion recursesubdirs createallsubdirs; Components: agent_node
+Source: "{#PayloadDir}\agents\node\*";    DestDir: "{app}\agents\node";   Flags: ignoreversion recursesubdirs createallsubdirs; Components: agent_codex or agent_claude
 #endif
 #ifdef HaveCodex
 Source: "{#PayloadDir}\agents\codex\*";   DestDir: "{app}\agents\codex";  Flags: ignoreversion recursesubdirs createallsubdirs; Components: agent_codex
@@ -117,12 +127,15 @@ Source: "{#PayloadDir}\agents\claude\*";  DestDir: "{app}\agents\claude"; Flags:
 Source: "{#PayloadDir}\agents\opencode\*"; DestDir: "{app}\agents\opencode"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: agent_opencode
 #endif
 ; —— 组件（纯 site-packages；由 _component_python() 用自带解释器 + PYTHONPATH 跑）——
-; ⚠ 不再有 music / audio。
+; ⚠ audio（真频谱）仍不随包（没装就退回 CSS 合成音频条）；**music 自 2026-10-14 起随包且必选**。
 #if HaveTerminal
 Source: "{#PayloadDir}\components\terminal\site-packages\*"; DestDir: "{app}\runtime\site-packages\terminal"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: terminal
 #endif
 #if HavePanelDir
 Source: "{#PayloadDir}\components\panel\site-packages\*"; DestDir: "{app}\runtime\site-packages\panel"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: panel
+#endif
+#if HaveMusic
+Source: "{#PayloadDir}\components\music\site-packages\*"; DestDir: "{app}\runtime\site-packages\music"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: music
 #endif
 
 [InstallDelete]
@@ -204,13 +217,6 @@ begin
     KillOurProcesses();
 end;
 
-// 勾了任一「适配器」组件就必须带上 node 运行时（两个适配器都靠它跑）
-function NextButtonClick(CurPageID: Integer): Boolean;
-begin
-  Result := True;
-  if CurPageID = wpSelectComponents then
-  begin
-    if WizardIsComponentSelected('agent_codex') or WizardIsComponentSelected('agent_claude') then
-      WizardSelectComponents('agent_node');
-  end;
-end;
+// ⚠ 不再需要「勾适配器就自动勾 node」那段了（`ui 0.1.82`）：
+//   node 的 [Files] 直接写成 `Components: agent_codex or agent_claude`，跟着适配器走；
+//   旧的那个自动勾选守卫要显式选一个已经不存在的组件，会在运行时报错，所以整段移除。

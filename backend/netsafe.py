@@ -104,3 +104,23 @@ def urlopen(req, timeout: float = 30, context: "ssl.SSLContext | None" = None):
     """带证书兜底的 urlopen —— 即使没调 `install()` 也能单独用。"""
     return urllib.request.urlopen(req, timeout=timeout,
                                   context=context or ssl_context())
+
+
+# ---------------- ★连「本机服务」专用：显式绕过系统代理 ----------------
+# 为什么必须单独一个（2026-10-15 实测踩到，排查了很久）：
+#   ① CPython 的 `urllib.request.urlopen()` **首次调用就把 opener 缓存住**（`_opener`），
+#      而 `build_opener()` 在构建时读 `getproxies()` —— 那一刻系统代理是**开**的，就带上了 `ProxyHandler`。
+#   ② 之后用户把代理**关**掉（注册表 `ProxyEnable=0`）—— 而 CPython 在 Windows 上
+#      `proxy_bypass_registry()` 在 `ProxyEnable=0` 时返回 **0 = "不绕过"** →
+#      缓存里那个代理**照样生效**（per-request 不会重新判断）。
+#   ③ 于是面板把**发给本机上游**（`http://127.0.0.1:49374`，OpenCode）的请求塞给了已关闭的
+#      代理 `127.0.0.1:7890` → `WinError 10061 目标计算机积极拒绝` → **界面一直"未连接"，
+#      而上游其实是好的**（`netstat` 铁证：`127.0.0.1:xxxxx → 127.0.0.1:7890 SYN_SENT`）。
+# ⇒ **凡是要连本机端口（面板 8787 / OpenCode 上游 / 音乐服务 8790 …），一律用这个 opener。**
+#   要连外网（GitHub / cocraft / 音乐站 / 技能下载）的仍用上面的 `urlopen()` —— 那种场景代理**可能是有用的**。
+LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def local_urlopen(req, timeout: float = 30):
+    """连**本机服务**专用：**不走系统代理**（见上面那段的血泪史）。"""
+    return LOCAL_OPENER.open(req, timeout=timeout)

@@ -54,6 +54,9 @@ frontend/assets/*.ico
 #      （它们含本机路径、进程号、个人项目名等；见 docs/REPRODUCE.md §7）
 AGENTS.md
 docs/PROGRESS.md
+docs/核心竞争力-增强方向.md
+docs/群聊存在感-方案.md
+docs/通用diff-工作区快照底座.md
 frontend/refs.html
 frontend/refs_q.html
 

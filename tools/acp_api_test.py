@@ -352,6 +352,67 @@ def main() -> int:
         check("POST .../command 200", st == 200, str(js)[:160])
         st, js = call("POST", "/api/session/sess_missing/command", {"name": "x"})
         check("command on unknown session -> 404", st == 404, str(js)[:120])
+
+        # ---- ★可逆执行：隔离区 + 工作区快照（引擎无关的 HTTP 路由）----
+        print("[13] quarantine + snapshot routes")
+        import snapshots as _sn                                 # noqa: PLC0415
+        _sn.QUARANTINE_DIR = os.path.join(tmp, "q")
+        _sn.SNAPSHOT_DIR = os.path.join(tmp, "snaps")
+        _sn.STORE_DIR = os.path.join(_sn.SNAPSHOT_DIR, "_store")
+        wsdir = os.path.join(tmp, "ws")
+        os.makedirs(wsdir, exist_ok=True)
+        with open(os.path.join(wsdir, "precious.txt"), "w", encoding="utf-8") as fh:
+            fh.write("PRECIOUS\n")
+
+        st, js = call("GET", "/quarantine/list")
+        check("GET /quarantine/list -> 200 + items/stats",
+              st == 200 and isinstance((js or {}).get("data", {}).get("items"), list)
+              and "stats" in ((js or {}).get("data") or {}), str(js)[:160])
+
+        st, js = call("POST", "/quarantine/add",
+                      {"root": wsdir, "paths": [os.path.join(wsdir, "precious.txt")],
+                       "scope": "routes", "note": "test", "cmd": "Remove-Item x"})
+        qid = ((js or {}).get("data") or {}).get("id") or ""
+        check("POST /quarantine/add quarantines 1 item", st == 200 and bool(qid), str(js)[:200])
+
+        st, js = call("GET", "/quarantine/get?id=%s" % urllib.parse.quote(qid, safe=""))
+        check("GET /quarantine/get returns the manifest",
+              st == 200 and ((js or {}).get("data") or {}).get("cmd") == "Remove-Item x", str(js)[:160])
+
+        os.remove(os.path.join(wsdir, "precious.txt"))
+        st, js = call("POST", "/quarantine/restore", {"id": qid})
+        check("POST /quarantine/restore puts the file back",
+              st == 200 and ((js or {}).get("restored") == 1)
+              and os.path.isfile(os.path.join(wsdir, "precious.txt")), str(js)[:200])
+        st, js = call("POST", "/quarantine/restore", {"id": qid})
+        check("restore onto an existing target -> conflict (no silent overwrite)",
+              st == 200 and ((js or {}).get("conflict") == 1), str(js)[:160])
+        st, js = call("POST", "/quarantine/drop", {"id": qid})
+        check("POST /quarantine/drop removes the record", st == 200, str(js)[:140])
+        st, js = call("POST", "/quarantine/restore", {"id": "../../etc"})
+        check("restore with a bogus id -> 400", st == 400, str(js)[:140])
+
+        st, js = call("POST", "/snapshot/take",
+                      {"root": wsdir, "scope": "routes", "label": "turn", "content": True})
+        ts = ((js or {}).get("data") or {}).get("ts") or ""
+        check("POST /snapshot/take -> 200 + ts", st == 200 and bool(ts), str(js)[:200])
+        with open(os.path.join(wsdir, "precious.txt"), "w", encoding="utf-8") as fh:
+            fh.write("CHANGED\n")
+        with open(os.path.join(wsdir, "new.txt"), "w", encoding="utf-8") as fh:
+            fh.write("NEW\n")
+        st, js = call("GET", "/snapshot/diff?scope=routes")
+        _d = (js or {}).get("data") or {}
+        check("GET /snapshot/diff detects 1 changed + 1 added",
+              st == 200 and _d.get("stats", {}).get("changed") == 1
+              and _d.get("stats", {}).get("added") == 1, str(_d)[:220])
+        st, js = call("GET", "/snapshot/file?scope=routes&path=precious.txt")
+        check("GET /snapshot/file gives a line-level diff",
+              st == 200 and ((js or {}).get("data") or {}).get("ok") is True, str(js)[:200])
+        st, js = call("POST", "/snapshot/undo", {"scope": "routes", "ts": ts})
+        check("POST /snapshot/undo restores the old content",
+              st == 200 and ((js or {}).get("restored") == 1) and ((js or {}).get("removed") == 1)
+              and open(os.path.join(wsdir, "precious.txt"), encoding="utf-8").read().strip() == "PRECIOUS"
+              and not os.path.exists(os.path.join(wsdir, "new.txt")), str(js)[:240])
     finally:
         try:
             eng = server.engines.get_engine("acp")

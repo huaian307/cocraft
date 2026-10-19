@@ -50,6 +50,13 @@ API_URL = (os.environ.get("COCRAFT_UPDATE_API")
 UA = "cocraft-updater"
 ASSET_PREFIXES = ("cocraft-setup-", "opencode-ui-setup-")   # 新名优先，兼容旧包名
 CACHE_SECONDS = 3600
+# ★ 失败缓存 10 分钟（不要用 60s）：GitHub **匿名**查询限流是 60 次/小时/IP（实测响应头），
+#   网络不通时前端启动就查一次，60s 的短缓存会把配额**烧光**，之后即使网络恢复也一直 403。
+FAIL_CACHE_SECONDS = 600
+# ★ 下载读超时：200MB 的包经第三方镜像，60s 偏紧（慢镜像会中途被判超时 → 整包重下）。
+DOWNLOAD_TIMEOUT = 120
+# ★ 启动更新脚本后，等它自报一次 `phase="started"` 的上限（本机 PowerShell 不可用时会静默什么都不做）。
+PS_START_WAIT = 12.0
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 
@@ -192,46 +199,215 @@ def _pick_asset(assets) -> dict:
     return {}
 
 
+# ---------------- GitHub Token（可选，解决匿名限流） ----------------
+# ★ 匿名查 GitHub API 只有 **60 次/小时/IP**（实测响应头，见踩坑 #44）；共享出口（梯子 / 代理 / 公司 NAT）
+#   很容易被别人一起刷没 → 用户看到的就是"检查失败 / 更新失败"。
+#   带 Token 是 **5000 次/小时/账号**（按账号算，不受出口 IP 影响）→ 要治本就得让面板带上 Authorization。
+#   ⚠ **只在直连 api.github.com 时带** —— 绝不把 Token 交给第三方镜像代理（那等于把凭据送给别人）。
+#   本机保存位置 `runtime/state/_github_token.json`（**只在本地；不进安装包、不进仓库**）；
+#   也认环境变量 `COCRAFT_GITHUB_TOKEN` / `GITHUB_TOKEN`（两者优先级高于文件）。
+def _token_path(app: str = "") -> str:
+    return os.path.join(app or ROOT, "runtime", "state", "_github_token.json")
+
+
+def github_token() -> str:
+    v = (os.environ.get("COCRAFT_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+    if v:
+        return v
+    try:
+        with open(_token_path(), "r", encoding="utf-8-sig") as fh:
+            return str((json.load(fh) or {}).get("token") or "").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def mask_secret(t: str) -> str:
+    """只回掩码（跟「模型 API Key」那一行同一个规矩：**明文不进界面**）。"""
+    t = str(t or "")
+    if not t:
+        return ""
+    if len(t) <= 8:
+        return "已设置"
+    return "%s…%s（%d 位）" % (t[:4], t[-4:], len(t))
+
+
+def read_token_info() -> dict:
+    env = (os.environ.get("COCRAFT_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+    t = github_token()
+    return {"set": bool(t), "mask": mask_secret(t), "source": ("env" if env else ("state" if t else ""))}
+
+
+def write_token(token) -> dict:
+    """`token` 留空 = 清除。写盘后**清掉 check 缓存**，让改动立刻生效。"""
+    t = str(token or "").strip()
+    p = _token_path()
+    try:
+        if not t:
+            os.remove(p)
+        else:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"token": t}, fh)
+            os.replace(tmp, p)
+    except OSError:
+        pass
+    _cache.update(t=0.0, data=None)
+    return read_token_info()
+
+
+def _gh_headers(url: str, accept: str = "application/vnd.github+json") -> dict:
+    """请求头。★ **只有在直连 GitHub API 时**才加 Authorization（不给第三方镜像代理看）。"""
+    h = {"User-Agent": UA, "Accept": accept}
+    if url == API_URL:
+        tok = github_token()
+        if tok:
+            h["Authorization"] = "Bearer " + tok
+    return h
+
+
+def _api_candidates() -> list:
+    """「查最新版」的源：**直连 → 各镜像代理**（去重）。
+
+    ★ 2026-10-14：国内很常见的问题是**连不上 github.com / api.github.com**（实测 WinError 10060）。
+      下载早就有一层镜像兜底，但这里以前只走直连 → 网络一挡就**完全查不到更新**（用户看到的
+      就是"更新失败"）。实测：`gh-proxy.com` 能代理 `api.github.com`（返回完整 JSON，带 size/digest）。
+    """
+    env = (os.environ.get("COCRAFT_UPDATE_DOWNLOAD") or "").strip()
+    cands = []
+    if env:
+        cands.append(env.replace("{url}", API_URL) if "{url}" in env else env.rstrip("/") + "/" + API_URL)
+    cands.append(API_URL)
+    for m in DOWNLOAD_MIRRORS:
+        cands.append(m + API_URL)
+    seen, out = set(), []
+    for u in cands:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+_RE_TAG = re.compile(r"/releases/tag/([^/\"?#]+)")
+_RE_ASSET = re.compile(r"/releases/download/([^/\"?]+)/([^\"?]+\.exe)")
+
+
+def _http_text(url: str, timeout: float = 25.0):
+    """GET 一个文本页（自动跟随重定向）；返回 `(最终URL, 正文)`。"""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.geturl(), resp.read(600000).decode("utf-8", "replace")
+
+
+def _check_via_html():
+    """★ 兜底：连不上 GitHub / API 全挂时，用**镜像**从 releases 页面抠版本号与安装包名。
+
+    `mirror + github.com/<repo>/releases/latest` → 302 到 `.../releases/tag/<tag>`（实测 ghproxy.net / ghfast.top 可用）；
+    资产名在 `.../releases/expanded_assets/<tag>` 片段里（同两个镜像可用）。
+    拿不到 `size` / `digest`（那是 API 才有的）→ 后面只做"够大 + MZ"两项校验。
+    """
+    for m in DOWNLOAD_MIRRORS:
+        try:
+            final, html = _http_text(m + "https://github.com/%s/releases/latest" % REPO)
+        except Exception:  # noqa: BLE001
+            continue
+        mt = _RE_TAG.search(final) or _RE_TAG.search(html)
+        if not mt:
+            continue
+        tag = mt.group(1)
+        name = ""
+        try:
+            _f2, ea = _http_text(m + "https://github.com/%s/releases/expanded_assets/%s" % (REPO, tag))
+            ma = _RE_ASSET.search(ea)
+            if ma:
+                name = ma.group(2)
+        except Exception:  # noqa: BLE001
+            pass
+        if not name:                       # 片段拿不到就按命名约定兜一个（新名/旧名各试一次）
+            ver = tag[1:] if tag.startswith("v") else tag
+            for pfx in ASSET_PREFIXES:
+                name = "%s%s-windows-x64.exe" % (pfx, ver)
+                break
+        return {"tag": tag, "latest": (tag[1:] if tag.startswith("v") else tag),
+                "asset": {"name": name,
+                          "url": "https://github.com/%s/releases/download/%s/%s" % (REPO, tag, name),
+                          "size": None, "digest": ""},
+                "source": m + "(html)"}
+    return None
+
+
 def check(force: bool = False) -> dict:
-    """查最新版本。结果缓存 1 小时（失败缓存短一点，避免频繁打接口）。"""
+    """查最新版本。结果缓存 1 小时（失败缓存 `FAIL_CACHE_SECONDS`，别烧光 GitHub 匿名限流）。"""
     now = time.time()
     cached = _cache.get("data")
     if cached is not None and not force:
-        ttl = CACHE_SECONDS if cached.get("ok") else 60
+        ttl = CACHE_SECONDS if cached.get("ok") else FAIL_CACHE_SECONDS
         if now - _cache["t"] < ttl:
             return cached
 
     cur = current_version()
     out = {"ok": True, "supported": bool(cur), "current": cur, "latest": "",
            "hasUpdate": False, "asset": None, "notes": "", "htmlUrl": "",
-           "checkedAt": int(now), "reason": ""}
+           "checkedAt": int(now), "reason": "", "source": ""}
     if not cur:
         out["reason"] = "没有版本信息（开发环境 / 非安装版）"
         _cache.update(t=now, data=out)
         return out
 
-    try:
-        req = urllib.request.Request(API_URL, headers={
-            "User-Agent": UA, "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            rel = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        out["ok"] = False
-        out["reason"] = "检查失败：%s" % exc
+    # ① API：直连 → 镜像代理 api.github.com（拿到完整数据：size / sha256 digest）
+    rel, src, errors, limit_hit = None, "", [], False
+    for url in _api_candidates():
+        host = _host_of(url)
+        try:
+            req = urllib.request.Request(url, headers=_gh_headers(url, "application/vnd.github+json"))
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                rel = json.loads(resp.read().decode("utf-8"))
+            src = host
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 429):
+                limit_hit = True
+                errors.append("%s：HTTP %s（可能是限流）" % (host, exc.code))
+            else:
+                errors.append("%s：HTTP %s" % (host, exc.code))
+        except Exception as exc:  # noqa: BLE001
+            errors.append("%s：%s" % (host, exc))
+
+    if rel is not None:
+        tag = str(rel.get("tag_name") or "").strip()
+        latest = tag[1:] if tag.startswith("v") else tag
+        asset = _pick_asset(rel.get("assets"))
+        out["latest"] = latest
+        out["notes"] = str(rel.get("body") or "")[:2000]
+        out["htmlUrl"] = str(rel.get("html_url") or "")
+        out["asset"] = asset or None
+        out["source"] = src
+        out["hasUpdate"] = bool(latest and _verkey(latest) > _verkey(cur))
+        if out["hasUpdate"] and not asset:
+            out["hasUpdate"] = False
+            out["reason"] = "最新版本里没有可用的安装包"
         _cache.update(t=now, data=out)
         return out
 
-    tag = str(rel.get("tag_name") or "").strip()
-    latest = tag[1:] if tag.startswith("v") else tag
-    asset = _pick_asset(rel.get("assets"))
-    out["latest"] = latest
-    out["notes"] = str(rel.get("body") or "")[:2000]
-    out["htmlUrl"] = str(rel.get("html_url") or "")
-    out["asset"] = asset or None
-    out["hasUpdate"] = bool(latest and _verkey(latest) > _verkey(cur))
-    if out["hasUpdate"] and not asset:
-        out["hasUpdate"] = False
-        out["reason"] = "最新版本里没有可用的安装包"
+    # ② HTML 兜底：API 全挂（典型是连不上 GitHub）→ 借镜像从 releases 页面拿版本号 + 安装包名
+    fb = _check_via_html()
+    if fb:
+        out["latest"] = fb["latest"]
+        out["asset"] = fb["asset"]
+        out["source"] = fb["source"]
+        out["htmlUrl"] = "https://github.com/%s/releases/tag/%s" % (REPO, fb["tag"])
+        out["hasUpdate"] = bool(fb["latest"] and _verkey(fb["latest"]) > _verkey(cur))
+        _cache.update(t=now, data=out)
+        return out
+
+    # ③ 都不行 → 明确说是网络问题（并给一句可操作的话）
+    out["ok"] = False
+    if limit_hit:
+        out["reason"] = ("GitHub 接口限流（HTTP 403/429）：匿名查询只有 60 次/小时/IP（共享出口容易被别人刷没）。"
+                         "在「设置 → 软件更新 → GitHub Token」填一个只读 token 可提到 5000 次/小时/账号。")
+    else:
+        out["reason"] = ("检查失败：连不上 GitHub（已试 %d 个源）—— 多半是本机网络/DNS 到 GitHub 不通；"
+                         "%s" % (len(errors), "；".join(errors[:3])))
     _cache.update(t=now, data=out)
     return out
 
@@ -272,6 +448,9 @@ def _build_apply_ps(app: str, setup: str, log: str, latest: str, cur: str, relau
         "    [IO.File]::WriteAllText($statePath, ($obj | ConvertTo-Json -Compress))",
         "  } catch {}",
         "}",
+        # ★ 第一件事：告诉面板「脚本起来了」。否则面板分不清"脚本根本没跑"和"正在装" ——
+        #   本机 PowerShell 不可用时（见 AGENTS.md 踩坑 #69 的 0xc0000142）脚本会静默什么都不做。
+        "Write-UpdateState 'started' $null ''",
         "Start-Sleep -Seconds 1",
         "$p = Start-Process -FilePath '%s' -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS','/LOG=%s' -PassThru -Wait"
         % (sq(setup), sq(log)),
@@ -286,8 +465,14 @@ def _build_apply_ps(app: str, setup: str, log: str, latest: str, cur: str, relau
         "    robocopy $src $dst /E /IS /IT /NFL /NDL /NJH /NJS /NP | Out-Null",
         "  }",
         "}",
-        "if ($code -eq 0) { Write-UpdateState 'done' $true '' } else { Write-UpdateState 'failed' $false ('installer exit code ' + $code + ' (log: %s)') }"
-        % sq(log),
+        "if ($code -eq 0) { Write-UpdateState 'done' $true '' } else {",
+        # ★ 把 install.log 尾部带进错误里 —— 否则用户（和我）只看到 "exit code N"，还得去找那个文件
+        "  $tail = ''",
+        "  if (Test-Path '%s') { $tail = ((Get-Content '%s' -Tail 12 -ErrorAction SilentlyContinue) -join ' | ') }"
+        % (sq(log), sq(log)),
+        "  if (-not $tail) { $tail = '(no log)' }",
+        "  Write-UpdateState 'failed' $false ('installer exit code ' + $code + '; log tail: ' + $tail)",
+        "}",
         "Start-Sleep -Seconds 2",
     ]
     if relaunch:
@@ -328,12 +513,14 @@ def apply_update(app_dir: str = "") -> dict:
     # 下载（流式；依次尝试 环境变量 > 镜像 > 直连；下完先校验再动安装器）
     errors = []
     got = False
+    used_src = ""
     for cand in _download_candidates(asset["url"]):
         try:
             req = urllib.request.Request(cand, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=60) as resp, open(setup, "wb") as fh:
+            with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp, open(setup, "wb") as fh:
                 shutil.copyfileobj(resp, fh, 256 * 1024)
             got = True
+            used_src = _host_of(cand)
             break
         except Exception as exc:  # noqa: BLE001
             errors.append("%s：%s" % (_host_of(cand), exc))
@@ -344,6 +531,8 @@ def apply_update(app_dir: str = "") -> dict:
                     pass
     if not got:
         return fail("下载失败（已试 %d 个源）：%s" % (len(errors), "；".join(errors)))
+    write_status(app, phase="downloading", ok=None, version=latest, fromVersion=cur,
+                 error="", source=used_src)          # ★ 记下"是哪个源下到的"，现场排查用
 
     # 完整性校验：拒绝半截 / 错文件 / 代理返回的 HTML（否则安装器会静默失败，看着像"没更新"）
     size = os.path.getsize(setup)
@@ -382,6 +571,20 @@ def apply_update(app_dir: str = "") -> dict:
     except Exception as exc:  # noqa: BLE001
         return fail("启动更新程序失败：%s" % exc)
 
+    # ★ 等脚本**自报 started** —— 本机 PowerShell 起不来（0xc0000142 之类）时它会静默什么都不做，
+    #   面板就会永远停在"更新中…（装完自动重启）"，用户只能得出"更新失败"。这里把它变成明确报错。
+    t0 = time.time()
+    started = False
+    while time.time() - t0 < PS_START_WAIT:
+        ph = str(read_status(app).get("phase") or "")
+        if ph and ph != "installing":        # started / done / failed 都算"脚本确实跑了"
+            started = True
+            break
+        time.sleep(0.5)
+    if not started:
+        return fail("更新脚本没能启动（%.0f 秒内没有回报）——本机 PowerShell 可能不可用；"
+                    "可手动运行 %s" % (PS_START_WAIT, setup))
+
     return {"ok": True, "message": "已开始静默更新，安装完成后面板会自动重启",
             "latest": latest, "setup": setup, "size": size, "backup": backup,
-            "willRestart": bool(relaunch)}
+            "source": used_src, "willRestart": bool(relaunch)}
