@@ -1670,6 +1670,18 @@ PY_CHECKS = [
     ("主动编排", "★快照失败也**不挡住回帖**", r"快照失败绝不能挡住回帖"),
     ("主动编排", "★changes 的 root = 与桥**同一个来源**（别两套判定）", r"def _ws_root\("),
     ("主动编排", "★路由 GET /ccagent/changes", r'sub == "changes"'),
+    # ---- ★本地协作 Runner（0.2.0 第一刀，不依赖群聊/登录）----
+    ("本地协作", "★任务/成员数据模型 + 落盘", r"def start_run\("),
+    ("本地协作", "★每个成员独立 AcpService + 独立会话文件（不碰面板/群聊）",
+     r"sessions_file=sessions_file"),
+    ("本地协作", "★并发：每个成员一个线程", r'threading\.Thread\(target=_run_member'),
+    ("本地协作", "★失败隔离（一个成员挂了不影响别人）", r"except Exception as exc:  # noqa: BLE001\s*\n\s*member\[\"status\"\] = \"failed\""),
+    ("本地协作", "★权限排队：等级命中放行、否则等 UI（fail-closed）", r"def _ask_permission\("),
+    ("本地协作", "★待批/回复（once/always/reject）", r"def reply_permission\("),
+    ("本地协作", "★取消 / 超时", r'def cancel_run\(|member\["status"\] = "timeout"'),
+    ("本地协作", "★仲裁：再跑一个 reviewer 并抠「推荐 X」", r"def arbitrate\(|def _run_arbitration\("),
+    ("本地协作", "★结果可追溯：全部申请（pending+已结算）都回", r'run\.get\("permissions"\) or \[\]'),
+    ("本地协作", "★HTTP 路由 /orchestrate/*", r'path\.startswith\("/orchestrate"\)'),
 ]
 
 
@@ -1705,6 +1717,7 @@ def main() -> int:
                  os.path.join("backend", "external.py"),
                  os.path.join("backend", "fsview.py"),
                  os.path.join("backend", "snapshots.py"),
+                 os.path.join("backend", "orchestrator.py"),
                  os.path.join("backend", "agent_install.py"),
                  os.path.join("backend", "themes.py"),
                  os.path.join("backend", "netsafe.py"),
@@ -1769,7 +1782,7 @@ def main() -> int:
               "cocraft_activity_test.py", "session_tree_test.py", "session_progress_test.py",
               "quarantine_test.py", "quarantine_ui_test.py", "undo_turn_test.py", "dispatch_test.py",
               "team_test.py", "trust_panel_test.py", "context_chip_test.py", "acp_session_sync_test.py",
-              "run_suite.py",
+              "run_suite.py", "orchestrator_test.py",
               "acp_events_test.py", "acp_api_test.py", "acp_engine_ui_test.py",
               "watch_mode_test.py", "md_render_test.py", "selftest.py",
               "cocraft_agents_check.py", "cocraft_ws_check.py")

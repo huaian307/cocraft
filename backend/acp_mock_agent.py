@@ -19,7 +19,9 @@
 session/close|delete。对未知的带 id 请求**故意不回**（用于验证客户端超时）。
 """
 import json
+import os
 import sys
+import time
 
 # ACP 的 JSONL 必须是 UTF-8；stdout 是管道时 Python 默认会用系统 ANSI 代码页（GBK）→ 乱码
 for _s in (sys.stdin, sys.stdout):
@@ -125,6 +127,22 @@ while True:
         STATE["prompt_id"] = rid
         STATE["turn"] += 1
         turn = STATE["turn"]
+        # ★ 本地协作测试用的「简单模式」：不弹权限/表单，直接回一句（可加延迟测取消）
+        if os.environ.get("ACP_MOCK_SIMPLE") == "1":
+            try:
+                delay = float(os.environ.get("ACP_MOCK_DELAY") or 0)
+            except Exception:  # noqa: BLE001
+                delay = 0.0
+            if delay > 0:
+                time.sleep(delay)
+            chunk(os.environ.get("ACP_MOCK_TEXT") or ("MOCK-REPLY %d" % turn))
+            notify({"sessionUpdate": "usage_update", "used": 1200, "size": 128000})
+            respond(STATE["prompt_id"], {"stopReason": "end_turn",
+                                         "usage": {"totalTokens": 1250, "inputTokens": 1200,
+                                                   "outputTokens": 50, "thoughtTokens": 0,
+                                                   "cachedReadTokens": 0}})
+            STATE["prompt_id"] = None
+            continue
         # ① 计划：先给一份 items，再追加一条 markdown
         notify({"sessionUpdate": "plan", "entries": [
             {"content": "读文件", "status": "in_progress", "priority": "medium"}]})

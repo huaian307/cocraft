@@ -48,6 +48,7 @@ TESTS = [
     "trust_panel_test",
     "context_chip_test",
     "acp_session_sync_test",
+    "orchestrator_test",
     "agent_install_test",
     "acp_events_test",
     "acp_api_test",

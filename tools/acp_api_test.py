@@ -413,6 +413,22 @@ def main() -> int:
               st == 200 and ((js or {}).get("restored") == 1) and ((js or {}).get("removed") == 1)
               and open(os.path.join(wsdir, "precious.txt"), encoding="utf-8").read().strip() == "PRECIOUS"
               and not os.path.exists(os.path.join(wsdir, "new.txt")), str(js)[:240])
+
+        print("\n[14] local orchestration routes (no chat / no login)")
+        st, js = call("GET", "/orchestrate/catalog")
+        _c = js or {}
+        check("GET /orchestrate/catalog -> 200 + agents/roles",
+              st == 200 and any(a.get("id") == "mock" for a in (_c.get("agents") or []))
+              and bool(_c.get("roles")), str(_c)[:230])
+        st, js = call("GET", "/orchestrate/runs")
+        check("GET /orchestrate/runs -> 200 list",
+              st == 200 and isinstance((js or {}).get("runs"), list), str(js)[:180])
+        st, js = call("GET", "/orchestrate/run?id=nope")
+        check("GET /orchestrate/run unknown -> 404", st == 404, str(js)[:160])
+        st, js = call("POST", "/orchestrate/start", {"task": "", "members": [{"engine": "mock"}]})
+        check("POST /orchestrate/start empty task -> 400", st == 400, str(js)[:160])
+        st, js = call("POST", "/orchestrate/permission", {"id": "nope", "decision": "once"})
+        check("POST /orchestrate/permission unknown -> 404", st == 404, str(js)[:160])
     finally:
         try:
             eng = server.engines.get_engine("acp")

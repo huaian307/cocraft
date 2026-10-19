@@ -392,7 +392,7 @@ def _save_ok_model(agent_id: str, model_id: str) -> None:
 
 class AcpService:
     def __init__(self, command, cwd=None, env=None, log=None, default_model="acp",
-                 agent_id="", provider_id="", baseline=None):
+                 agent_id="", provider_id="", baseline=None, sessions_file=None):
         self.command = list(command)
         self.env = env
         self.agent_id = agent_id or ""
@@ -425,7 +425,7 @@ class AcpService:
         #   正文/思考/工具/权限弹窗**全被丢弃**（实测：turn done text_parts=0，模型白答）。
         self._alias = {}
         self._seen_kinds = set()   # 诊断：见过哪些 session/update 类型（第一次出现记一行到 acp.log）
-        self._sessions_file = os.path.join(STATE_DIR, "_acp_sessions.json")
+        self._sessions_file = sessions_file or os.path.join(STATE_DIR, "_acp_sessions.json")
         self._prune_at = 0.0      # 上次跟 OpenCode 共享库对账的时间（别每次 list_sessions 都查库）
         self._load()               # 重启后把上次的会话/消息读回来
 
@@ -1160,6 +1160,16 @@ class AcpService:
         form = {"id": fid, "sessionID": sid,
                 "title": params.get("message") or "需要你选择",
                 "fields": schema_to_fields(params.get("requestedSchema"))}
+        # ★ 本地协作 / 无 UI 的场景可以挂 `auto_form`：直接回 accept/decline，别静默等 1800s。
+        hook = getattr(self, "auto_form", None)
+        if callable(hook):
+            try:
+                verdict = hook(form, params)
+            except Exception:  # noqa: BLE001
+                verdict = None
+            if isinstance(verdict, dict) and verdict.get("action") in ("accept", "decline", "cancel"):
+                self._log("[acp] 自动答复表单（%s）：%s" % (verdict.get("action"), form["title"]))
+                return verdict
         waiter = {"event": threading.Event(), "value": None}
         with self._lock:
             self._waiters[fid] = waiter

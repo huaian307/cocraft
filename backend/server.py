@@ -1571,6 +1571,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/ccagent"):
                 # 本地路由（**不走上游代理**）：群聊「AI 成员」的管理 + 运行时
                 self._ccagent(method, path)
+            elif path.startswith("/orchestrate"):
+                # ★本地协作（无需登录）：任务派发 / 结果 / 待批 / 仲裁
+                self._orchestrate(method, path)
             elif path == "/skills/preview":
                 self._skills_preview(method)
             elif path == "/skills/install":
@@ -2834,6 +2837,69 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+
+    def _orchestrate(self, method: str, path: str):
+        """★本地协作编排（引擎无关、**不经过群聊/登录**）。
+
+        GET  /orchestrate/catalog          可用的 agent + 角色 + 团队预设
+        GET  /orchestrate/runs             最近任务
+        GET  /orchestrate/run?id=          单个任务（含成员结果 / 待批 / 仲裁）
+        GET  /orchestrate/pending?run=     待批权限
+        POST /orchestrate/start            {task, cwd?, members:[{engine,name,role}]}
+        POST /orchestrate/cancel           {id, member?}
+        POST /orchestrate/permission       {id, decision: once|always|reject}
+        POST /orchestrate/arbitrate        {id, engine, name?}
+        """
+        import orchestrator as orch
+        sub = path[len("/orchestrate"):].strip("/")
+        q = parse_qs(urlsplit(self.path).query)
+        try:
+            if method == "GET" and sub in ("", "catalog"):
+                self._send_json(200, dict({"ok": True}, **orch.catalog()))
+                return
+            if method == "GET" and sub == "runs":
+                self._send_json(200, {"ok": True, "runs": orch.list_runs()})
+                return
+            if method == "GET" and sub == "run":
+                rid = (q.get("id") or [""])[0]
+                run = orch.get_run(rid)
+                if not run:
+                    self._send_json(404, {"ok": False, "error": "没有这个任务"})
+                    return
+                self._send_json(200, {"ok": True, "run": run})
+                return
+            if method == "GET" and sub == "pending":
+                rid = (q.get("run") or [""])[0]
+                self._send_json(200, {"ok": True, "pending": orch.pending_permissions(rid)})
+                return
+            body = self._read_json_body() or {}
+            if method == "POST" and sub == "start":
+                run = orch.start_run(body.get("task"), body.get("cwd") or "",
+                                     body.get("members"), body.get("title") or "")
+                self._send_json(200, {"ok": True, "run": run})
+                return
+            if method == "POST" and sub == "cancel":
+                run = orch.cancel_run(body.get("id"), body.get("member") or "")
+                self._send_json(200, {"ok": True, "run": run})
+                return
+            if method == "POST" and sub == "permission":
+                okv = orch.reply_permission(body.get("id"), body.get("decision") or "")
+                if not okv:
+                    self._send_json(404, {"ok": False, "error": "这条申请已结算或不存在"})
+                    return
+                self._send_json(200, {"ok": True})
+                return
+            if method == "POST" and sub == "arbitrate":
+                run = orch.arbitrate(body.get("id"), body.get("engine"), body.get("name") or "审查者")
+                self._send_json(200, {"ok": True, "run": run})
+                return
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+        except Exception as e:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+            return
+        self._send_json(404, {"ok": False, "error": "unknown orchestrate path: %s" % sub})
 
     def _ccagent(self, method: str, path: str):
         """面板**本地**路由：群聊「AI 成员」（建/加/移/启停/换大脑）。
