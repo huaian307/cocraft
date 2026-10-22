@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import threading
+import time
 
 from .. import STATE_DIR
 from .client import AcpClient, AcpClosed
@@ -30,6 +31,65 @@ CLIENT_CAPABILITIES = {"elicitation": {"form": {}},
                        "_meta": {"terminal_output_delta": True}}
 # Codex 在自定义 provider 下会把这段告警当正文/想法输出；弹窗"背景"里没必要带它
 _MODEL_WARN_RE = re.compile(r"^\s*Warning: Model metadata for `[^`]*` not found\.[^\n]*\n+", re.I)
+
+# ---------------- ★内部会话（群聊 AI 成员 / 本地协作）识别 ----------------
+# 这些会话是"面板自己"创建的（桥 / 编排 Runner），不是用户的项目会话；不应该混在「接续」列表里。
+# 三种来源一起认：
+#   ① 桥的独立会话文件 `_cocraft_bridge_sessions.json`；
+#   ② 本地协作每个成员的 `_orchestrator/runs/<run>/<member>.sessions.json`；
+#   ③ 标题特征（老的 / 已被清理掉文件的内部会话）：角色提示词 / 群聊成员声明 / 群聊AI· / 协作· / 仲裁。
+_BRIDGE_SESSIONS_FILE = os.path.join(STATE_DIR, "_cocraft_bridge_sessions.json")
+_ORCH_RUNS_DIR = os.path.join(STATE_DIR, "_orchestrator", "runs")
+_INTERNAL_TITLE_RE = re.compile(
+    r"【你的角色：|你是群聊成员|【最近的群聊记录】|群聊AI·|协作·|【仲裁】|你是本次任务的")
+_INTERNAL_IDS_CACHE = {"ts": 0.0, "ids": set()}
+
+
+def _json_or_empty(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _internal_session_ids() -> set:
+    """桥 / 本地协作创建的 agent 侧会话 id（15 秒缓存，别每次都扫目录）。"""
+    now = time.time()
+    if now - float(_INTERNAL_IDS_CACHE.get("ts") or 0) < 15:
+        return set(_INTERNAL_IDS_CACHE.get("ids") or set())
+    ids = set()
+
+    def take(doc):
+        for s in (doc.get("sessions") or []):
+            if not isinstance(s, dict):
+                continue
+            for k in ("id", "agentSessionId"):
+                v = s.get(k)
+                if v:
+                    ids.add(str(v))
+
+    take(_json_or_empty(_BRIDGE_SESSIONS_FILE))
+    try:
+        for run in os.listdir(_ORCH_RUNS_DIR):
+            d = os.path.join(_ORCH_RUNS_DIR, run)
+            if not os.path.isdir(d):
+                continue
+            for fn in os.listdir(d):
+                if fn.endswith(".sessions.json"):
+                    take(_json_or_empty(os.path.join(d, fn)))
+    except OSError:
+        pass
+    _INTERNAL_IDS_CACHE["ts"] = now
+    _INTERNAL_IDS_CACHE["ids"] = ids
+    return set(ids)
+
+
+def _is_internal_session(rid, title) -> bool:
+    if str(rid) in _internal_session_ids():
+        return True
+    return bool(_INTERNAL_TITLE_RE.search(str(title or "")))
 
 
 def _hook_arity(fn) -> int:
@@ -52,6 +112,7 @@ ANSWER_TIMEOUT = 1800.0      # 等用户答复的上限（秒）；超时按拒�
 TURN_TIMEOUT = 24 * 3600.0   # 等 agent 跑完一轮的上限（秒）。模型一轮可能很久，
 #                            ⚠ 绝不能用 AcpClient 的默认 60s：真实 agent 会被超时掐断，
 #                            而 agent 还在继续跑 → 状态错乱（delta 找不到 turn 被丢弃）。
+MAX_INBOX = 20              # 一轮进行中最多能排队几条「补充要求」（再多就明确拒绝，别无限堆）
 # 多个 agent 的 AcpService 会同时存在（进程缓存），它们共用 _acp_sessions.json。
 # 这个锁保证"只改自己的会话、别人的原样保留"，避免各存各的时互相覆盖。
 _SESSIONS_IO_LOCK = threading.RLock()
@@ -251,6 +312,13 @@ def _opencode_history(rid, limit: int = 400) -> list:
                 m["agent"] = d["agent"]
             if d.get("model"):
                 m["model"] = d["model"]
+            # ★把 token 用量 / 上下文一起带过来：否则「ACP 侧看同一条 OpenCode 会话」
+            #   上下文条显示「—」、会话详情 Token 全 0，和 opencode 引擎那边对不上
+            #   （2026-10-20 用户反馈"acp 的上下文显示和 opencode 的不太一样"）。
+            if isinstance(d.get("tokens"), dict):
+                m["tokens"] = d["tokens"]
+            if isinstance(d.get("context"), dict):
+                m["context"] = d["context"]
         elif t == "system":
             m["type"] = "system"
             m["text"] = d.get("text") or ""
@@ -390,6 +458,32 @@ def _save_ok_model(agent_id: str, model_id: str) -> None:
         pass
 
 
+def context_from_usage(usage) -> dict:
+    """从 `session/prompt` 的 usage 估一个上下文占用（agent 没发 `usage_update` 时兜底）。
+
+    * 优先 `totalTokens`；没有就 `inputTokens + outputTokens`；
+    * **不编窗口上限**：`size=0`，`estimated=True`（前端显示「上下文 ~N」而不是「剩 X%」）；
+    * 返回 `None` = 这条 usage 里没有可用数字。
+    ⚠ 这是**本轮**的用量，不是精确的窗口占用；有真实 `usage_update` 时不会被覆盖。
+    """
+    if not isinstance(usage, dict):
+        return None
+
+    def num(*keys):
+        for k in keys:
+            v = usage.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+        return 0
+
+    used = num("totalTokens", "total_tokens")
+    if not used:
+        used = num("inputTokens", "input_tokens") + num("outputTokens", "output_tokens")
+    if used <= 0:
+        return None
+    return {"used": used, "size": 0, "estimated": True}
+
+
 class AcpService:
     def __init__(self, command, cwd=None, env=None, log=None, default_model="acp",
                  agent_id="", provider_id="", baseline=None, sessions_file=None):
@@ -525,6 +619,11 @@ class AcpService:
             s.setdefault("pendingSkills", [])
             s.setdefault("agentSessionId", "")
             s["turn"] = None
+            s["inbox"] = []          # ★排队只在内存（重启后不自动跑）；下面把没发出去的标成「未送达」
+            for _m in (s.get("messages") or []):
+                if isinstance(_m, dict) and _m.get("queued"):
+                    _m["queued"] = False
+                    _m["undelivered"] = True
             s["permissions"] = {}
             s["forms"] = {}
             # ★ 迁移：本地 id 与 agent 侧 id 分家的会话（老数据 / 导入）→ **归一成 agent 侧 id**，
@@ -1386,11 +1485,14 @@ class AcpService:
             return False
         return "list" in caps and caps.get("list") is not False
 
-    def list_remote(self, cwd=None, cursor="") -> dict:
+    def list_remote(self, cwd=None, cursor="", include_internal=False) -> dict:
         """列出 **agent 侧**已有的会话（Codex 客户端里聊过的那些），供面板「导入」。
 
         ACP 形状：`session/list {cwd?, cursor?}` → `{sessions:[{sessionId,cwd,title?,updatedAt?}], nextCursor?}`
         旧适配器不支持时回 `{"supported": False}`（前端可优雅降级）。
+
+        ★`include_internal=False`（默认）会隐藏**面板内部**的会话（群聊 AI 成员 / 本地协作 Runner）——
+        它们和项目会话混在一起会让「接续」列表没法看。`include_internal=True` 时全给，并带 `internal` 标记。
         """
         try:
             client = self.ensure_started()
@@ -1425,10 +1527,17 @@ class AcpService:
             cwd = str(it.get("cwd") or "")
             if not cwd and self._is_opencode():
                 cwd = _opencode_session_dir(rid)          # agent 没给 cwd 时从共享库兜底
-            out.append({"id": rid, "title": str(it.get("title") or ""),
+            title = str(it.get("title") or "")
+            out.append({"id": rid, "title": title,
                         "cwd": cwd,
                         "updatedAt": str(it.get("updatedAt") or ""),
+                        # ★内部会话（群聊 AI 成员 / 本地协作）：默认不混进项目会话列表
+                        "internal": _is_internal_session(rid, title),
                         "imported": rid in owned, "localID": owned.get(rid) or ""})
+        all_out = list(out)
+        internal_count = sum(1 for x in out if x.get("internal"))
+        if not include_internal:
+            out = [x for x in out if not x.get("internal")]
         # opencode：顺手把"对面有多少历史"也读出来（同一个库，一次 GROUP BY）
         if out and self._is_opencode():
             counts = _opencode_message_counts([x["id"] for x in out])
@@ -1469,8 +1578,10 @@ class AcpService:
         if fixed:
             self._save()
             self._log("[acp] 已按 agent 侧自愈 %d 处接续会话信息" % fixed)
-        self._log("[acp] agent 侧有 %d 条会话（已接续 %d）" % (len(out), sum(1 for x in out if x["imported"])))
-        return {"supported": True, "sessions": out, "cursor": res.get("nextCursor") or None}
+        self._log("[acp] agent 侧有 %d 条会话（项目 %d / 内部 %d，已接续 %d）"
+                  % (len(all_out), len(out), internal_count, sum(1 for x in out if x["imported"])))
+        return {"supported": True, "sessions": out, "cursor": res.get("nextCursor") or None,
+                "total": len(all_out), "internalCount": internal_count}
 
     def import_remote(self, remote_id, title=None) -> dict:
         """把 agent 侧已有的一条会话「接续」到面板里（原设计叫"导入"，措辞已改）。
@@ -1495,7 +1606,7 @@ class AcpService:
         # ⚠ 无论有没有传 title，都要去 session/list 核对 cwd：
         #   resume 要求 cwd 与会话归属一致，用错 cwd 会吃 -32602，随后被静默新建（这是老 bug）。
         try:
-            remote = self.list_remote()
+            remote = self.list_remote(include_internal=True)
             hit = next((x for x in (remote.get("sessions") or []) if x.get("id") == rid), None)
             if hit:
                 cwd = str(hit.get("cwd") or "")
@@ -1835,7 +1946,8 @@ class AcpService:
         # ★ opencode-acp 与 OpenCode 客户端**共用同一个库**：历史直接读库 →
         #   面板（ACP 侧）与客户端看到的是**同一条记录**（否则两边各存一份、永远对不上）。
         if self._is_opencode():
-            got = self._opencode_messages(sid, limit, cursor)
+            got = self._opencode_messages(sid, limit, cursor,
+                                          extra=self._pending_local_msgs(sid))
             if got is not None:
                 return got
         with self._lock:
@@ -1850,7 +1962,20 @@ class AcpService:
         next_cursor = page[0].get("id") if (page and start > 0) else None
         return list(reversed(page)), next_cursor
 
-    def _opencode_messages(self, sid, limit, cursor):
+    def _pending_local_msgs(self, sid) -> list:
+        """只存在于面板本地、可能还不在 agent 共享库里的用户消息。
+
+        · `queued` / `undelivered`：肯定没进库；
+        · `delivered`：投递后 agent 通常会把它写进共享库，但也可能还没写/没写 →
+          一并带上，由 `_opencode_messages()` 按**文本**去重（库里有就不重复显示）。
+        """
+        with self._lock:
+            s = self._sessions.get(sid) or {}
+            return [m for m in (s.get("messages") or [])
+                    if isinstance(m, dict) and m.get("type") == "user"
+                    and (m.get("queued") or m.get("undelivered") or m.get("delivered"))]
+
+    def _opencode_messages(self, sid, limit, cursor, extra=None):
         """读共享库里的历史（面板形状，新→旧 + cursor）。库不可用/为空 → None（退回本地）。"""
         try:
             hist = _opencode_history(self._agent_sid(sid), limit=2000)   # 旧 → 新
@@ -1858,6 +1983,27 @@ class AcpService:
             return None
         if not hist:
             return None
+        if extra and not cursor:
+            # 排队 / 未送达 / 刚投递的用户消息可能只在本地面板 → 合并进来（按时间排好）
+            ids = {str(m.get("id")) for m in hist}
+            used = {}                                   # 库里已有同文用户消息 → 去重，别显示两遍
+            for m in hist:
+                if m.get("type") == "user":
+                    t = str(m.get("text") or "")
+                    used[t] = used.get(t, 0) + 1
+            add = []
+            for m in extra:
+                if str(m.get("id")) in ids:
+                    continue
+                if m.get("delivered"):
+                    t = str(m.get("text") or "")
+                    if used.get(t):
+                        used[t] -= 1
+                        continue
+                add.append(dict(m))
+            if add:
+                hist = sorted(hist + add,
+                              key=lambda m: (((m.get("time") or {}).get("created")) or 0))
         if cursor:
             idx = next((i for i, m in enumerate(hist) if str(m.get("id")) == str(cursor)), -1)
             if idx >= 0:
@@ -1917,6 +2063,59 @@ class AcpService:
             return bool(s and s.get("turn") is not None)
 
     def prompt(self, sid, text, files=None) -> dict:
+        """发一条用户消息。
+
+        ★ 一轮还在跑时**不再直接 409**：把这条**排队**，这一轮结束后自动发出去。
+          （OpenCode 引擎本来就有 inbox 队列；ACP 以前只能干等一轮跑完，用户反馈"没法中途补充要求"。）
+          队列只在内存：面板重启时没发出去的会标成「未送达」，**不会自动补跑**。
+        """
+        with self._lock:
+            s = self._sessions.get(sid)
+            if s is None or not self._owns(s):
+                raise KeyError("会话不存在：%s" % sid)
+            busy = s.get("turn") is not None
+            if busy:
+                inbox = s.setdefault("inbox", [])
+                if len(inbox) >= MAX_INBOX:
+                    raise BusyError("排队已满（%d 条）—— 等这一轮结束、或先中断再补充"
+                                    % MAX_INBOX)
+                # ⚠ 时间戳要**单调递增**：同一毫秒内连发两条时 created 会相等，
+                #   前端按 created 排序时排队那条可能跑到前一条前面（实测）。
+                last = 0
+                for _m in (s.get("messages") or []):
+                    last = max(last, ((_m.get("time") or {}).get("created") or 0))
+                created = max(now_ms(), last + 1)
+                # 也要晚于**本轮助手开始时间**：这样"中途补充"永远排在这一轮回答之后
+                _turn = s.get("turn")
+                if _turn is not None:
+                    created = max(created, (getattr(_turn, "started", 0) or 0) + 1)
+                um = {"id": "u_%d" % next(self._id), "type": "user", "text": text,
+                      "time": {"created": created}, "queued": True}
+                if files:
+                    um["files"] = [_norm_attachment(f) for f in files]
+                s["messages"].append(um)
+                inbox.append({"msgId": um["id"], "text": text,
+                              "files": list(files or [])})
+                s["time"]["updated"] = now_ms()
+                pos = len(inbox)
+        if busy:
+            self._save()
+            self._emit({"type": "session.inbox.enqueued", "data": {
+                "sessionID": sid, "messageID": um["id"], "text": text,
+                "position": pos}})
+            self._log("[acp] 本轮回合进行中 → 已排队第 %d 条补充要求：%s"
+                      % (pos, " ".join(str(text or "").split())[:60]))
+            return {"ok": True, "queued": True, "messageID": um["id"], "position": pos}
+        return self._start_turn(sid, text, files)
+
+    def _start_turn(self, sid, text, files=None, msg_id="") -> dict:
+        """真正开一轮（`prompt` 与「排队投递」共用）。
+
+        `msg_id`：复用**已经存在**的那条用户消息（排队时先落库的那条），别再插一条。
+        """
+        self.ensure_started()
+        self._ensure_bound(sid)        # 重启后第一次续聊：先 resume 把会话在 agent 侧接回来
+        now = now_ms()
         with self._lock:
             s = self._sessions.get(sid)
             if s is None or not self._owns(s):
@@ -1925,22 +2124,34 @@ class AcpService:
                 # 我们的映射是「每个会话同一时刻只有一个 turn」；并发发问会串轮
                 # （delta 找不到自己的 turn → 静默丢弃）。宁可明确拒绝。
                 raise BusyError("上一轮还在生成，请等它结束或先中断")
-        client = self.ensure_started()
-        self._ensure_bound(sid)        # 重启后第一次续聊：先 resume 把会话在 agent 侧接回来
-        now = now_ms()
-        um = {"id": "u_%d" % next(self._id), "type": "user", "text": text,
-              "time": {"created": now}}      # ⚠ 必须有 time.created，前端按它升序排；否则会排到最顶
-        if files:
-            um["files"] = [_norm_attachment(f) for f in files]   # 带 mime/data，前端才能渲染缩略图
-        with self._lock:
             # ★ agent 侧会话如果是空的（刚重置/接不回）→ 本轮把本地历史补记上
             reseed = bool(s.pop("_needsReseed", False))
             prior = list(s.get("messages") or []) if reseed else []
             pending = s.pop("pendingSkills", None) or []    # ★ 已装填的技能：随本轮一起发出去
-            s["messages"].append(um)
+            um = None
+            if msg_id:
+                um = next((m for m in (s.get("messages") or [])
+                           if isinstance(m, dict) and str(m.get("id")) == str(msg_id)), None)
+            if um is None:
+                last = 0
+                for _m in (s.get("messages") or []):
+                    last = max(last, ((_m.get("time") or {}).get("created") or 0))
+                created = max(now_ms(), last + 1)     # 单调递增（同一毫秒连发也不会乱序）
+                um = {"id": "u_%d" % next(self._id), "type": "user", "text": text,
+                      "time": {"created": created}}
+                if files:
+                    um["files"] = [_norm_attachment(f) for f in files]
+                s["messages"].append(um)
+            else:
+                # 排队那条：去掉「排队中」标记，落一个送达时间
+                um.pop("queued", None)
+                um["delivered"] = True
+                um["time"] = um.get("time") or {"created": now_ms()}
+                if files and not um.get("files"):
+                    um["files"] = [_norm_attachment(f) for f in files]
             turn = AssistantTurn(sid, "a_%d" % next(self._id), agent=(self.agent_id or "acp"),
                                  model=(s["model"] or {}).get("id") or self._model or "")
-            turn.started = max(turn.started, now + 1)   # 助手必须严格晚于用户，否则同毫秒排序会乱
+            turn.started = max(turn.started, um["time"]["created"] + 1)   # 助手严格晚于用户
             s["turn"] = turn
             s["time"]["updated"] = now_ms()
         self._emit({"type": "session.step.started", "data": {
@@ -1957,7 +2168,37 @@ class AcpService:
                 blocks = [{"type": "text", "text": note}] + blocks
                 self._log("[acp] agent 侧会话是空的 → 已把最近 %d 条本地历史补记给本轮" % len(prior))
         threading.Thread(target=self._run_turn, args=(sid, turn, blocks), daemon=True).start()
-        return {"ok": True}
+        return {"ok": True, "messageID": um["id"]}
+
+    def _deliver_next(self, sid) -> None:
+        """上一轮结束后，自动把队列里的**下一条**补充要求发出去（一次一轮）。"""
+        with self._lock:
+            s = self._sessions.get(sid)
+            if not s or s.get("turn") is not None:
+                return
+            inbox = s.get("inbox") or []
+            if not inbox:
+                return
+            item = inbox.pop(0)
+            s["time"]["updated"] = now_ms()
+        self._emit({"type": "session.inbox.delivered", "data": {
+            "sessionID": sid, "messageID": item.get("msgId"),
+            "text": item.get("text") or ""}})
+        try:
+            self._start_turn(sid, item.get("text") or "", item.get("files") or [],
+                             msg_id=item.get("msgId") or "")
+        except Exception as exc:  # noqa: BLE001
+            self._log("[acp] 排队消息投递失败：%s" % exc)
+            with self._lock:
+                s = self._sessions.get(sid) or {}
+                for m in (s.get("messages") or []):
+                    if isinstance(m, dict) and str(m.get("id")) == str(item.get("msgId")):
+                        m.pop("queued", None)
+                        m["undelivered"] = True
+            self._save()
+            self._emit({"type": "session.error", "data": {
+                "sessionID": sid,
+                "error": "排队消息没能发出去：%s（请重新发送）" % exc}})
 
     def inject_skill(self, sid, skill: dict, resume: bool = False) -> dict:
         """把技能注入会话。
@@ -1998,8 +2239,12 @@ class AcpService:
         ⚠ ACP 的 `session/prompt` 结果带 `usage`（zUsage: totalTokens/inputTokens/
           outputTokens/thoughtTokens/cachedReadTokens/cachedWriteTokens）——
           这是**账单口径**的 token，和 `usage_update`（上下文窗口占用）不是一回事。
+        ⚠ 但 dsh 这类 agent **只在 prompt 结果里给 usage、不发 usage_update** →
+          这里顺手用本轮 tokens 估一个上下文占用（`estimated=True, size=0`），
+          前端显示「上下文 ~N」而不是「—」。**不编窗口上限**（size 保持 0）。
         ⚠ ACP 不给官方单价，所以 `cost` 仍然是 None（面板显示「费用未知」，不谎报免费）。
         """
+        est_out = None
         if isinstance(usage, dict):
             def num(*keys):
                 for k in keys:
@@ -2008,7 +2253,7 @@ class AcpService:
                         return int(v)
                 return 0
             with self._lock:
-                tok = s.setdefault("tokens", {}) or {}
+                tok = s.get("tokens")
                 if not isinstance(tok, dict):
                     tok = {}
                     s["tokens"] = tok
@@ -2024,10 +2269,17 @@ class AcpService:
                     s["cost"] = float(cost["amount"])
                 elif isinstance(cost, (int, float)):
                     s["cost"] = float(cost)
+                # ★上下文兜底：只在本轮没有真实 usage_update（size>0）时才估
+                est = context_from_usage(usage)
+                cur = s.get("context")
+                if est and not (isinstance(cur, dict) and cur.get("size")):
+                    s["context"] = est
+                    est_out = est
         if stop:
             s["outcome"] = {"end_turn": "completed", "max_tokens": "max_tokens",
                             "max_turn_requests": "max_turn_requests", "cancelled": "cancelled",
                             "refusal": "refusal"}.get(str(stop), str(stop))
+        return est_out
 
     def _recover_model(self, sid, detail) -> str:
         """本轮因「模型不可用」失败 → 自动切到一个已知可用的模型；回可读提示（空 = 没处理）。
@@ -2122,15 +2374,28 @@ class AcpService:
                     s["plan"] = turn.plan
                 if turn.context:
                     s["context"] = turn.context
+        est_ctx = None
         if s is not None:
-            self._record_usage(s, usage, stop)
+            est_ctx = self._record_usage(s, usage, stop)
         self._save()
+        # ★dsh 等「只给 prompt usage、不发 usage_update」的 agent：把估算值推给前端，
+        #   否则要等重新打开会话才能看到（`state.current.context` 不会自己更新）。
+        if est_ctx:
+            self._emit({"type": "session.usage.update", "data": {
+                "sessionID": sid, "used": est_ctx.get("used") or 0,
+                "size": 0, "estimated": True}})
         # 终态事件 → 前端会去重取一次权威消息
         self._emit({"type": "session.text.ended",
                     "data": {"sessionID": sid, "assistantMessageID": turn.id}})
         self._emit({"type": "session.step.ended",
                     "data": {"sessionID": sid, "assistantMessageID": turn.id}})
         self._emit({"type": "session.execution.succeeded", "data": {"sessionID": sid}})
+        # ★ 本轮结束 → 把用户**中途排队**的补充要求发出去（一次一轮）。
+        #   放在最后：先让前端收完这一轮的终态事件，再开下一轮。
+        try:
+            self._deliver_next(sid)
+        except Exception as exc:  # noqa: BLE001
+            self._log("[acp] 投递排队消息失败：%s" % exc)
 
     def interrupt(self, sid) -> bool:
         client = self._client_or_none()

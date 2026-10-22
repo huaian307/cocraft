@@ -88,6 +88,8 @@ class AcpEngine(Engine):
             env = {}
             env.update(b.get("env") or {})
             env.update(a.get("env") or {})
+            # ★安全兜底（第 ② 层）：就算调用方拿着旧注册表 dict，也不把「永不问」模式传给子进程
+            env, _sec_fixes = agents.sanitize_agent_env(a.get("id"), env)
             cfg = dict(a)
             cfg["cwd"] = a.get("cwd") or b.get("cwd") or ""
             cfg["env"] = env
@@ -316,7 +318,8 @@ class AcpEngine(Engine):
                 q = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
                 return handler._send_json(200, self.service().list_remote(
                     cwd=(q.get("cwd") or [""])[0] or None,
-                    cursor=(q.get("cursor") or [""])[0] or ""))
+                    cursor=(q.get("cursor") or [""])[0] or "",
+                    include_internal=(q.get("internal") or [""])[0] in ("1", "true", "yes", "on")))
             if path == "/api/session/import" and method == "POST":
                 b = handler._read_json_body() or {}
                 try:
@@ -377,13 +380,13 @@ class AcpEngine(Engine):
         if rest == "prompt" and method == "POST":
             b = handler._read_json_body() or {}
             try:
-                svc.prompt(sid, b.get("text") or "", b.get("files"))
+                res = svc.prompt(sid, b.get("text") or "", b.get("files"))
             except KeyError:
                 return handler._send_json(404, {
                     "error": "会话不存在（可能刚切换过引擎：请刷新面板，或在左侧重选一个会话）"})
             except BusyError as exc:
                 return handler._send_json(409, {"error": str(exc)})
-            return handler._send_json(200, {"ok": True})
+            return handler._send_json(200, dict({"ok": True}, **(res or {})))
         if rest == "interrupt" and method == "POST":
             svc.interrupt(sid)
             return handler._send_json(200, {"ok": True})

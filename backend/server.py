@@ -1777,10 +1777,13 @@ class Handler(BaseHTTPRequestHandler):
                                   "detail": eng.status(), "agents": eng.list_agents()})
             return
         if act == "candidates":
+            # 显式"发现" → 重新扫盘（缓存默认 5 分钟，别让刚装好的 adapter 看不见）
+            acp_agents.invalidate_detect_cache()
             self._send_json(200, {"ok": True, "candidates": acp_agents.scan_candidates()})
             return
         if act == "scan":
             # 「扫描本机」：本机发现报告（含已登记、可用性、客户端缺适配器提示）
+            acp_agents.invalidate_detect_cache()
             self._send_json(200, {"ok": True, **acp_agents.deep_scan()})
             return
         if act == "guess-provider":
@@ -2843,12 +2846,18 @@ class Handler(BaseHTTPRequestHandler):
 
         GET  /orchestrate/catalog          可用的 agent + 角色 + 团队预设
         GET  /orchestrate/runs             最近任务
+        GET  /orchestrate/workflows?cwd=   工作流列表（可复用：成员 / 默认任务 / 画布布局）
+        POST /orchestrate/workflows/save   {id?, name, cwd, taskTemplate?, members[], layout?}
+        POST /orchestrate/workflows/delete {id}
+        POST /orchestrate/workflows/duplicate {id, name?}
         GET  /orchestrate/run?id=          单个任务（含成员结果 / 待批 / 仲裁）
         GET  /orchestrate/pending?run=     待批权限
         POST /orchestrate/start            {task, cwd?, members:[{engine,name,role}]}
         POST /orchestrate/cancel           {id, member?}
+        POST /orchestrate/member           {run, member, permLevel}
         POST /orchestrate/permission       {id, decision: once|always|reject}
         POST /orchestrate/arbitrate        {id, engine, name?}
+        POST /orchestrate/delete           {id}         删除已结束的运行记录
         """
         import orchestrator as orch
         sub = path[len("/orchestrate"):].strip("/")
@@ -2859,6 +2868,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if method == "GET" and sub == "runs":
                 self._send_json(200, {"ok": True, "runs": orch.list_runs()})
+                return
+            if method == "GET" and sub == "workflows":
+                cwd = (q.get("cwd") or [""])[0]
+                self._send_json(200, {"ok": True, "workflows": orch.list_workflows(cwd)})
                 return
             if method == "GET" and sub == "run":
                 rid = (q.get("id") or [""])[0]
@@ -2873,13 +2886,33 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "pending": orch.pending_permissions(rid)})
                 return
             body = self._read_json_body() or {}
+            if method == "POST" and sub == "workflows/save":
+                wf = orch.save_workflow(body)
+                self._send_json(200, {"ok": True, "workflow": wf})
+                return
+            if method == "POST" and sub == "workflows/delete":
+                if not orch.delete_workflow(body.get("id")):
+                    self._send_json(404, {"ok": False, "error": "没有这个工作流"})
+                    return
+                self._send_json(200, {"ok": True})
+                return
+            if method == "POST" and sub == "workflows/duplicate":
+                wf = orch.duplicate_workflow(body.get("id"), body.get("name") or "")
+                self._send_json(200, {"ok": True, "workflow": wf})
+                return
             if method == "POST" and sub == "start":
                 run = orch.start_run(body.get("task"), body.get("cwd") or "",
-                                     body.get("members"), body.get("title") or "")
+                                     body.get("members"), body.get("title") or "",
+                                     body.get("workflowId") or "")
                 self._send_json(200, {"ok": True, "run": run})
                 return
             if method == "POST" and sub == "cancel":
                 run = orch.cancel_run(body.get("id"), body.get("member") or "")
+                self._send_json(200, {"ok": True, "run": run})
+                return
+            if method == "POST" and sub == "member":
+                run = orch.set_member(body.get("run") or body.get("id"),
+                                      body.get("member") or "", body)
                 self._send_json(200, {"ok": True, "run": run})
                 return
             if method == "POST" and sub == "permission":
@@ -2892,6 +2925,13 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and sub == "arbitrate":
                 run = orch.arbitrate(body.get("id"), body.get("engine"), body.get("name") or "审查者")
                 self._send_json(200, {"ok": True, "run": run})
+                return
+            if method == "POST" and sub == "delete":
+                okv = orch.delete_run(body.get("id"))
+                if not okv:
+                    self._send_json(404, {"ok": False, "error": "没有这个任务"})
+                    return
+                self._send_json(200, {"ok": True})
                 return
         except ValueError as e:
             self._send_json(400, {"ok": False, "error": str(e)})
@@ -2924,6 +2964,16 @@ class Handler(BaseHTTPRequestHandler):
             since = (q.get("since") or ["0"])[0]
             chat = (q.get("chat") or [""])[0] or None
             self._send_json(200, dict({"ok": True}, **ca.activity(since, chat)))
+            return
+        if method == "GET" and sub == "permissions":
+            # ★信任面板：群聊审批的**完整时间线**（谁批准/拒绝了哪条、命令原文、什么时候）。
+            #   数据落盘在 runtime/state/_cc_perm_log.json（重启不丢），只读。
+            q = parse_qs(urlsplit(self.path).query)
+            try:
+                limit = int((q.get("limit") or ["80"])[0] or 80)
+            except (TypeError, ValueError):
+                limit = 80
+            self._send_json(200, {"ok": True, "items": ca.perm_log(limit)})
             return
         if method == "GET" and sub == "changes":
             # ★对比带上「文件改动」：这个成员从**派活前**到现在改了哪些文件（文件级）
@@ -3135,6 +3185,17 @@ def main() -> int:
     start_music_service()                     # 拉起网易云音乐服务（面板内搜歌/放歌）
     threading.Thread(target=music_service_keeper, daemon=True).start()
     threading.Thread(target=pty_term.warmup, daemon=True).start()   # 预热面板内终端（可选组件，别让首次点开卡探测）
+
+    # ★预热 ACP agent 探测：detect_all() 要扫盘（冷机实测 2~9s）。
+    #   不预热的话，重启后**第一次打开 agent 列表**会明显卡（列表迟迟不出来）。
+    #   后台线程做，不挡服务启动；结果进 5 分钟缓存。
+    def _warm_acp_detect():
+        try:
+            from engines.acp import agents as _acp_agents
+            _acp_agents.detect_all_cached()
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=_warm_acp_detect, daemon=True).start()
 
     # ACP 引擎：启动就预热当前 agent 的子进程（第一次提问不用等 node 冷启动）
     if eng.id == "acp":

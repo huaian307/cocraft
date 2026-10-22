@@ -280,12 +280,15 @@ function fmtTok(n) {
   return String(Math.round(n));
 }
 
-/** 模型窗口上限（`limit.context`）。OpenCode 给；ACP 的模型清单没有这一项 → 返回 0。 */
+/** 模型窗口上限（`limit.context`）。OpenCode 给；ACP 的模型清单没有这一项 → 返回 0。
+ *  ⚠ 只认**当前引擎**的清单（切引擎后旧清单不能拿来算上限，否则百分比会莫名其妙地变）。 */
 function ctxLimitOf(ref) {
   const id = String((ref && (ref.id || ref.modelID)) || "");
   if (!id) return 0;
+  const list = MODEL.list || [];
+  if (!list.length || !modelEngineMatches()) return 0;
   const prov = String((ref && ref.providerID) || "");
-  const hit = (MODEL.list || []).find((m) => String(m.id) === id
+  const hit = list.find((m) => String(m.id) === id
     && (!prov || !m.providerID || String(m.providerID) === prov));
   const n = Number((hit && hit.limit && hit.limit.context) || 0);
   return n > 0 ? n : 0;
@@ -317,10 +320,16 @@ function ctxFromMessages() {
 
 function ctxCompute() {
   if (!state.current) return { used: 0, size: 0, src: "", model: "" };
+  const mid = String((state.current.model && state.current.model.id) || "");
   const sc = state.current.context;
-  if (sc && Number(sc.size) > 0) {
-    return { used: Number(sc.used) || 0, size: Number(sc.size) || 0, src: "agent",
-             model: String((state.current.model && state.current.model.id) || "") };
+  // ★size=0 也认：dsh 这类 agent 只在 prompt 结果里给 tokens，后端估一个 used（estimated=true）
+  if (sc && (Number(sc.used) > 0 || Number(sc.size) > 0)) {
+    let size = Number(sc.size) || 0;
+    // ★两个引擎同一口径：agent 没给窗口上限时，用**当前引擎**模型清单里的 limit.context 补一次
+    //   （只补真实清单里有的模型；补不到就还是「~N」，绝不编一个数）
+    if (!size && Number(sc.used) > 0) size = ctxLimitOf(state.current.model || { id: mid });
+    return { used: Number(sc.used) || 0, size: size,
+             src: sc.estimated ? "estimate" : "agent", model: mid };
   }
   return ctxFromMessages() || { used: 0, size: 0, src: "", model: "" };
 }
@@ -334,6 +343,9 @@ function ctxTitle() {
   if (CTX.size) bits.push("剩余 " + Math.max(0, Math.round((1 - CTX.used / CTX.size) * 100)) + "%");
   if (CTX.model) bits.push("模型 " + CTX.model);
   bits.push(CTX.src === "agent" ? "来源：agent 上报的 usage_update"
+    : CTX.src === "estimate"
+      ? (CTX.size ? "来源：本轮 tokens 估算（窗口上限取自模型清单）"
+                  : "来源：本轮 tokens 估算（这个 agent 没上报 usage_update；窗口上限未知）")
     : CTX.src === "model" ? "来源：模型窗口上限 + 上一条回答的 tokens"
     : "窗口上限未知（模型清单没给 limit.context）");
   return bits.join("\n");
@@ -353,7 +365,9 @@ function ctxSync() {
     const left = Math.max(0, Math.min(100, Math.round((1 - CTX.used / CTX.size) * 100)));
     b.textContent = "上下文 剩 " + left + "%";
   } else {
-    b.textContent = CTX.used ? ("上下文 " + fmtTok(CTX.used)) : "上下文 —";
+    b.textContent = CTX.used
+      ? ((CTX.src === "estimate" ? "上下文 ~" : "上下文 ") + fmtTok(CTX.used))
+      : "上下文 —";
   }
   b.title = ctxTitle();
   const pct = CTX.size ? CTX.used / CTX.size : 0;
@@ -871,6 +885,8 @@ function renderMessage(m) {
       ${modelID ? `<span class="badge">${esc(modelID)}</span>` : ""}
       ${m.time && m.time.created ? `<span class="muted">${fmtTime(m.time.created)}</span>` : ""}
       ${m.pending ? `<span class="tag run">发送中</span>` : ""}
+      ${m.queued ? `<span class="tag run" title="这一轮还在跑；结束后会自动发送。想立刻改用这条：点「■ 中断」，它马上就会发出">已排队</span>` : ""}
+      ${m.undelivered ? `<span class="tag warn" title="面板重启时这条还没发出去，请重新发送">未送达</span>` : ""}
       ${streaming ? `<span class="tag run">生成中</span>` : ""}
       ${!isUser ? `<button type="button" class="copy-btn" data-copy="${esc(m.id)}" title="复制这条回答的正文（不含思考过程）">复制</button>` : ""}
     </div>
@@ -1765,6 +1781,7 @@ function renderMessages() {
   paintLiveSlot();
   if (TRACE.open) renderTrace();
   ctxSync();                       // ★上下文「还剩多少」跟着当前会话/最新回答走
+  msgNavSchedule();                // ★消息导航（回到底部 / 问题列表）跟着重建
 }
 
 /** 只重建「生成中」那一小块：我发的消息（乐观回显）→ 思考 → 回答，一路向下生长 */
@@ -1813,6 +1830,7 @@ function paintLiveSlot() {
   });
 
   if (state.follow) box.scrollTop = box.scrollHeight;
+  msgNavSchedule();                // 新内容 / 打字机推进时同步「回到底部」的显隐
 }
 
 let rafId = null;
@@ -2142,6 +2160,11 @@ async function send() {
     await api(`/api/session/${encodeURIComponent(state.current.id)}/prompt`, {
       method: "POST",
       body: JSON.stringify(files.length ? { text, files } : { text }),
+    }).then((r) => {
+      const rr = (r && typeof r === "object" && r.data && typeof r.data === "object") ? r.data : r;
+      if (rr && rr.queued) {
+        setBanner(`已加入队列（第 ${rr.position || 1} 条）—— 这一轮结束后自动发送；想立刻用它，点「■ 中断」`, { ms: 7000 });
+      }
     });
     if (firstAsk) await autoNameSession(firstAsk);
     await refreshMessages();
@@ -2477,7 +2500,8 @@ function handleEvent(p) {
   //   ⚠ 这是**上下文**，不是账单 token（账单累计在 session.tokens 里）。
   if (t === "session.usage.update") {
     if (mine && state.current) {
-      state.current.context = { used: Number(d.used) || 0, size: Number(d.size) || 0 };
+      state.current.context = { used: Number(d.used) || 0, size: Number(d.size) || 0,
+                                estimated: !!d.estimated };
       ctxSync();
     }
     return;
@@ -6783,7 +6807,29 @@ function permMenuToggle() {
    ② 「谁批准了什么」要能追溯到**具体那条规则**（每条都能单独撤销）；
    ③ 撤销复用现有接口（`/api/permission/always`、`/api/permission/level`），不另造一套。 */
 const TRUST = { open: false, busy: false, pend: [], pendErr: "",
-                always: null, alwaysErr: "", group: null };
+                always: null, alwaysErr: "", group: null,
+                quar: null, quarErr: "", snaps: null, snapsErr: "",
+                permLog: null, permLogErr: "", acts: null, actsErr: "",
+                dec: [],
+                orch: null, orchErr: "" };
+
+/** 列表数据一律过这一道：接口形状万一变了（对象 / null）也不会把面板整块打崩。 */
+function trustList(x) { return Array.isArray(x) ? x : []; }
+
+/** 秒 / 毫秒都认的时间格式化（审计记录里两种都出现过）。 */
+function trustWhen(ts) {
+  const n = Number(ts || 0);
+  if (!n) return "";
+  return fmtTime(n < 1e12 ? n * 1000 : n);
+}
+
+/** 活动状态 → 中文（与活动卡同口径）。 */
+function trustActZh(st) {
+  return {
+    running: "进行中", completed: "完成", error: "失败",
+    asking: "等待批准", allowed: "已允许", denied: "已拒绝", timeout: "超时",
+  }[String(st || "")] || String(st || "");
+}
 
 function trustIsOpen() { const b = $("trust"); return !!b && !b.hidden; }
 
@@ -6875,6 +6921,152 @@ function trustRender() {
         + `<div class="trust-alw-foot"><button type="button" data-alw-clear="1" title="只清当前 agent 的全部「始终允许」记忆">清空全部「始终允许」</button></div>`;
     }
   }
+  // ★群聊审批时间线（落盘审计：谁批准/拒绝了哪条、命令原文、什么时候）
+  const plbox = $("trust-permlog");
+  const plnote = $("trust-permlog-note");
+  if (plbox) {
+    if (TRUST.permLog === null) {
+      plbox.innerHTML = `<div class="trust-empty">${esc(TRUST.permLogErr || "拿不到群聊审批记录")}</div>`;
+      if (plnote) plnote.textContent = TRUST.permLogErr ? "不可用" : "";
+    } else if (!TRUST.permLog.length) {
+      plbox.innerHTML = `<div class="trust-empty">还没有审批记录 —— 群聊 AI 成员第一次需要你批准/拒绝（或超时、拿不到拥有者）时会记一条；按等级自动放行的操作不记。</div>`;
+      if (plnote) plnote.textContent = "0 条";
+    } else {
+      plbox.innerHTML = TRUST.permLog.slice(0, 30).map((r) => {
+        const v = String(r.verdict || "");
+        const cls = v === "reject" ? "v-deny" : (v === "auto" ? "v-auto" : "v-allow");
+        const label = v === "reject" ? "拒绝"
+          : v === "auto" ? "自动放行"
+          : v === "always" ? "始终允许" : "允许一次";
+        const by = r.by === "owner" ? (`拥有者 ${r.owner || "?"}`)
+          : r.by === "level" ? "按等级"
+          : r.by === "timeout" ? "超时未批"
+          : r.by === "no-ctx" ? "拿不到拥有者"
+          : r.by === "send" ? "发不出去" : "";
+        const what = r.cmd || (r.paths || []).join("、") || r.title || "";
+        return `<div class="trust-row">`
+          + `<i class="${cls}">${esc(label)}</i>`
+          + `<b title="${esc(r.agent || r.aid || "")}">${esc(r.agent || r.aid || "成员")}</b>`
+          + `<span title="${esc(what)}">${esc(what)}</span>`
+          + `<em>${esc(by)}${r.destructive ? " · 破坏性" : ""}</em>`
+          + `<em>${esc(trustWhen(r.ts))}</em>`
+          + `</div>`;
+      }).join("");
+      if (plnote) plnote.textContent = TRUST.permLog.length + " 条（最近 30 条）";
+    }
+  }
+  // ★可撤销：隔离区（破坏性操作放行前留的原件）+ 当前会话的每轮快照
+  const ubox = $("trust-undo");
+  const unote = $("trust-undo-note");
+  if (ubox) {
+    const rows = [];
+    if (TRUST.quarErr) {
+      rows.push(`<div class="trust-empty">隔离区读不到：${esc(TRUST.quarErr)}</div>`);
+    } else {
+      (TRUST.quar || []).slice(0, 3).forEach((q) => {
+        rows.push(`<div class="trust-row"><i>隔离区</i>`
+          + `<b title="${esc(q.id || "")}">${esc(q.note || "破坏性操作")}</b>`
+          + `<span title="${esc(q.cmd || "")}">${esc(q.cmd || (String(q.count || 0) + " 项被隔离"))}</span>`
+          + `<em>${esc(trustWhen(q.taken_at || q.ts))}</em>`
+          + `<button type="button" data-trust-jump="quar">打开</button></div>`);
+      });
+      if (!(TRUST.quar || []).length) {
+        rows.push(`<div class="trust-empty">隔离区是空的 —— 破坏性命令放行前会自动留一份（不占 OS 回收站）。</div>`);
+      }
+    }
+    if (!state.current) {
+      rows.push(`<div class="trust-empty">先选一个会话，才能看/撤销它的每轮快照。</div>`);
+    } else if (TRUST.snapsErr) {
+      rows.push(`<div class="trust-empty">快照读不到：${esc(TRUST.snapsErr)}</div>`);
+    } else {
+      const snaps = TRUST.snaps || [];
+      const latest = snaps[0];
+      rows.push(`<div class="trust-row"><i>快照</i>`
+        + `<b>${esc(String(snaps.length) + " 次")}</b>`
+        + `<span>${latest ? ("最近 " + esc(trustWhen(latest.taken_at)) + " · " + esc(String(latest.count || 0)) + " 个文件") : "还没有快照"}</span>`
+        + `<button type="button" data-trust-jump="undo">${latest ? "撤销这一轮" : "查看"}</button></div>`);
+    }
+    ubox.innerHTML = rows.join("");
+    if (unote) {
+      unote.textContent = TRUST.quarErr ? "隔离区不可用"
+        : (TRUST.snapsErr ? "快照不可用"
+          : `${(TRUST.quar || []).length} 条隔离 · ${(TRUST.snaps || []).length} 次快照`);
+    }
+  }
+  // ★agent 活动（群聊 AI 成员最近在做什么；桥的内存缓冲，面板重启后从零开始）
+  const abox2 = $("trust-act");
+  const anote2 = $("trust-act-note");
+  if (abox2) {
+    if (TRUST.acts === null) {
+      abox2.innerHTML = `<div class="trust-empty">${esc(TRUST.actsErr || "拿不到 agent 活动")}</div>`;
+      if (anote2) anote2.textContent = TRUST.actsErr ? "不可用" : "";
+    } else if (!TRUST.acts.length) {
+      abox2.innerHTML = `<div class="trust-empty">还没有活动 —— AI 成员被 @ 后干活（或申请权限）才会记一条；面板重启后缓冲从零开始。</div>`;
+      if (anote2) anote2.textContent = "0 条";
+    } else {
+      abox2.innerHTML = TRUST.acts.slice(0, 12).map((r) => {
+        const st = trustActZh(r.status);
+        const cls = r.status === "error" || r.status === "denied" || r.status === "timeout"
+          ? "v-deny" : (r.status === "running" || r.status === "asking" ? "v-auto" : "v-allow");
+        const what = [r.tool, r.summary].filter(Boolean).join(" · ");
+        return `<div class="trust-row">`
+          + `<i class="${cls}">${esc(st)}</i>`
+          + `<b>${esc(r.agent || "成员")}</b>`
+          + `<span title="${esc(r.detail || what)}">${esc(what)}</span>`
+          + `<em>${esc(trustWhen(r.ts))}</em>`
+          + `</div>`;
+      }).join("");
+      if (anote2) anote2.textContent = TRUST.acts.length + " 条（最近 12 条）";
+    }
+  }
+  // ★派活 / 仲裁的结论（0.1.86 起记在 localStorage；这里只读展示）
+  const dbox = $("trust-dec");
+  const dnote = $("trust-dec-note");
+  if (dbox) {
+    const dec = TRUST.dec || [];
+    if (!dec.length) {
+      dbox.innerHTML = `<div class="trust-empty">还没有仲裁结论 —— 群聊「对比」里请审查者仲裁、并点过「推荐 X」后会记一条。</div>`;
+      if (dnote) dnote.textContent = "0 条";
+    } else {
+      dbox.innerHTML = dec.slice(0, 20).map((r) => `<div class="trust-row">`
+        + `<i class="v-allow">推荐</i>`
+        + `<b title="${esc(r.target || "")}">${esc(r.pick || "?")}</b>`
+        + `<span title="${esc(r.task || "")}">${esc(r.task || "")}</span>`
+        + `<em>${esc(r.reviewer || "审查者")}</em>`
+        + `<em>${esc(trustWhen(r.ts))}</em>`
+        + `</div>`).join("");
+      if (dnote) dnote.textContent = dec.length + " 条（最近 20 条）";
+    }
+  }
+  // 本地协作：待批 + 最近任务（只读展示；逐条处理仍在工作台里）
+  const obox = $("trust-orch");
+  const onote = $("trust-orch-note");
+  if (obox) {
+    if (TRUST.orch === null) {
+      obox.innerHTML = `<div class="trust-empty">${esc(TRUST.orchErr || "拿不到本地协作任务")}</div>`;
+      if (onote) onote.textContent = TRUST.orchErr ? "不可用" : "";
+    } else {
+      const runs = (TRUST.orch.runs || []).slice(0, 3);
+      const pend = TRUST.orch.pending || [];
+      const rows = [];
+      pend.slice(0, 4).forEach((p) => {
+        rows.push(`<div class="collab-orch-row"><i class="trust-alw-k">待批</i>`
+          + `<b>${esc(p.memberName || p.member || "成员")} · ${esc(p.title || p.kind || "权限")}</b>`
+          + `<span title="${esc(p.command || (p.locations || []).join("、") || "")}">${esc(p.command || (p.locations || []).join("、") || "")}</span>`
+          + `<button type="button" data-orch-run="${esc(p.run)}">去处理</button></div>`);
+      });
+      runs.forEach((r) => {
+        const st = COLLAB_ST[String(r.status || "")] || String(r.status || "");
+        rows.push(`<div class="collab-orch-row"><i class="trust-alw-k">${esc(st)}</i>`
+          + `<b>${esc(r.title || r.task || r.id)}</b>`
+          + `<span>${esc(String(r.done || 0) + "/" + String(r.members || 0) + " 完成 · " + fmtTime(r.created))}</span>`
+          + `<button type="button" data-orch-run="${esc(r.id)}">打开工作台</button></div>`);
+      });
+      obox.innerHTML = rows.length ? rows.join("")
+        : `<div class="trust-empty">还没有本地协作任务 —— 顶栏「协作」可以本机多 agent 并行派活（不登录）。</div>`;
+      if (onote) onote.textContent = `${pend.length} 条待批 · ${(TRUST.orch.runs || []).length} 个任务`;
+    }
+  }
 }
 
 async function trustRefresh() {
@@ -6887,7 +7079,7 @@ async function trustRefresh() {
     if (state.current) {
       try {
         const r = await api(`/api/session/${encodeURIComponent(state.current.id)}/permission`);
-        TRUST.pend = (r && r.data) || [];
+        TRUST.pend = trustList(r && r.data);
       } catch (e) { TRUST.pendErr = (e && e.message) || String(e); }
     }
     // 待批（群聊，从已有消息推；不额外问服务端）
@@ -6895,7 +7087,7 @@ async function trustRefresh() {
     // 最近「始终允许」（只有 ACP 引擎有这个接口）
     try {
       const r = await api("/api/permission/always");
-      TRUST.always = (r && r.data) || [];
+      TRUST.always = trustList(r && r.data);
       TRUST.alwaysErr = "";
     } catch (e) {
       TRUST.always = null;
@@ -6904,6 +7096,49 @@ async function trustRefresh() {
         ? "当前引擎不支持「始终允许」记忆（只有 ACP 引擎有；opencode 引擎没有这个接口）"
         : ("拿不到「始终允许」列表：" + msg);
     }
+    // 本地协作：最近任务 + 待批（只读展示；逐条处理在工作台里）
+    try {
+      const [rr, pp] = await Promise.all([api("/orchestrate/runs"), api("/orchestrate/pending")]);
+      TRUST.orch = { runs: trustList(rr && rr.runs), pending: trustList(pp && pp.pending) };
+      TRUST.orchErr = "";
+    } catch (e) {
+      TRUST.orch = null;
+      const msg = String((e && e.message) || e);
+      TRUST.orchErr = /^404/.test(msg)
+        ? "当前版本没有本地协作接口（需要 0.2.1+ 的后端；重启面板服务）"
+        : ("拿不到本地协作任务：" + msg);
+    }
+    // ★可撤销：隔离区记录 + 当前会话的每轮快照（都用现成接口，不另造一套）
+    TRUST.quar = null; TRUST.quarErr = "";
+    try {
+      const r = unwrap(await api("/quarantine/list")) || {};
+      TRUST.quar = trustList(r && r.items);
+    } catch (e) { TRUST.quarErr = (e && e.message) || String(e); }
+    TRUST.snaps = null; TRUST.snapsErr = "";
+    if (state.current) {
+      try {
+        const r = unwrap(await api(`/snapshot/list?scope=${encodeURIComponent(state.current.id)}`)) || {};
+        TRUST.snaps = trustList(r && r.items);
+      } catch (e) { TRUST.snapsErr = (e && e.message) || String(e); }
+    } else TRUST.snaps = [];
+    // ★群聊审批时间线（落盘审计；没有就是还没发生过）
+    TRUST.permLog = null; TRUST.permLogErr = "";
+    try {
+      const r = await api("/ccagent/permissions?limit=80");
+      TRUST.permLog = trustList(r && r.items);
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      TRUST.permLogErr = /^404/.test(msg)
+        ? "当前版本还没有审批审计接口（重启面板服务）" : ("拿不到审批记录：" + msg);
+    }
+    // ★agent 活动（桥的内存环形缓冲；面板重启后从零开始）
+    TRUST.acts = null; TRUST.actsErr = "";
+    try {
+      const r = await api("/ccagent/activity?since=0");
+      TRUST.acts = trustList(r && r.items);
+    } catch (e) { TRUST.actsErr = (e && e.message) || String(e); }
+    // ★派活 / 仲裁结论（localStorage 历史；只读）
+    TRUST.dec = trustList((typeof ccDecisionHistory === "function") ? ccDecisionHistory() : []);
     trustRender();
   } finally {
     TRUST.busy = false;
@@ -6972,9 +7207,23 @@ function initTrust() {
         }
         return;
       }
+      const jump = e.target.closest("[data-trust-jump]");
+      if (jump) {
+        trustClose();
+        if (jump.dataset.trustJump === "quar") { try { quarOpen(); } catch { /* ignore */ } }
+        else { try { undoOpen(); } catch { /* ignore */ } }
+        return;
+      }
       const del = e.target.closest("[data-alw-del]");
       if (del) { trustForget(del.dataset.alwDel); return; }
-      if (e.target.closest("[data-alw-clear]")) { trustForgetAll(); }
+      if (e.target.closest("[data-alw-clear]")) { trustForgetAll(); return; }
+      const orch = e.target.closest("[data-orch-run]");
+      if (orch) {
+        trustClose();
+        collabOpen(true);
+        collabOpenRun(orch.dataset.orchRun);
+        return;
+      }
     });
   }
   window.addEventListener("keydown", (e) => { if (e.key === "Escape" && trustIsOpen()) trustClose(); });
@@ -7307,6 +7556,15 @@ async function setEngine(id) {
   if (sel) sel.disabled = true;
   try {
     await api("/engine", { method: "POST", body: JSON.stringify({ engine: id }) });
+    // ★ 换引擎的第一件事：把「旧引擎的模型清单」作废，并按新引擎重拉。
+    //   必须赶在 openSession()（它会触发 repairStaleModel）**之前** —— 否则会拿 ACP 的清单
+    //   去判 OpenCode 的模型引用，把 `providerID:"acp"` 写进会话 → 提问 17ms 就 idle、没有任何回复。
+    ENGINE.active = id;
+    resetModels(id);
+    // ★ 后台重拉，**不 await**：ACP 的 /api/model 要先 ensure_model_config（resume 最近会话/冷启动，
+    //   实测数秒）—— 等它会把"切引擎"卡住。清单已同步作废（list=null），
+    //   这段时间任何归一/写入都会走 fail-closed（不猜、不写非法引用），不会重现跨引擎写坏模型。
+    loadModels().catch(() => {});
     setBanner(`已切换对话引擎：${id}`);
     // 换引擎 = 换后端：清空当前会话与消息区，并重连 SSE。
     // ⚠ /api/event 在「连接那一刻」就绑定了当时的引擎；不重连会一直收到旧引擎的事件。
@@ -7321,6 +7579,7 @@ async function setEngine(id) {
     heroShown = false;
     resetMsgPaging();
     renderAttachRow();
+    ctxSync();                                  // ★ 换引擎：旧引擎的上下文数字立刻清掉（别让它继续显示）
     $("session-title").textContent = "未选择会话";
     $("session-meta").textContent = "";
     $("input").disabled = true;
@@ -7645,7 +7904,8 @@ function renderSkills() {
 
   if (!SKILL.cmds.length) {
     cl.innerHTML = `<div class="muted skill-empty">`
-      + `${SKILL.loading ? "读取中…" : "没有斜杠命令（ACP 一般要跑过一轮才拿得到）"}</div>`;
+      + `${SKILL.loading ? "读取中…" : "这个 agent 没有上报斜杠命令（ACP 里不是每个 adapter 都实现；dsh 就没有）。"
+        + "仍可用顶栏「模式 / 模型」和左边的技能。"}</div>`;
   } else {
     cl.innerHTML = SKILL.cmds.map((c) => {
       const tip = [c.name, c.description].filter(Boolean).join("\n");
@@ -7849,11 +8109,13 @@ function initSkillPicker() {
  * （反过来在 ACP 里新建的会话会写进 OpenCode 的库，所以"本地看的到"）。
  * 这里把 agent 侧的会话列出来，点一下就领进面板（历史留在 agent 那边，接着聊即可）。 */
 
-const IMP = { list: [], cursor: null, supported: null, err: "" };
+const IMP = { all: [], list: [], internal: [], tab: "project",
+              cursor: null, supported: null, err: "" };
 
 async function openImport() {
   const box = $("import");
   if (!box) return;
+  IMP.tab = "project";
   box.hidden = false;
   $("imp-cur").textContent = "读取中…";
   $("imp-list").innerHTML = "";
@@ -8172,14 +8434,19 @@ async function undoRun() {
 
 async function loadImport() {
   try {
-    const r = await api("/api/session/remote");
+    // ★internal=1：一次拿全，前端再按 `internal` 标记拆成两个标签
+    const r = await api("/api/session/remote?internal=1");
     IMP.supported = !!(r && r.supported);
-    IMP.list = (r && r.sessions) || [];
+    IMP.all = (r && r.sessions) || [];
+    IMP.list = IMP.all.filter((x) => !x.internal);
+    IMP.internal = IMP.all.filter((x) => !!x.internal);
     IMP.cursor = (r && r.cursor) || null;
     IMP.err = (r && r.error) || "";
   } catch (e) {
     IMP.supported = false;
+    IMP.all = [];
     IMP.list = [];
+    IMP.internal = [];
     IMP.err = (e && e.message) ? e.message : String(e);
   }
   renderImport();
@@ -8188,30 +8455,58 @@ async function loadImport() {
 function renderImport() {
   const box = $("imp-list");
   const cur = $("imp-cur");
+  const tabs = $("imp-tabs");
   if (!box) return;
+  const np = $("imp-n-project"), ni = $("imp-n-internal");
+  if (np) np.textContent = String((IMP.list || []).length);
+  if (ni) ni.textContent = String((IMP.internal || []).length);
+  if (tabs) {
+    Array.prototype.forEach.call(tabs.querySelectorAll("[data-imp-tab]"), (b) => {
+      b.classList.toggle("on", String(b.dataset.impTab) === String(IMP.tab));
+    });
+  }
   if (IMP.supported === false) {
+    if (tabs) tabs.hidden = true;
     if (cur) cur.textContent = IMP.err || "当前 agent / 引擎不支持列会话（session/list）";
     box.innerHTML = `<div class="muted" style="padding:10px">`
       + `只有 ACP 引擎 + 支持 <code>session/list</code> 的 agent 才能列出来。`
       + `（OpenCode 自带的 ACP 支持；Codex 也支持）</div>`;
     return;
   }
-  const n = IMP.list.length;
-  const fresh = IMP.list.filter((x) => !x.imported).length;
-  if (cur) cur.textContent = n
-    ? `agent 侧共 ${n} 条${fresh ? `，其中 ${fresh} 条还没接续` : "（都已在面板里）"}`
-    : "agent 侧没有会话";
+  if (tabs) tabs.hidden = false;
+  const internal = IMP.tab === "internal";
+  const rows = internal ? (IMP.internal || []) : (IMP.list || []);
+  const n = rows.length;
+  const fresh = rows.filter((x) => !x.imported).length;
+  if (cur) {
+    if (IMP.err) cur.textContent = IMP.err;
+    else if (internal) {
+      cur.textContent = n
+        ? `内部会话 ${n} 条（群聊 AI 成员 / 本地协作——通常不需要接续到项目列表）`
+        : "没有内部会话（群聊 AI 成员 / 本地协作）";
+    } else {
+      cur.textContent = n
+        ? `项目会话 ${n} 条${fresh ? `，其中 ${fresh} 条还没接续` : "（都已在面板里）"}`
+          + ((IMP.internal || []).length ? `　·　另有 ${IMP.internal.length} 条内部会话（另一个标签）` : "")
+        : ((IMP.internal || []).length
+          ? `没有项目会话；内部会话有 ${IMP.internal.length} 条（点上面的「内部会话」看）`
+          : "agent 侧没有会话");
+    }
+  }
   if (!n) {
-    box.innerHTML = `<div class="muted" style="padding:10px">agent 那边也没有历史会话。</div>`;
+    box.innerHTML = `<div class="muted" style="padding:10px">`
+      + (internal ? "没有内部会话。" : "agent 那边没有项目会话。")
+      + `</div>`;
     return;
   }
-  box.innerHTML = IMP.list.map((s) => {
+  box.innerHTML = rows.map((s) => {
     const title = s.title || "(无标题)";
     const when = s.updatedAt ? String(s.updatedAt).replace("T", " ").slice(0, 16) : "";
     const hist = Number(s.messages || 0);
     const histTip = hist ? `<span class="muted" style="font-size:11px">对面 ${hist} 条历史</span>` : "";
-    return `<div class="agents-row${s.imported ? " on" : ""}" data-imp="${esc(s.id)}">`
-      + `<div class="an"><span class="dot ok"></span>${esc(title)}`
+    return `<div class="agents-row${s.imported ? " on" : ""}${s.internal ? " imp-internal" : ""}" data-imp="${esc(s.id)}">`
+      + `<div class="an"><span class="dot ${s.internal ? "" : "ok"}"></span>${esc(title)}`
+      + (s.internal ? `<span class="badge">内部</span>` : "")
       + `<span class="muted" style="font-size:11px">${esc(s.id)}</span>`
       + histTip
       + `<span class="muted" style="font-size:11px;margin-left:auto">`
@@ -8224,9 +8519,13 @@ function renderImport() {
 /** 点一条：没接续过就 POST /api/session/import，然后打开它。
  *  后端会回 `attach`：bound=能否接回；historyImported=是否真读进了历史。 */
 async function doImport(remoteId) {
-  const s = IMP.list.find((x) => x.id === remoteId);
+  const s = (IMP.all || []).find((x) => x.id === remoteId)
+    || (IMP.list || []).find((x) => x.id === remoteId)
+    || (IMP.internal || []).find((x) => x.id === remoteId);
   if (!s) return;
   if (s.imported && s.localID) { closeImport(); await openSession(s.localID); return; }
+  if (s.internal && !confirm("这条是群聊 AI 成员 / 本地协作创建的**内部会话**。\n"
+    + "接续后它会作为普通会话出现在左边的项目会话列表里。确定要接续吗？")) return;
   const cur = $("imp-cur");
   if (cur) cur.textContent = "接续中…";
   try {
@@ -8458,6 +8757,7 @@ function renderAgents() {
       + (canDel ? `<button type="button" class="p-x" data-del="${esc(a.id)}" title="删除这个 agent">×</button>` : "")
       + `</div>`
       + (a.note ? `<div class="ab">${esc(a.note)}</div>` : "")
+      + (a.dangerous ? `<div class="ab danger" title="${esc(a.dangerousNote || "")}">⚠ ${esc(a.dangerousNote || "该 agent 不请求权限，权限等级/群审批对它无效")}</div>` : "")
       + `</div>`;
   }).join("");
   // 每张卡片右上角补一个「改」（编辑名称/命令/目录/provider）
@@ -8776,6 +9076,11 @@ function closeAgents() {
  *（否则拿旧 sessionId 去 prompt，对方回 -32603 Session not found）。 */
 async function resetAfterAgentSwitch(msg) {
   setBanner(msg);
+  // ★ 换 ACP agent = 换模型清单（每个 agent 能用的模型不同）→ 旧清单立刻作废。
+  //   ⚠ 重拉**不 await**：ACP 拿清单要 resume 最近会话（冷启动时 5s+），等它会把"切 agent"卡死。
+  //   清单为空期间 normalizeModelRef 返回 null（不猜）、writeSessionModel 不写非法引用 → 安全。
+  resetModels(ENGINE.active);
+  loadModels().catch(() => {});
   state.current = null;
   state.messages = [];
   state.live = {};
@@ -9117,6 +9422,13 @@ function initSettings() {
   }));
   $("imp-close").addEventListener("click", closeImport);
   $("imp-reload").addEventListener("click", loadImport);
+  const impTabs = $("imp-tabs");
+  if (impTabs) impTabs.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-imp-tab]");
+    if (!b) return;
+    IMP.tab = String(b.dataset.impTab) === "internal" ? "internal" : "project";
+    renderImport();
+  });
   $("import").addEventListener("click", (e) => { if (e.target === $("import")) closeImport(); });
   $("imp-list").addEventListener("click", (e) => {
     const row = e.target.closest("[data-imp]");
@@ -9656,6 +9968,7 @@ function hideBarResults() {
 
 function openMusicHome() {
   try { if (typeof CODE !== "undefined" && CODE.open) codeClose(); } catch { /* ignore */ }
+  try { if (typeof collabIsOpen === "function" && collabIsOpen()) collabOpen(false); } catch { /* ignore */ }
   const bs = $("body-stage");
   if (bs) bs.classList.add("mus-open");
   MUS.homeOpen = true;
@@ -10105,8 +10418,50 @@ function initMusicAudio() {
  * 清单来自 GET /api/model（{location,data:[...]}）；variants[] 也一并做成可点的变体按钮。
  * ⚠ 切模型后 GET /api/session/{id} 的 model 会更新，但"列表"更可靠（详情也是 {data:...} 包着的）。 */
 
-const MODEL = { list: null, loading: false, pending: null };
+const MODEL = { list: null, engine: "", loading: false, pending: null, pendingEngine: "" };
 const MODEL_KEY = "cocraft.model";
+
+/* ★模型清单是「某个引擎的」清单，不是全局清单（2026-10-20 修跨引擎写坏模型）。
+ *
+ * 事故：在 ACP 下建的会话里模型是 `{id:"deepseek/deepseek-flash", providerID:"acp"}`
+ * （ACP 注册表没配 provider → 后端兜底成中性 `"acp"`）。切到 opencode 后：
+ *   ① `MODEL.list` 还是 ACP 那份 → `repairStaleModel()` 把**合法**的 opencode 引用判成"失效"；
+ *   ② `normalizeModelRef()` 只比 `id`、不比 `providerID` → 把 `providerID:"acp"` 原样吐出来；
+ *   ③ 于是 POST /api/session/{id}/model 写进去 → OpenCode `ModelUnavailableError`
+ *     → 那一轮 17ms 就 `idle`，提问**没有任何回复**。
+ *
+ * 铁律：清单必须带引擎标记；**不属于当前引擎的清单，一律不拿来做判断**（宁可不动，不许猜）。 */
+function modelEngineNow() { return ENGINE.active || ""; }
+
+/** 清单是否属于当前引擎（任一侧未知时按"匹配"处理，避免启动早期误杀）。 */
+function modelEngineMatches() {
+  const cur = modelEngineNow();
+  return !MODEL.engine || !cur || MODEL.engine === cur;
+}
+
+/** 作废模型清单（切引擎时调用）：旧引擎的清单绝不能再参与任何判断。 */
+function resetModels(engineId) {
+  MODEL.list = null;
+  MODEL.engine = engineId === undefined ? modelEngineNow() : (engineId || "");
+  MODEL.pending = null;
+  MODEL.pendingEngine = "";
+  MODEL.loading = false;
+}
+
+/** 清单没拿到 / 不属于当前引擎 → 重拉一次（写模型前都要过这一道）。 */
+async function ensureModelList() {
+  if (!MODEL.list || !MODEL.list.length || !modelEngineMatches()) {
+    try { await loadModels(); } catch { /* ignore */ }
+  }
+}
+
+/** 这个引用在当前引擎里「制度上」是否合法：ACP 的中性 providerID `"acp"` 只对 ACP 引擎有效。 */
+function modelRefUsable(ref) {
+  if (!ref || !ref.id) return false;
+  const acpNeutral = String(ref.providerID || "") === "acp";
+  if (acpNeutral && modelEngineNow() !== "acp") return false;
+  return true;
+}
 
 /* 模型官方图标（本地素材，由 tools/fetch_model_icons.py 下载；OpenCode 接口本身没有图标字段）。
    解析顺序：模型 id → family → family(去掉 -free) → providerID；都没有就用「青铜字母徽章」。
@@ -10118,11 +10473,16 @@ const MODEL_ICONS = {
 };
 const MODEL_ICON_DIR = "/assets/models/";
 
-/** 把会话里的轻量 model ref 与模型清单里的完整条目合并（拿 name / family） */
+/** 把会话里的轻量 model ref 与模型清单里的完整条目合并（拿 name / family）
+ *  ⚠ 清单属于当前引擎、却命中不到 → 标记 `engineForeign`（别的引擎留下的引用）。
+ *    绝不能把它当权威 ref 展示，免得顶栏一直显示一个当前引擎不认的模型。 */
 function modelFull(ref) {
   if (!ref) return null;
-  const hit = (MODEL.list || []).find((m) => m.id === ref.id && m.providerID === ref.providerID);
-  return hit ? Object.assign({}, hit, ref) : ref;
+  const list = MODEL.list || [];
+  const hit = list.find((m) => m.id === ref.id && m.providerID === ref.providerID);
+  if (hit) return Object.assign({}, hit, ref);
+  if (list.length && modelEngineMatches()) return Object.assign({}, ref, { engineForeign: true });
+  return ref;
 }
 
 function iconKeyFor(ref) {
@@ -10164,21 +10524,23 @@ function saveDefaultModel(ref) {
  *   否则新会话会挂一个无效模型，发出去又是「发了没反应」。
  */
 async function resolveDefaultModel() {
+  await ensureModelList();
+  const list = MODEL.list || [];
+  const usable = (r) => !!r && !!r.id && !!r.providerID && modelRefUsable(r)
+    && (!list.length || list.some((m) => m.id === r.id && m.providerID === r.providerID));
+  // ★ 本地存的引用**只有**在「清单属于当前引擎、且真的命中」时才能直接用；
+  //   否则它多半是上一个引擎留下的（例如 ACP 的 providerID="acp"）→ 重新解析。
   const saved = defaultModel();
-  if (saved && saved.id && saved.providerID) {
-    const list = MODEL.list;
-    if (!list || list.some((m) => m.id === saved.id && m.providerID === saved.providerID)) {
-      return saved;
-    }
-  }
+  if (usable(saved)) return saved;
   let ref = null;
   try {
     const d = unwrap(await api("/api/model/default"));
     if (d && d.id) ref = { id: d.id, providerID: d.providerID };
   } catch { /* 后端不支持就算了 */ }
+  if (ref && !usable(ref)) ref = null;
   if (!ref) {
-    const list = await loadModels();
-    const first = (list || []).find((m) => m && m.id && m.providerID);
+    const fresh = await loadModels();
+    const first = (fresh || []).find((m) => m && m.id && m.providerID && modelRefUsable(m));
     if (first) ref = { id: first.id, providerID: first.providerID };
   }
   if (ref) saveDefaultModel(ref);
@@ -10187,6 +10549,19 @@ async function resolveDefaultModel() {
 
 /** 把模型 ref 写进会话并同步本地状态（顶栏按钮/列表）；返回落地后的 ref，失败返回 null。 */
 async function writeSessionModel(sid, ref) {
+  if (!sid || !ref || !ref.id || !ref.providerID) return null;
+  // ★ 最后一道闸（事故就是漏了这一道）：当前引擎不认的引用**绝不写进会话**。
+  //   写坏比不写危险得多 —— 写坏了提问会直接 `ModelUnavailableError`，界面上没有任何回复。
+  if (!modelRefUsable(ref)) {
+    setBanner(`模型 ${modelText(ref)} 不属于当前引擎，未写入；请点「模型」另选一个`, { ms: 9000 });
+    return null;
+  }
+  const list = MODEL.list || [];
+  if (list.length && modelEngineMatches()
+      && !list.some((m) => m.id === ref.id && m.providerID === ref.providerID)) {
+    setBanner(`当前引擎没有模型 ${modelText(ref)}，未写入；请点「模型」另选一个`, { ms: 9000 });
+    return null;
+  }
   try {
     await api(`/api/session/${encodeURIComponent(sid)}/model`,
       { method: "POST", body: JSON.stringify({ model: { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" } }) });
@@ -10207,8 +10582,8 @@ async function writeSessionModel(sid, ref) {
 async function ensureSessionModel(sid) {
   if (!sid) return null;
   const cur = (state.current && state.current.id === sid) ? state.current.model : null;
+  await ensureModelList();                        // ★ 清单必须属于当前引擎，才拿它做判断
   if (cur && cur.id) {
-    if (!MODEL.list || !MODEL.list.length) { try { await loadModels(); } catch { /* ignore */ } }
     if (modelAvailable(cur)) return cur;   // 已有且仍在清单里 → 不动
     // ★ 跨引擎残留（如 providerID=acp、id=deepseek/deepseek-flash）：能归一就就地改写，不换模型
     const norm = normalizeModelRef(cur);
@@ -10216,10 +10591,10 @@ async function ensureSessionModel(sid) {
       const fixed = await writeSessionModel(sid, norm);
       if (fixed) return fixed;
     }
-    // 真下架：落到下面重新解析默认并写回（否则发出去只会空转）
+    // 真下架 / 归一不了：落到下面重新解析默认并写回（否则发出去只会空转）
   }
   const ref = await resolveDefaultModel();
-  if (!ref) return null;
+  if (!ref) { setBanner("没有可用的模型；请点「模型」另选一个", { ms: 9000 }); return null; }
   return await writeSessionModel(sid, ref);
 }
 
@@ -10234,33 +10609,38 @@ async function ensureSessionModel(sid) {
 function normalizeModelRef(ref) {
   if (!ref || !ref.id) return ref || null;
   const list = MODEL.list;
-  if (!list || !list.length) return ref;              // 清单没加载 → 原样返回（避免误杀）
+  // ⚠ 不知道清单属于谁 / 清单不属于当前引擎 → **不猜**（返回 null 由调用方提示用户）
+  if (!list || !list.length) return null;
+  if (!modelEngineMatches()) return null;
   const pick = (m) => ({ id: m.id, providerID: m.providerID, variant: ref.variant });
+  const ok = (m) => !!m && !!m.providerID && modelRefUsable(m);
   // ① 精确命中（本引擎里就有这一项）
-  let hit = list.find((m) => m.id === ref.id && m.providerID === ref.providerID);
+  let hit = list.find((m) => ok(m) && m.id === ref.id && m.providerID === ref.providerID);
   if (hit) return pick(hit);
   // ② id 形如 `<provider>/<model>`（ACP 形态）
   const slash = ref.id.indexOf("/");
   if (slash > 0) {
     const prov = ref.id.slice(0, slash), mid = ref.id.slice(slash + 1);
-    hit = list.find((m) => m.id === mid && m.providerID === prov);
+    hit = list.find((m) => ok(m) && m.id === mid && m.providerID === prov);
     if (hit) return pick(hit);
     // ④ id 带前缀、本引擎的 id 是最后一段
-    hit = list.find((m) => m.id === ref.id.slice(ref.id.lastIndexOf("/") + 1));
+    hit = list.find((m) => ok(m) && m.id === ref.id.slice(ref.id.lastIndexOf("/") + 1));
     if (hit) return pick(hit);
   }
   // ③ providerID 兜底成了中性值（如 "acp"），但 id 本身是对的
-  hit = list.find((m) => m.id === ref.id);
+  //   ⚠ `ok()` 已经挡掉「非 acp 引擎却产出 providerID=acp」——事故就是从这里漏出去的
+  hit = list.find((m) => ok(m) && m.id === ref.id);
   if (hit) return pick(hit);
   return null;
 }
 
-/** 模型 ref 是否仍在当前清单里；清单还没加载时不做判断（避免误杀）。 */
+/** 模型 ref 是否仍在**当前引擎**的清单里；清单没拿到 / 不属于当前引擎时不做判断（避免误杀）。 */
 function modelAvailable(ref) {
   if (!ref || !ref.id || !ref.providerID) return true;
   const list = MODEL.list;
   if (!list || !list.length) return true;
-  return list.some((m) => m.id === ref.id && m.providerID === ref.providerID);
+  if (!modelEngineMatches()) return true;
+  return list.some((m) => m.id === ref.id && m.providerID === ref.providerID && modelRefUsable(m));
 }
 
 /** 后端可能因「模型不可用」自动换过模型 → 把这个会话的最新模型同步到顶栏按钮。 */
@@ -10284,7 +10664,7 @@ async function refreshCurrentModel() {
  */
 async function repairStaleModel(sess) {
   if (!sess || !sess.model || !sess.model.id) return false;
-  if (!MODEL.list || !MODEL.list.length) { try { await loadModels(); } catch { /* ignore */ } }
+  await ensureModelList();                       // ★ 拿不到当前引擎的清单就不动（不许拿旧清单误判）
   if (modelAvailable(sess.model)) return false;
   const oldText = modelText(sess.model);
   // ★ 跨引擎残留：能归一就就地改写引用（同一个模型），别误当成"下架"去换默认
@@ -10295,17 +10675,18 @@ async function repairStaleModel(sess) {
       setBanner(`已修正这个会话的模型引用：${oldText} → ${modelText(fixed)}`);
       return true;
     }
-    setBanner(`这个会话的模型引用 ${oldText} 无法修正；请点「模型」另选一个`);
+    setBanner(`这个会话的模型引用 ${oldText} 不属于当前引擎，未改动；请点「模型」另选一个`, { ms: 9000 });
     return false;
   }
   const ref = await resolveDefaultModel();
   if (!ref) {
-    setBanner(`这个会话绑的模型 ${oldText} 已不可用；请点「模型」另选一个（当前没有可用模型）`);
+    // ⚠ 归一不了、也解析不出默认模型 → **什么都不写**（写进去就是"发了没反应"）
+    setBanner(`这个会话的模型 ${oldText} 不属于当前引擎，且没有可用的替代；请点「模型」另选一个`, { ms: 9000 });
     return false;
   }
   const m = await writeSessionModel(sess.id, ref);
   if (!m) {
-    setBanner(`这个会话绑的模型 ${oldText} 已不可用，自动切换失败；请点「模型」另选一个`);
+    setBanner(`这个会话的模型 ${oldText} 已不可用，自动切换失败；请点「模型」另选一个`, { ms: 9000 });
     return false;
   }
   setBanner(`这个会话原来的模型 ${oldText} 已下架，已自动切到 ${modelText(m)}（可在「模型」里改）`);
@@ -10329,23 +10710,56 @@ function updateModelBtn() {
   const b = $("btn-model");
   if (!b) return;
   const cur = currentModel();
+  const f = modelFull(cur);
   b.innerHTML = modelIconHtml(cur);          // 用官方图标代替模型名（名字放 tooltip）
-  b.title = cur ? `当前模型：${modelText(cur, true)}（点一下切换）` : "切换模型（对当前会话生效）";
+  b.title = cur
+    ? `当前模型：${modelText(cur, true)}`
+      + (f && f.engineForeign ? "（当前引擎的清单里没有它 —— 请点这里重选一个）" : "")
+      + "（点一下切换）"
+    : "切换模型（对当前会话生效）";
 }
 
 async function loadModels() {
+  // ★ 清单必须绑定引擎。ENGINE.active 在「没打开过设置」时可能还是空 → 先问一次后端，
+  //   否则会拿一份不知道自己属于谁、也不知道属于哪个引擎的清单去判模型（就是事故的入口）。
+  if (!ENGINE.active) {
+    try {
+      const st = await api("/engine/status");
+      if (st) {
+        if (st.active) ENGINE.active = st.active;
+        if (st.available) ENGINE.available = st.available;
+        if (st.engines) ENGINE.engines = st.engines;
+      }
+    } catch { /* 老后端没有这个接口：按"引擎未知"处理 */ }
+  }
+  const eng = modelEngineNow();
   // ★ 并发调用共享同一次请求的结果：以前并发时会直接返回 MODEL.list（可能还是空 []），
   //   调用方据此误判"模型清单为空 → 模型一定可用" → 跨引擎残留的引用没被归一 → 发出即失败。
-  if (MODEL.pending) return MODEL.pending;
+  if (MODEL.pending && MODEL.pendingEngine === eng) return MODEL.pending;
   MODEL.loading = true;
-  MODEL.pending = (async () => {
-    try { MODEL.list = unwrap(await api("/api/model")) || []; }
-    catch { MODEL.list = MODEL.list || []; }
-    MODEL.loading = false;
-    MODEL.pending = null;
+  const p = (async () => {
+    let list = null;
+    try { list = unwrap(await api("/api/model")) || []; }
+    catch { list = null; }                     // ★ 失败**不再沿用旧清单**（旧清单可能属于别的引擎）
+    // 请求期间引擎被切走了 → 这份结果不属于当前引擎，直接丢弃，别写进 MODEL.list
+    if (modelEngineNow() !== eng) {
+      return modelEngineMatches() ? (MODEL.list || []) : [];
+    }
+    MODEL.list = list || [];
+    MODEL.engine = eng;
     return MODEL.list;
   })();
-  return MODEL.pending;
+  MODEL.pending = p;
+  MODEL.pendingEngine = eng;
+  try {
+    return await p;
+  } finally {
+    if (MODEL.pending === p) {
+      MODEL.pending = null;
+      MODEL.pendingEngine = "";
+      MODEL.loading = false;
+    }
+  }
 }
 
 /** 按 provider 分组渲染；标出当前；带 variants 的给一排变体小按钮 */
@@ -10357,9 +10771,12 @@ function renderModels() {
   const all = MODEL.list || [];
   const items = all.filter((m) => !q || [m.name, m.id, m.providerID, m.family]
     .some((x) => String(x || "").toLowerCase().includes(q)));
-  $("mdl-cur").textContent = state.current
+  const curRef = state.current ? state.current.model : cur;
+  const curForeign = curRef && (modelFull(curRef) || {}).engineForeign;
+  $("mdl-cur").textContent = (state.current
     ? "当前会话：" + modelText(state.current.model, true)
-    : (cur ? "未选会话 · 新会话默认：" + modelText(cur, true) : "未选会话 · 跟随引擎默认");
+    : (cur ? "未选会话 · 新会话默认：" + modelText(cur, true) : "未选会话 · 跟随引擎默认"))
+    + (curForeign ? "　⚠ 当前引擎不认这个模型，请在下面重选" : "");
   if (!items.length) {
     box.innerHTML = `<div class="muted" style="padding:10px">`
       + (all.length ? "没有匹配的模型" : "拿不到模型清单") + `</div>`;
@@ -10395,11 +10812,23 @@ function renderModels() {
 /** 切换：有会话 → 写进会话；没会话 → 存成"新会话默认" */
 async function pickModel(ref) {
   const sid = state.current && state.current.id;
+  // ★ 用户点的那一项必须真的在当前引擎的清单里（防止界面上还挂着上一个引擎的清单）
+  if (!sid && !modelRefUsable(ref)) {
+    setBanner(`模型 ${modelText(ref)} 不属于当前引擎；请刷新后重选`, { ms: 9000 });
+    return;
+  }
   if (!sid) {
     saveDefaultModel(ref);
     setBanner(`已设为新会话默认模型：${modelText(ref, true)}`);
     renderModels();
     updateModelBtn();
+    return;
+  }
+  await ensureModelList();
+  const list = MODEL.list || [];
+  if (!modelRefUsable(ref) || (list.length && modelEngineMatches()
+      && !list.some((m) => m.id === ref.id && m.providerID === ref.providerID))) {
+    setBanner(`当前引擎没有模型 ${modelText(ref)}，未切换；请刷新后重选`, { ms: 9000 });
     return;
   }
   await api(`/api/session/${encodeURIComponent(sid)}/model`,
@@ -10549,6 +10978,7 @@ $("messages").addEventListener("scroll", () => {
   const prev = histLastTop;
   histLastTop = top;
   state.follow = (b.scrollHeight - top - b.clientHeight) < 60;
+  msgNavSchedule();                // ★回到底部 / 问题导航跟着滚动更新
   // ★往上翻页：滚到顶附近、且这次确实是"往上"滚的（首屏渲染时 scrollTop 从 0 跳到最底，不算）
   if (top <= MSG_TOP_TRIGGER && top < prev) maybeLoadHistory();
 });
@@ -10556,6 +10986,240 @@ $("messages").addEventListener("scroll", () => {
 $("msg-more").addEventListener("click", (e) => {
   if (e.target.closest(".mm-btn")) loadHistory();
 });
+
+/* ============================================================================
+   ★消息导航：回到底部 + 问题导航（跳到某次提问 / 上一问 / 下一问 / 回到本问）
+   ---------------------------------------------------------------------------
+   * 「回到底部」只在离开底部 >80px 时出现（正在读历史时它就是个明确的回位入口）；
+   * 「问题」始终列出自上次加载以来的每次**提问**（含刚发出去、还在 pending 的那条），
+     点一行就跳到那一轮；`Alt+↑ / Alt+↓` 直接上一问 / 下一问；
+   * 「回到本问」= 跳到**当前视口所在那一轮**的提问（长回答读一半时最好用）；
+   * 跳过去会给那一轮的 `.bubble` 闪一下，否则滚过去了也看不出停在哪。
+   ============================================================================ */
+
+const MSG_NAV = { open: false, timer: 0, instant: false };
+try {
+  MSG_NAV.instant = !!(navigator.webdriver
+    || (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches));
+} catch { /* 隐私模式 / 老浏览器：保持平滑滚动 */ }
+
+/** 提问原文：用户消息正文在 `text` / `metadata.displayText`（和 messageCopyText 同一套兜底）。 */
+function msgUserText(m) {
+  if (!m) return "";
+  const t = m.text
+    || (m.metadata && (m.metadata.displayText || m.metadata.text))
+    || "";
+  return String(t || "").trim();
+}
+
+function msgClock(ts) {
+  const n = Number(ts) || 0;
+  if (!n) return "";
+  try {
+    return new Date(n).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  } catch { return ""; }
+}
+
+/** 当前 DOM 里的每一条提问（顺序 = 从上到下）。DOM 是权威：消息重建 / 翻页 / pending 都跟着变。 */
+function msgQuestionItems() {
+  const box = $("messages");
+  if (!box) return [];
+  const meta = new Map();
+  (state.messages || []).forEach((m) => {
+    if (!m || m.type !== "user") return;
+    meta.set(String(m.id), { text: msgUserText(m), ts: Number((m.time || {}).created) || 0 });
+  });
+  (state.pending || []).forEach((p) => {
+    if (!p || !p.id) return;
+    meta.set(String(p.id), { text: String(p.text || ""), ts: Number(p.time) || 0 });
+  });
+  const out = [];
+  Array.prototype.forEach.call(box.querySelectorAll(".msg.user[data-mid]"), (el) => {
+    const id = String(el.dataset.mid || "");
+    if (!id) return;
+    const mm = meta.get(id) || {};
+    let text = mm.text || "";
+    if (!text) {
+      const b = el.querySelector(".bubble");
+      text = b ? String(b.innerText || b.textContent || "").trim() : "";
+    }
+    text = oneLine(text, 4000);
+    out.push({ id, el, index: out.length, ts: mm.ts || 0, full: text, text: oneLine(text, 120) });
+  });
+  return out;
+}
+
+/** 当前视口所在的是第几问（按提问的顶边 <= 消息区顶边 + 26px 的最后一条算；没有就 -1）。 */
+function msgCurrentQuestionIndex(items) {
+  const box = $("messages");
+  if (!box || !items.length) return -1;
+  const anchor = box.getBoundingClientRect().top + 26;
+  let idx = -1;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].el.getBoundingClientRect().top <= anchor) idx = i;
+    else break;
+  }
+  return idx;
+}
+
+function msgNavSync() {
+  const box = $("messages");
+  if (!box) return;
+  const btn = $("msg-bottom");
+  const ask = $("msg-ask");
+  const gap = box.scrollHeight - box.scrollTop - box.clientHeight;
+  if (btn) btn.hidden = !(gap > 80);
+  const items = msgQuestionItems();
+  if (ask) {
+    ask.hidden = !items.length;
+    const cur = items.length ? msgCurrentQuestionIndex(items) : -1;
+    ask.title = items.length
+      ? `问题导航：第 ${Math.max(1, cur + 1)}/${items.length} 问（Alt+↑ / Alt+↓）`
+      : "问题导航";
+  }
+  if (MSG_NAV.open) msgRenderQuestions(items);
+}
+
+/** 定时器节流：滚动时最多每 40ms 算一次（提问多的时候别在 scroll 里做几十次 rect）。
+ *  ⚠ 这里**不用 requestAnimationFrame**：无头 + 虚拟时间里 rAF 不推进（终端渲染踩过同一个坑）→
+ *    状态会一直卡在"已排程但没执行"。setTimeout 在真实浏览器 / 无头里都可靠。 */
+function msgNavSchedule() {
+  if (MSG_NAV.timer) return;
+  MSG_NAV.timer = setTimeout(() => {
+    MSG_NAV.timer = 0;
+    try { msgNavSync(); } catch { /* 导航不是功能前置 */ }
+  }, 40);
+}
+
+/** 平滑滚动（尊重「减少动态效果」/ 无头环境 → 直接落位）。 */
+function msgScrollToY(box, top) {
+  const y = Math.max(0, Math.min(Math.max(0, box.scrollHeight - box.clientHeight), Number(top) || 0));
+  try { box.scrollTo({ top: y, behavior: MSG_NAV.instant ? "auto" : "smooth" }); }
+  catch { box.scrollTop = y; }
+}
+
+function msgRenderQuestions(items) {
+  const list = $("msg-ask-list");
+  if (!list) return;
+  items = items || msgQuestionItems();
+  if (!items.length) {
+    list.innerHTML = `<div class="msg-q-empty">还没有提问 —— 发出一句后就能在这里跳回来。</div>`;
+    return;
+  }
+  const cur = msgCurrentQuestionIndex(items);
+  list.innerHTML = items.map((it, i) => `<button type="button"
+      class="msg-q${i === cur ? " on" : ""}" data-q-mid="${esc(it.id)}"
+      title="${esc(oneLine(it.full || it.text, 300))}">`
+    + `<i>${i + 1}</i><span>${esc(it.text || "（无文字）")}</span>`
+    + `<em>${esc(msgClock(it.ts))}</em></button>`).join("");
+  // 打开时把「当前那一问」滚进弹层自己的视口（别用 scrollIntoView：会连带滚动消息区）
+  const on = list.querySelector(".msg-q.on");
+  if (on) {
+    const top = on.offsetTop, h = on.offsetHeight;
+    if (top < list.scrollTop || top + h > list.scrollTop + list.clientHeight) {
+      list.scrollTop = Math.max(0, top - list.clientHeight / 2);
+    }
+  }
+}
+
+/** 把某条消息滚到消息区顶部（留 12px 余量），并闪一下。 */
+function msgJumpToEl(el, flash) {
+  const box = $("messages");
+  if (!box || !el) return false;
+  const y = el.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop - 12;
+  state.follow = false;
+  msgScrollToY(box, y);
+  if (flash !== false) {
+    el.classList.remove("flash");
+    void el.offsetWidth;                        // 强制重排，连续点同一问也能重新闪
+    el.classList.add("flash");
+    setTimeout(() => el.classList.remove("flash"), 1500);
+  }
+  msgNavSchedule();
+  return true;
+}
+
+function msgJumpById(id) {
+  const items = msgQuestionItems();
+  const hit = items.find((x) => String(x.id) === String(id));
+  if (!hit) { setBanner("这条提问已经不在当前消息里了（可能刚刷新过）"); return; }
+  msgJumpToEl(hit.el);
+}
+
+/** delta=-1 上一问 / +1 下一问；到头就停在第一条 / 最后一条。 */
+function msgStepQuestion(delta) {
+  const items = msgQuestionItems();
+  if (!items.length) { setBanner("当前会话还没有提问"); return; }
+  const cur = msgCurrentQuestionIndex(items);
+  let idx = cur < 0 ? (delta > 0 ? 0 : items.length - 1) : cur + delta;
+  idx = Math.max(0, Math.min(items.length - 1, idx));
+  msgJumpToEl(items[idx].el);
+  if (MSG_NAV.open) msgRenderQuestions(items);
+}
+
+/** 回到**当前阅读的这一轮**的提问（长回答读一半时用）。 */
+function msgJumpCurrentQuestion() {
+  const items = msgQuestionItems();
+  if (!items.length) { setBanner("当前会话还没有提问"); return; }
+  const cur = msgCurrentQuestionIndex(items);
+  msgJumpToEl(items[cur < 0 ? items.length - 1 : cur].el);
+}
+
+function msgScrollBottom() {
+  const box = $("messages");
+  if (!box) return;
+  state.follow = true;
+  msgScrollToY(box, box.scrollHeight);
+  msgNavSchedule();
+}
+
+function msgAskOpen(open) {
+  const pop = $("msg-ask-pop");
+  const btn = $("msg-ask");
+  MSG_NAV.open = !!open;
+  if (pop) pop.hidden = !open;
+  if (btn) btn.classList.toggle("on", !!open);
+  if (open) msgRenderQuestions();
+}
+
+function initMsgNav() {
+  const bottom = $("msg-bottom");
+  if (bottom) bottom.addEventListener("click", msgScrollBottom);
+  const ask = $("msg-ask");
+  if (ask) ask.addEventListener("click", () => msgAskOpen(!MSG_NAV.open));
+  const close = $("msg-q-close");
+  if (close) close.addEventListener("click", () => msgAskOpen(false));
+  const prev = $("msg-q-prev");
+  if (prev) prev.addEventListener("click", () => msgStepQuestion(-1));
+  const next = $("msg-q-next");
+  if (next) next.addEventListener("click", () => msgStepQuestion(1));
+  const cur = $("msg-q-cur");
+  if (cur) cur.addEventListener("click", () => { msgJumpCurrentQuestion(); msgAskOpen(false); });
+  const list = $("msg-ask-list");
+  if (list) list.addEventListener("click", (e) => {
+    const row = e.target.closest("[data-q-mid]");
+    if (!row) return;
+    msgJumpById(row.dataset.qMid);
+    msgAskOpen(false);
+  });
+  // 点弹层外面 / Esc 收起（点「问题」按钮自己不算外面）
+  document.addEventListener("click", (e) => {
+    if (!MSG_NAV.open) return;
+    const nav = $("msg-nav");
+    if (nav && nav.contains(e.target)) return;
+    msgAskOpen(false);
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && MSG_NAV.open) { msgAskOpen(false); return; }
+    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    const ae = document.activeElement || {};
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(String(ae.tagName || ""))) return;
+    e.preventDefault();
+    msgStepQuestion(e.key === "ArrowUp" ? -1 : 1);
+  });
+  msgNavSchedule();
+}
 
 /* ============================================================================
    面板内终端：真·ConPTY（后端 /pty/*），前端做一个「够用」的 ANSI 渲染器
@@ -11365,7 +12029,7 @@ async function codeOpenAt(root, path) {
   { const ml = $("code-menu-list"); if (ml) ml.hidden = true; }
   codeResetTo(root);
   syncDrawerOverlap();
-  await codeOpenFile(path);
+  if (path) await codeOpenFile(path);       // ★空 path = 只打开项目根目录（列文件树）
   renderSessionTrees();          // 把左侧树里「当前打开的那个文件」高亮上
 }
 
@@ -11984,6 +12648,1745 @@ async function updReportStatus() {
   } catch { /* ignore */ }
 }
 
+/* ================================================================================
+   ★本地协作工作台（本机多 agent；不登录、不经过云端）
+   ================================================================================
+   后端：backend/orchestrator.py + /orchestrate/*
+   入口：顶栏「协作」→ 全页工作台（像音乐主页那样替换消息区）
+   形态：左栏运行历史；右栏任务头 + 待批权限（逐条）+ 成员列（并排）+ 逐行差异/仲裁
+   轮询：只有任务还在跑时才 1.5s 拉一次，完成即停（别一直打接口）。
+   ⚠ 三条红线：① 不给「一键全放行」（权限逐条）；② 破坏性操作永远要确认；
+               ③ 只读/展示为主，撤销/恢复入口复用现有接口。
+   ================================================================================ */
+
+const COLLAB = {
+  open: false, cat: null, catErr: "", runs: [], runsErr: "", busy: false,
+  run: null, runId: "", runErr: "", poll: 0, tickBusy: false, wasActive: false,
+  arbEngine: "", pickId: "", diffOpen: false,
+  memSel: "", memAll: false, permOpen: false,        // ★运行详情：只看选中的成员 / 权限抽屉
+  projFilter: "",                                        // ★左栏「按项目筛选」：空 = 全部
+  runsPoll: 0, runsBusy: false, runsSeq: 0,
+  // ★工作流（0.2.11）：可复用配置 + 画布
+  view: "wf",                 // "wf" | "run"
+  workflows: [], wfErr: "", wfId: "", wfBusy: false, wfSeq: 0,
+  runWfFilter: "",            // 运行历史只看某个工作流
+  canvas: { zoom: 1, pan: { x: 20, y: 14 }, nodes: {}, sel: "", drag: null, panning: null,
+            saveTimer: 0 },
+};
+
+const COLLAB_ST = {
+  wait: "等待中", running: "运行中", done: "完成", failed: "失败",
+  timeout: "超时", cancelled: "已取消",
+  partial: "部分完成",
+};
+const COLLAB_DEC = {
+  once: "允许一次", always: "始终允许", reject: "拒绝",
+  allowed: "已允许", denied: "已拒绝", timeout: "已超时", pending: "待批准",
+};
+
+// ★节点级权限等级（后端 catalog 会回同一份；这里留兜底，后端没重启也能用）
+const COLLAB_PERM_FALLBACK = [
+  { id: "", label: "跟随面板", note: "用面板当前等级" },
+  { id: "ask", label: "全部询问", note: "每条命令都问" },
+  { id: "read", label: "只读自动", note: "读自动；写/执行要问" },
+  { id: "edit", label: "读写自动", note: "工作区内读写自动" },
+  { id: "exec", label: "执行自动", note: "工作区内读写执行自动" },
+  { id: "trust", label: "信任（非破坏性自动）", note: "不再逐条问；破坏性仍然必须确认" },
+];
+
+function collabPermLevels() {
+  const l = (COLLAB.cat && COLLAB.cat.permLevels) || [];
+  return (l.length ? l : COLLAB_PERM_FALLBACK);
+}
+
+function collabStText(s) { return COLLAB_ST[String(s || "")] || String(s || "—"); }
+function collabAgents() { return (COLLAB.cat && COLLAB.cat.agents) || []; }
+function collabAvailAgents() { return collabAgents().filter((a) => a && a.available); }
+function collabDefaultEngine() {
+  const a = collabAvailAgents()[0];
+  return a ? String(a.id) : "";
+}
+function collabRoleLabel(role) {
+  const r = COLLAB.cat && COLLAB.cat.roles && COLLAB.cat.roles[role];
+  return (r && r.label) || "";
+}
+function collabRunActive(run) {
+  if (!run) return false;
+  if (String(run.status || "") === "running") return true;
+  if ((run.members || []).some((m) => m.status === "wait" || m.status === "running")) return true;
+  return !!(run.arbitration && run.arbitration.status === "running");
+}
+function collabFindMemberName(id, fallback) {
+  const run = COLLAB.run;
+  const m = run && (run.members || []).find((x) => String(x.id) === String(id));
+  return (m && m.name) || fallback || String(id || "");
+}
+
+function collabIsOpen() {
+  const bs = $("body-stage");
+  return !!bs && bs.classList.contains("collab-open");
+}
+
+/** 关掉权限抽屉并清空（切回画布 / 离开工作台时用；否则宽抽屉会盖在画布上）。 */
+function collabPermReset() {
+  COLLAB.permOpen = false;
+  const box = $("collab-pending");
+  if (box) {
+    box.classList.remove("open");
+    box.hidden = true;
+    box.innerHTML = "";
+  }
+  const bar = $("collab-pend-bar");
+  if (bar) { bar.hidden = true; bar.innerHTML = ""; }
+}
+
+/* ---------------- 打开 / 关闭 ---------------- */
+
+async function collabOpen(open) {
+  const bs = $("body-stage");
+  if (!bs) return;
+  if (open) {
+    try { closeMusicHome(); } catch { /* ignore */ }
+    try { if (typeof CODE !== "undefined" && CODE.open) codeClose(); } catch { /* ignore */ }
+  }
+  COLLAB.open = !!open;
+  bs.classList.toggle("collab-open", !!open);
+  const btn = $("btn-collab");
+  if (btn) btn.classList.toggle("on", !!open);
+  if (open) {
+    if (!COLLAB.cat && !COLLAB.catErr && !COLLAB.busy) collabLoadCatalog();
+    if (!(COLLAB.workflows || []).length) await collabLoadWorkflows(true);
+    else { collabRenderWfList(); collabRenderWf(); collabRenderMain(); }
+    collabLoadRuns(!(COLLAB.workflows || []).length);
+    collabStartPoll();
+    collabStartRunsPoll();
+  } else {
+    collabStopPoll();
+    collabStopRunsPoll();
+    collabPermReset();
+  }
+}
+
+function collabClose() { collabOpen(false); }
+
+/** 左栏历史每 4s 轻刷一次：**同时跑多个任务**时，不选中的那些也能看到状态变化。 */
+function collabStartRunsPoll() {
+  collabStopRunsPoll();
+  if (!COLLAB.open) return;
+  COLLAB.runsPoll = setInterval(() => {
+    if (COLLAB.open) collabLoadRuns(false);
+  }, 4000);
+}
+function collabStopRunsPoll() {
+  if (COLLAB.runsPoll) { clearInterval(COLLAB.runsPoll); COLLAB.runsPoll = 0; }
+}
+
+function collabStartPoll() {
+  collabStopPoll();
+  if (!COLLAB.open || !COLLAB.runId) return;
+  COLLAB.wasActive = collabRunActive(COLLAB.run);
+  COLLAB.poll = setInterval(collabTick, 1500);
+}
+
+function collabStopPoll() {
+  if (COLLAB.poll) { clearInterval(COLLAB.poll); COLLAB.poll = 0; }
+}
+
+async function collabTick() {
+  if (!COLLAB.open || !COLLAB.runId) return;
+  await collabFetchRun();
+  const active = collabRunActive(COLLAB.run);
+  if (!active) {
+    collabStopPoll();
+    if (COLLAB.wasActive) { COLLAB.wasActive = false; collabLoadRuns(); }
+  } else {
+    COLLAB.wasActive = true;
+  }
+}
+
+/* ---------------- 数据 ---------------- */
+
+async function collabLoadCatalog() {
+  COLLAB.busy = true;
+  try {
+    const r = await api("/orchestrate/catalog");
+    COLLAB.cat = {
+      agents: (r && r.agents) || [],
+      roles: (r && r.roles) || {},
+      presets: (r && r.presets) || [],
+      askTimeout: Number((r && r.askTimeout) || 180) || 180,
+    };
+    COLLAB.catErr = "";
+  } catch (e) {
+    COLLAB.cat = null;
+    const msg = String((e && e.message) || e);
+    COLLAB.catErr = /^404/.test(msg)
+      ? "后端没有 /orchestrate 接口（本地协作需要 0.2.1+ 的后端；请重启面板服务）"
+      : ("拿不到 agent 清单：" + msg);
+  } finally {
+    COLLAB.busy = false;
+  }
+  collabRenderRun();
+}
+
+async function collabLoadRuns(autoOpen) {
+  if (COLLAB.runsBusy) return;
+  const seq = ++COLLAB.runsSeq;
+  COLLAB.runsBusy = true;
+  let list = null;
+  let err = "";
+  try {
+    const r = await api("/orchestrate/runs");
+    list = (r && r.runs) || [];
+  } catch (e) {
+    list = [];
+    const msg = String((e && e.message) || e);
+    err = /^404/.test(msg)
+      ? "后端没有 /orchestrate 接口（需要重启面板服务加载新代码）"
+      : ("拿不到任务列表：" + msg);
+  } finally {
+    COLLAB.runsBusy = false;
+  }
+  // ★期间删过任务 / 有更新的请求 → 这次结果作废（否则会把刚删掉的那条又画回来）
+  if (seq !== COLLAB.runsSeq) return;
+  COLLAB.runs = list;
+  COLLAB.runsErr = err;
+  collabRenderRuns();
+  collabRenderWfList();
+  collabRefreshCanvasStatus();
+  if (!COLLAB.runId && autoOpen !== false && COLLAB.runs.length
+      && !(COLLAB.workflows || []).length) {
+    await collabOpenRun(COLLAB.runs[0].id);
+    return;
+  }
+  if (!COLLAB.runId) { COLLAB.run = null; collabRenderMain(); }
+}
+
+/* ---------------- ★工作流（可复用配置 + 画布） ---------------- */
+
+const CV_NODE = { w: 196, h: 92, taskW: 200, gapY: 108 };
+
+function collabWfById(id) {
+  return (COLLAB.workflows || []).find((w) => String(w.id) === String(id)) || null;
+}
+function collabWf() { return collabWfById(COLLAB.wfId); }
+
+/** 这个工作流**最近一次**运行（从运行历史里找；拿它显示节点状态 / 上次结果）。 */
+function collabWfLastRun(wf) {
+  if (!wf) return null;
+  return (COLLAB.runs || []).find((r) => String(r.workflowId || "") === String(wf.id)) || null;
+}
+
+/** 当前打开的那条 run 若属于这个工作流 → 用它做**实时**节点状态。 */
+function collabWfRun(wf) {
+  if (!wf) return null;
+  if (COLLAB.run && String(COLLAB.run.workflowId || "") === String(wf.id)) return COLLAB.run;
+  return null;
+}
+
+/** 画布布局：缺失的节点自动给一个位置；清理已经不存在的成员。 */
+function collabWfLayout(wf) {
+  const L = (wf && wf.layout) || {};
+  const nodes = Object.assign({}, L.nodes || {});
+  const ms = (wf && wf.members) || [];
+  const ids = new Set(["task"]);
+  ms.forEach((m) => ids.add(String(m.id)));
+  Object.keys(nodes).forEach((k) => { if (!ids.has(k)) delete nodes[k]; });
+  if (!nodes.task) {
+    const n = Math.max(1, ms.length);
+    nodes.task = { x: 40, y: Math.round(28 + ((n - 1) * CV_NODE.gapY) / 2 - 4) };
+  }
+  let y = 28;
+  ms.forEach((m) => {
+    const id = String(m.id);
+    if (!nodes[id]) nodes[id] = { x: m.role === "reviewer" ? 620 : 360, y: y };
+    y += CV_NODE.gapY;
+  });
+  let zoom = Number(L.zoom) || 1;
+  zoom = Math.max(0.6, Math.min(1.6, zoom));
+  return { zoom: zoom, nodes: nodes };
+}
+
+async function collabLoadWorkflows(autoSelect) {
+  const seq = ++COLLAB.wfSeq;
+  try {
+    const r = await api("/orchestrate/workflows");
+    if (seq !== COLLAB.wfSeq) return (COLLAB.workflows || []).length > 0;
+    COLLAB.workflows = (r && r.workflows) || [];
+    COLLAB.wfErr = "";
+  } catch (e) {
+    if (seq !== COLLAB.wfSeq) return false;
+    COLLAB.workflows = [];
+    const msg = String((e && e.message) || e);
+    COLLAB.wfErr = /^404/.test(msg)
+      ? "当前版本没有工作流接口（重启面板服务）" : ("拿不到工作流：" + msg);
+  }
+  if (COLLAB.wfId && !collabWfById(COLLAB.wfId)) { COLLAB.wfId = ""; COLLAB.runWfFilter = ""; }
+  if (autoSelect && !COLLAB.wfId && (COLLAB.workflows || []).length) {
+    const first = COLLAB.workflows[0];
+    COLLAB.wfId = String(first.id);
+    COLLAB.runWfFilter = String(first.id);
+    COLLAB.view = "wf";
+    const lay = collabWfLayout(first);
+    COLLAB.canvas.zoom = lay.zoom;
+    COLLAB.canvas.pan = { x: 20, y: 14 };
+  }
+  collabRenderWfList();
+  collabRenderWf();
+  collabRenderMain();
+  collabRenderRuns();
+  if (autoSelect) setTimeout(collabFitCanvas, 120);
+  return (COLLAB.workflows || []).length > 0;
+}
+
+function collabSelectWf(id, opts) {
+  const wf = collabWfById(id);
+  if (!wf) return;
+  collabPermReset();
+  COLLAB.wfId = String(wf.id);
+  COLLAB.runWfFilter = String(wf.id);
+  COLLAB.view = "wf";
+  COLLAB.canvas.sel = "";
+  COLLAB.canvas.pan = { x: 20, y: 14 };
+  COLLAB.canvas.zoom = collabWfLayout(wf).zoom;
+  const qi = $("collab-quick-task");
+  if (qi) qi.value = wf.taskTemplate || "";
+  collabRenderWfList();
+  collabRenderRuns();
+  collabRenderWf();
+  collabRenderMain();
+  setTimeout(collabFitCanvas, 100);
+}
+
+function collabRenderWfList() {
+  const box = $("collab-wf-list");
+  const cnt = $("collab-wf-count");
+  if (!box) return;
+  const list = COLLAB.workflows || [];
+  if (cnt) cnt.textContent = list.length ? (list.length + " 个") : "";
+  if (COLLAB.wfErr) {
+    box.innerHTML = `<div class="collab-empty"><span>${esc(COLLAB.wfErr)}</span></div>`;
+    return;
+  }
+  if (!list.length) {
+    box.innerHTML = `<div class="collab-empty"><span>还没有工作流 —— 点左栏「工作流 ＋」建一个（成员 / 目录 / 默认任务都可复用）。</span></div>`;
+    return;
+  }
+  const groups = [];
+  const by = {};
+  list.forEach((w) => {
+    const dir = String(w.cwd || "").trim();
+    const key = dir ? dir.replace(/\\/g, "/").toLowerCase() : "__none__";
+    if (!by[key]) {
+      by[key] = { key: key, name: dir ? (projectNameOf(dir) || dir) : "未指定项目",
+                  dir: dir, items: [] };
+      groups.push(by[key]);
+    }
+    by[key].items.push(w);
+  });
+  box.innerHTML = groups.map((g) => `<div class="collab-wf-group" title="${esc(g.dir)}">${esc(g.name)}</div>`
+    + g.items.map((w) => {
+      const n = (w.members || []).length;
+      const last = collabWfLastRun(w);
+      const st = last ? (COLLAB_ST[String(last.status || "")] || String(last.status || "")) : "未跑过";
+      return `<div class="collab-wf-row${String(w.id) === String(COLLAB.wfId) ? " on" : ""}"`
+        + ` data-wf="${esc(w.id)}" title="${esc((w.name || "") + (g.dir ? "\n" + g.dir : ""))}">`
+        + `<span class="collab-dot ${last ? esc(String(last.status || "")) : ""}"></span>`
+        + `<span class="collab-wf-t"><b>${esc(w.name || "未命名工作流")}</b>`
+        + `<i>${esc(n + " 成员 · 跑过 " + (w.runCount || 0) + " 次 · " + st)}</i></span>`
+        + `<button type="button" class="wrun" data-wf-run="${esc(w.id)}" title="用默认任务一键跑">▶</button>`
+        + `</div>`;
+    }).join("")).join("");
+}
+
+function collabRenderWf() {
+  const box = $("collab-wf");
+  if (!box) return;
+  const wf = collabWf();
+  if (!wf || COLLAB.view !== "wf") { box.hidden = true; return; }
+  box.hidden = false;
+  const name = $("collab-wf-name");
+  if (name) name.textContent = wf.name || "未命名工作流";
+  const cnt = (wf.members || []).length;
+  const meta = $("collab-wf-meta");
+  if (meta) {
+    const last = collabWfLastRun(wf);
+    const bits = [cnt + " 成员", "跑过 " + (wf.runCount || 0) + " 次"];
+    if (wf.cwd) bits.push(wf.cwd);
+    if (last) bits.push("上次 " + (COLLAB_ST[String(last.status || "")] || last.status));
+    meta.textContent = bits.join(" · ");
+    meta.title = wf.cwd || "";
+  }
+  const input = $("collab-quick-task");
+  if (input && !input.value) input.value = wf.taskTemplate || "";
+  const note = $("collab-quick-note");
+  if (note) {
+    note.textContent = COLLAB.catErr ? COLLAB.catErr
+      : (!collabAvailAgents().length ? "没有可用的 ACP agent（先去设置里加一个）" : "");
+  }
+  collabRenderCanvas();
+  collabRenderInspector();
+}
+
+/** 主区三选一：工作流 / 运行 / 空态。 */
+function collabRenderMain() {
+  const empty = $("collab-empty");
+  const runBox = $("collab-run");
+  const wfBox = $("collab-wf");
+  if (!empty || !runBox || !wfBox) return;
+  if (COLLAB.view === "run" && COLLAB.run) {
+    empty.hidden = true; wfBox.hidden = true; runBox.hidden = false;
+    return;
+  }
+  if (COLLAB.view === "wf" && collabWf()) {
+    empty.hidden = true; runBox.hidden = true; wfBox.hidden = false;
+    return;
+  }
+  empty.hidden = false; wfBox.hidden = true; runBox.hidden = true;
+}
+
+async function collabSaveWfNow() {
+  const wf = collabWf();
+  if (!wf) return;
+  const payload = {
+    id: wf.id,
+    name: wf.name || "未命名工作流",
+    cwd: wf.cwd || "",
+    taskTemplate: wf.taskTemplate || "",
+    members: (wf.members || []).map((m, i) => ({
+      id: m.id || ("m" + (i + 1)), role: m.role || "",
+      name: m.name || "", engine: m.engine || "",
+    })),
+    layout: { zoom: COLLAB.canvas.zoom, nodes: COLLAB.canvas.nodes },
+  };
+  try {
+    const r = await api("/orchestrate/workflows/save",
+      { method: "POST", body: JSON.stringify(payload) });
+    const saved = (r && r.workflow) || null;
+    if (!saved || !saved.id) return;
+    const i = (COLLAB.workflows || []).findIndex((w) => String(w.id) === String(wf.id));
+    if (i >= 0) COLLAB.workflows[i] = saved; else COLLAB.workflows.unshift(saved);
+    COLLAB.wfId = String(saved.id);
+    COLLAB.runWfFilter = String(saved.id);
+    collabRenderWfList();
+  } catch (e) {
+    setBanner("保存工作流失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+function collabSaveWfSoon() {
+  const c = COLLAB.canvas;
+  if (c.saveTimer) clearTimeout(c.saveTimer);
+  c.saveTimer = setTimeout(() => { c.saveTimer = 0; collabSaveWfNow(); }, 600);
+}
+
+async function collabNewWorkflow() {
+  const agents = collabAvailAgents();
+  if (!agents.length) { setBanner("没有可用的 ACP agent —— 先去设置里加一个"); return; }
+  const eng = String(agents[0].id);
+  const wf = {
+    name: "新工作流", cwd: (typeof currentDir === "function" ? currentDir() : "") || "",
+    taskTemplate: "",
+    members: [
+      { id: "m1", role: "implementer", name: "impl", engine: eng },
+      { id: "m2", role: "reviewer", name: "rev",
+        engine: String((agents[1] && agents[1].id) || eng) },
+    ],
+    layout: { zoom: 1, nodes: {} },
+  };
+  try {
+    const r = await api("/orchestrate/workflows/save",
+      { method: "POST", body: JSON.stringify(wf) });
+    const saved = (r && r.workflow) || wf;
+    COLLAB.workflows.unshift(saved);
+    collabSelectWf(saved.id);
+    setBanner("已新建工作流 —— 在画布上改成员，写好任务点「▶ 运行」", { ms: 6000 });
+  } catch (e) {
+    setBanner("新建工作流失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function collabDuplicateWf() {
+  const wf = collabWf();
+  if (!wf) return;
+  try {
+    const r = await api("/orchestrate/workflows/duplicate",
+      { method: "POST", body: JSON.stringify({ id: wf.id }) });
+    const saved = (r && r.workflow) || null;
+    if (saved && saved.id) {
+      await collabLoadWorkflows(false);
+      collabSelectWf(saved.id);
+      setBanner("已复制工作流：" + (saved.name || ""));
+    }
+  } catch (e) {
+    setBanner("复制失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function collabDeleteWf() {
+  const wf = collabWf();
+  if (!wf) return;
+  if (!confirm(`删除工作流「${wf.name}」？\n历史运行记录会保留（只是不再归属它）。`)) return;
+  try {
+    await api("/orchestrate/workflows/delete",
+      { method: "POST", body: JSON.stringify({ id: wf.id }) });
+    COLLAB.workflows = (COLLAB.workflows || []).filter((w) => String(w.id) !== String(wf.id));
+    COLLAB.wfId = "";
+    COLLAB.runWfFilter = "";
+    COLLAB.view = "wf";
+    collabRenderWfList();
+    collabRenderWf();
+    collabRenderMain();
+    collabRenderRuns();
+    setBanner("已删除工作流（运行记录保留）");
+  } catch (e) {
+    setBanner("删除失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function collabPickWfCwd() {
+  const wf = collabWf();
+  if (!wf) return;
+  try {
+    const r = await api("/pick/folder", { method: "POST" });
+    if (r && r.ok && r.path) {
+      wf.cwd = r.path;
+      collabSaveWfSoon();
+      collabRenderWf();
+      collabRenderWfList();
+      setBanner("工作流目录：" + r.path);
+    }
+  } catch (e) {
+    setBanner("选目录失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+function collabAddMember() {
+  const wf = collabWf();
+  if (!wf) return;
+  if ((wf.members || []).length >= 8) { setBanner("最多 8 个成员"); return; }
+  const agents = collabAgents();
+  const eng = String((agents.find((a) => a && a.available) || {}).id || "");
+  if (!eng) { setBanner("没有可用的 ACP agent"); return; }
+  let n = 1;
+  (wf.members || []).forEach((m) => {
+    const num = Number(String(m.id || "").replace(/^m/, ""));
+    if (num >= n) n = num + 1;
+  });
+  const id = "m" + n;
+  wf.members = wf.members || [];
+  wf.members.push({ id: id, role: "implementer", name: "m" + n, engine: eng });
+  const lay = collabWfLayout(wf);
+  wf.layout = { zoom: COLLAB.canvas.zoom, nodes: lay.nodes };
+  COLLAB.canvas.nodes = lay.nodes;
+  COLLAB.canvas.sel = id;
+  collabSaveWfSoon();
+  collabRenderCanvas();
+  collabRenderInspector();
+  collabRenderWfList();
+}
+
+function collabDeleteMember(id) {
+  const wf = collabWf();
+  if (!wf) return;
+  if ((wf.members || []).length <= 1) { setBanner("至少要留一个成员"); return; }
+  wf.members = (wf.members || []).filter((m) => String(m.id) !== String(id));
+  if (wf.layout && wf.layout.nodes) delete wf.layout.nodes[id];
+  if (COLLAB.canvas.sel === String(id)) COLLAB.canvas.sel = "";
+  collabSaveWfSoon();
+  collabRenderCanvas();
+  collabRenderInspector();
+  collabRenderWfList();
+}
+
+/* ---- 画布渲染 ---- */
+
+function collabNodePos(lay, id, dx, dy) {
+  const p = (lay.nodes || {})[id] || { x: dx, y: dy };
+  return p;
+}
+
+function collabRefreshCanvasStatus() {
+  if (COLLAB.view !== "wf") return;
+  const wf = collabWf();
+  if (!wf) return;
+  const run = collabWfRun(wf) || collabWfLastRun(wf);
+  const nodes = document.querySelectorAll("#collab-cv-nodes [data-node]");
+  nodes.forEach((el) => {
+    const id = String(el.dataset.node || "");
+    if (id === "task") return;
+    const i = (wf.members || []).findIndex((m) => String(m.id) === id);
+    if (i < 0) return;
+    const rm = (run && (run.members || [])[i]) || null;
+    const st = rm ? String(rm.status || "") : "";
+    let stat = el.querySelector(".cv-n-stat");
+    if (!st) { if (stat) stat.remove(); return; }
+    if (!stat) {
+      stat = document.createElement("span");
+      el.appendChild(stat);
+    }
+    stat.className = "cv-n-stat " + st;
+    stat.textContent = COLLAB_ST[st] || st;
+  });
+}
+
+function collabRenderCanvas() {
+  const wf = collabWf();
+  const box = $("collab-cv-nodes");
+  if (!wf || !box) return;
+  const lay = collabWfLayout(wf);
+  COLLAB.canvas.nodes = lay.nodes;
+  const inner = $("collab-canvas-inner");
+  if (inner) {
+    inner.style.transform = `translate(${COLLAB.canvas.pan.x}px, ${COLLAB.canvas.pan.y}px) scale(${COLLAB.canvas.zoom})`;
+  }
+  const run = collabWfRun(wf) || collabWfLastRun(wf);
+  const task = collabNodePos(lay, "task", 40, 130);
+  const nodes = [`<div class="cv-node cv-task${COLLAB.canvas.sel === "task" ? " sel" : ""}"`
+    + ` data-node="task" style="left:${task.x}px;top:${task.y}px">`
+    + `<span class="cv-tag">任务</span><b>${esc(wf.name || "工作流")}</b>`
+    + `<span class="cv-n-eng" title="${esc(wf.taskTemplate || "")}">${esc(wf.taskTemplate || "（运行时临时输入）")}</span>`
+    + `</div>`];
+  (wf.members || []).forEach((m, i) => {
+    const p = collabNodePos(lay, String(m.id), m.role === "reviewer" ? 620 : 360, 28 + i * CV_NODE.gapY);
+    const rm = (run && (run.members || [])[i]) || null;
+    const st = rm ? String(rm.status || "") : "";
+    const zh = st ? (COLLAB_ST[st] || st) : "";
+    nodes.push(`<div class="cv-node cv-member${COLLAB.canvas.sel === String(m.id) ? " sel" : ""}"`
+      + ` data-node="${esc(m.id)}" style="left:${p.x}px;top:${p.y}px">`
+      + `<button type="button" class="cv-x" data-cv-del="${esc(m.id)}" title="删掉这个成员">×</button>`
+      + `<span class="cv-role">${esc(collabRoleLabel(m.role) || "成员")}</span>`
+      + `<b>${esc(m.name || m.id)}</b>`
+      + `<span class="cv-n-eng">${esc(m.engine || "（未选大脑）")}</span>`
+      + (zh ? `<span class="cv-n-stat ${esc(st)}">${esc(zh)}</span>` : "")
+      + `</div>`);
+  });
+  box.innerHTML = nodes.join("");
+  collabPaintEdges();
+}
+
+function collabPaintEdges() {
+  const svg = $("collab-cv-edges");
+  const wf = collabWf();
+  if (!svg || !wf) return;
+  const nodes = COLLAB.canvas.nodes || {};
+  const ms = (wf.members || []).map((m) => ({ id: String(m.id), role: m.role }));
+  const task = nodes.task || { x: 40, y: 130 };
+  const tR = task.x + CV_NODE.taskW, tC = task.y + CV_NODE.h / 2;
+  const parts = [];
+  ms.forEach((m) => {
+    const p = nodes[m.id];
+    if (!p) return;
+    const x2 = p.x, y2 = p.y + CV_NODE.h / 2;
+    parts.push(`<path d="M${tR} ${tC} C${tR + 80} ${tC}, ${x2 - 80} ${y2}, ${x2} ${y2}"/>`);
+  });
+  const rev = ms.find((m) => m.role === "reviewer");
+  if (rev && nodes[rev.id]) {
+    const rp = nodes[rev.id];
+    const ax = rp.x, ay = rp.y + CV_NODE.h / 2;
+    ms.filter((m) => m.role !== "reviewer").forEach((m) => {
+      const p = nodes[m.id];
+      if (!p) return;
+      const x1 = p.x + CV_NODE.w, y1 = p.y + CV_NODE.h / 2;
+      parts.push(`<path class="dash" d="M${x1} ${y1} C${x1 + 60} ${y1}, ${ax - 60} ${ay}, ${ax} ${ay}"/>`);
+    });
+  }
+  svg.innerHTML = parts.join("");
+}
+
+function collabFitCanvas() {
+  const cv = $("collab-canvas");
+  const inner = $("collab-canvas-inner");
+  if (!cv || !inner) return;
+  const vw = cv.clientWidth || 0, vh = cv.clientHeight || 0;
+  if (vw < 80 || vh < 80) {
+    // 刚切到工作流视图时画布可能还没布局（clientWidth=0）→ 稍后再试，别用 0 去算
+    COLLAB.canvas.fitTries = (COLLAB.canvas.fitTries || 0) + 1;
+    if (COLLAB.canvas.fitTries < 12) setTimeout(collabFitCanvas, 150);
+    return;
+  }
+  COLLAB.canvas.fitTries = 0;
+  const nodes = COLLAB.canvas.nodes || {};
+  const keys = Object.keys(nodes);
+  if (!keys.length) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  keys.forEach((k) => {
+    const p = nodes[k];
+    const w = k === "task" ? CV_NODE.taskW : CV_NODE.w;
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x + w); maxY = Math.max(maxY, p.y + CV_NODE.h);
+  });
+  const pad = 36;
+  const z = Math.max(0.6, Math.min(1.4, Math.min(
+    (vw - pad * 2) / Math.max(1, maxX - minX),
+    (vh - pad * 2) / Math.max(1, maxY - minY))));
+  COLLAB.canvas.zoom = z;
+  COLLAB.canvas.pan = {
+    x: (vw - (maxX - minX) * z) / 2 - minX * z,
+    y: (vh - (maxY - minY) * z) / 2 - minY * z,
+  };
+  inner.style.transform = `translate(${COLLAB.canvas.pan.x}px, ${COLLAB.canvas.pan.y}px) scale(${z})`;
+}
+
+function collabCanvasZoomAt(factor, clientX, clientY) {
+  const cv = $("collab-canvas");
+  if (!cv) return;
+  const rect = cv.getBoundingClientRect();
+  const px = clientX - rect.left, py = clientY - rect.top;
+  const z0 = COLLAB.canvas.zoom;
+  const z1 = Math.max(0.6, Math.min(1.6, z0 * factor));
+  if (Math.abs(z1 - z0) < 1e-4) return;
+  const pan = COLLAB.canvas.pan;
+  pan.x = px - (px - pan.x) * (z1 / z0);
+  pan.y = py - (py - pan.y) * (z1 / z0);
+  COLLAB.canvas.zoom = z1;
+  const inner = $("collab-canvas-inner");
+  if (inner) inner.style.transform = `translate(${pan.x}px, ${pan.y}px) scale(${z1})`;
+  collabSaveWfSoon();
+}
+
+/* ---- 检查器（改角色 / 名字 / 大脑；任务节点改默认任务） ---- */
+
+function collabRenderInspector() {
+  const box = $("collab-inspector");
+  if (!box) return;
+  const wf = collabWf();
+  const sel = COLLAB.canvas.sel;
+  if (!wf || !sel) { box.hidden = true; box.innerHTML = ""; return; }
+  const agents = collabAgents();
+  const roles = (COLLAB.cat && COLLAB.cat.roles) || {};
+  if (sel === "task") {
+    box.hidden = false;
+    box.innerHTML = `<b>工作流</b>`
+      + `<label><span>名字</span><input data-insp-wfname maxlength="40" value="${esc(wf.name || "")}" autocomplete="off"></label>`
+      + `<label><span>目录</span><input data-insp-cwd value="${esc(wf.cwd || "")}" autocomplete="off" spellcheck="false"></label>`
+      + `<div class="insp-cap">默认任务</div>`
+      + `<textarea data-insp-task rows="3" placeholder="默认任务（运行时可直接改）">${esc(wf.taskTemplate || "")}</textarea>`
+      + `<div class="insp-msg">改完自动保存；点画布空白处收起。</div>`;
+    return;
+  }
+  const m = (wf.members || []).find((x) => String(x.id) === String(sel));
+  if (!m) { box.hidden = true; box.innerHTML = ""; return; }
+  const roleOpts = `<option value="">（无角色）</option>`
+    + Object.keys(roles).map((k) => `<option value="${esc(k)}"${String(k) === String(m.role) ? " selected" : ""}>`
+      + `${esc(roles[k].label || k)}</option>`).join("");
+  const engOpts = agents.map((a) => `<option value="${esc(a.id)}"${String(a.id) === String(m.engine) ? " selected" : ""}`
+    + `${a.available ? "" : " disabled"}>${esc(a.label || a.id)}${a.available ? "" : "（缺依赖）"}</option>`).join("");
+  const levels = collabPermLevels();
+  const permOpts = levels.map((x) => `<option value="${esc(x.id || "")}"${String(x.id || "") === String(m.permLevel || "") ? " selected" : ""}`
+    + ` title="${esc(x.note || "")}">${esc(x.label || x.id || "跟随面板")}</option>`).join("");
+  box.hidden = false;
+  box.innerHTML = `<b>成员</b>`
+    + `<label><span>角色</span><select data-insp-role>${roleOpts}</select></label>`
+    + `<label><span>名字</span><input data-insp-name maxlength="24" value="${esc(m.name || "")}" autocomplete="off"></label>`
+    + `<label><span>大脑</span><select data-insp-engine>${engOpts}</select></label>`
+    + `<label><span>权限</span><select data-insp-perm title="只对这一个成员生效">${permOpts}</select></label>`
+    + `<div class="insp-msg">「信任」= 非破坏性不再逐条问；破坏性仍要确认。改完自动保存。</div>`;
+}
+
+function collabInspectorChanged(e) {
+  const wf = collabWf();
+  if (!wf) return;
+  const t = e.target;
+  const sel = COLLAB.canvas.sel;
+  const m = (wf.members || []).find((x) => String(x.id) === String(sel));
+  let hit = false;
+  if (m && t.matches("[data-insp-role]")) { m.role = t.value; hit = true; }
+  else if (m && t.matches("[data-insp-name]")) { m.name = String(t.value || "").trim() || m.id; hit = true; }
+  else if (m && t.matches("[data-insp-engine]")) { m.engine = t.value; hit = true; }
+  else if (m && t.matches("[data-insp-perm]")) { m.permLevel = String(t.value || ""); hit = true; }
+  else if (sel === "task" && t.matches("[data-insp-wfname]")) {
+    wf.name = String(t.value || "").trim() || wf.name; hit = true;
+  } else if (sel === "task" && t.matches("[data-insp-cwd]")) {
+    wf.cwd = String(t.value || "").trim(); hit = true;
+  } else if (sel === "task" && t.matches("[data-insp-task]")) {
+    wf.taskTemplate = String(t.value || ""); hit = true;
+  }
+  if (!hit) return;
+  collabSaveWfSoon();
+  collabRenderCanvas();
+  collabRenderWfList();
+  if (sel === "task") collabRenderWf();
+  else collabRenderInspector();
+}
+
+/* ---- 启动 ---- */
+
+async function collabQuickRun(wfId) {
+  const wf = collabWfById(wfId || COLLAB.wfId);
+  if (!wf) { setBanner("先选一个工作流"); return; }
+  if (!collabAvailAgents().length) { setBanner("没有可用的 ACP agent —— 先去设置里加一个"); return; }
+  const input = $("collab-quick-task");
+  const typed = String((input && input.value) || "").trim();
+  const task = typed || String(wf.taskTemplate || "").trim();
+  if (!task) {
+    setBanner("先写一句任务（或给这个工作流设一个默认任务）");
+    if (input) input.focus();
+    return;
+  }
+  try {
+    const r = await api("/orchestrate/start", {
+      method: "POST",
+      body: JSON.stringify({ task: task, workflowId: wf.id }),
+    });
+    const run = (r && r.run) || null;
+    if (input && typed) input.value = "";
+    await collabLoadRuns(false);
+    await collabLoadWorkflows(false);
+    if (run && run.id) await collabOpenRun(run.id);
+    setBanner(`已用工作流「${wf.name}」开跑`);
+  } catch (e) {
+    setBanner("启动失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+/* ---- 画布交互：拖动节点 / 平移 / 缩放 / 双击 / 删除 ---- */
+
+function collabCanvasPointerDown(e) {
+  const cv = $("collab-canvas");
+  if (!cv || e.button !== 0) return;
+  const nodeEl = e.target.closest("[data-node]");
+  if (nodeEl && !e.target.closest("button,input,textarea,select")) {
+    e.preventDefault();
+    const id = nodeEl.dataset.node;
+    const p = (COLLAB.canvas.nodes || {})[id];
+    if (!p) return;
+    const start = { x: e.clientX, y: e.clientY, ox: p.x, oy: p.y };
+    nodeEl.classList.add("dragging");
+    let moved = false;
+    const move = (ev) => {
+      const z = COLLAB.canvas.zoom || 1;
+      const dx = (ev.clientX - start.x) / z, dy = (ev.clientY - start.y) / z;
+      if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+      p.x = start.ox + dx;
+      p.y = start.oy + dy;
+      nodeEl.style.left = p.x + "px";
+      nodeEl.style.top = p.y + "px";
+      collabPaintEdges();
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      nodeEl.classList.remove("dragging");
+      if (moved) {
+        COLLAB.canvas.justDragged = true;
+        setTimeout(() => { COLLAB.canvas.justDragged = false; }, 0);
+        collabSaveWfSoon();
+      } else {
+        COLLAB.canvas.sel = id;
+        collabRenderCanvas();
+        collabRenderInspector();
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    return;
+  }
+  // 空白处 = 平移画布；松手收起检查器
+  e.preventDefault();
+  const start = { x: e.clientX, y: e.clientY,
+                  px: COLLAB.canvas.pan.x, py: COLLAB.canvas.pan.y };
+  cv.classList.add("panning");
+  const move = (ev) => {
+    COLLAB.canvas.pan.x = start.px + (ev.clientX - start.x);
+    COLLAB.canvas.pan.y = start.py + (ev.clientY - start.y);
+    const inner = $("collab-canvas-inner");
+    if (inner) {
+      inner.style.transform = `translate(${COLLAB.canvas.pan.x}px, ${COLLAB.canvas.pan.y}px)`
+        + ` scale(${COLLAB.canvas.zoom})`;
+    }
+  };
+  const up = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    cv.classList.remove("panning");
+    COLLAB.canvas.sel = "";
+    collabRenderInspector();
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+
+function collabCanvasWheel(e) {
+  if (e.ctrlKey) return;                 // Ctrl+滚轮 = 界面缩放（全局），别抢
+  e.preventDefault();
+  collabCanvasZoomAt(e.deltaY < 0 ? 1.1 : 0.9, e.clientX, e.clientY);
+}
+
+function collabCanvasDblClick(e) {
+  const nodeEl = e.target.closest("[data-node]");
+  if (!nodeEl) { collabAddMember(); return; }
+  COLLAB.canvas.sel = nodeEl.dataset.node;
+  collabRenderCanvas();
+  collabRenderInspector();
+}
+
+function collabCanvasClick(e) {
+  const del = e.target.closest("[data-cv-del]");
+  if (del) {
+    e.stopPropagation();
+    collabDeleteMember(del.dataset.cvDel);
+    return;
+  }
+  if (COLLAB.canvas.justDragged) return;
+  const nodeEl = e.target.closest("[data-node]");
+  if (!nodeEl) return;
+  COLLAB.canvas.sel = nodeEl.dataset.node;
+  collabRenderCanvas();
+  collabRenderInspector();
+}
+
+async function collabOpenRun(id, keepPoll) {
+  const rid = String(id || "");
+  if (!rid) return;
+  COLLAB.runId = rid;
+  COLLAB.view = "run";
+  COLLAB.runErr = "";
+  COLLAB.pickId = "";
+  COLLAB.diffOpen = false;
+  COLLAB.memSel = "";
+  COLLAB.memAll = false;
+  COLLAB.permOpen = false;
+  const diff = $("collab-diff");
+  if (diff) { diff.hidden = true; diff.innerHTML = ""; }
+  collabRenderRuns();
+  await collabFetchRun();
+  collabRenderMain();
+  if (!keepPoll) collabStartPoll();
+}
+
+async function collabFetchRun() {
+  if (!COLLAB.runId || COLLAB.tickBusy) return;
+  COLLAB.tickBusy = true;
+  const rid = COLLAB.runId;
+  try {
+    const r = await api("/orchestrate/run?id=" + encodeURIComponent(rid));
+    if (COLLAB.runId !== rid) return;
+    COLLAB.run = (r && r.run) || null;
+    COLLAB.runErr = "";
+  } catch (e) {
+    if (COLLAB.runId !== rid) return;
+    COLLAB.run = null;
+    const msg = String((e && e.message) || e);
+    COLLAB.runErr = /^404/.test(msg) ? "这条任务不存在（可能被清理了）" : ("拿不到任务详情：" + msg);
+  } finally {
+    COLLAB.tickBusy = false;
+  }
+  collabRenderRun();
+  collabRefreshCanvasStatus();
+}
+
+/* ---------------- 渲染：历史 ---------------- */
+
+/** 一条运行属于哪个项目：看它的工作目录（`cwd`）；没有就归到「未指定项目」。
+ *  ⚠ 以前 `list_runs()` 不带 cwd，左栏只能看到任务名 —— 多条工作流混在一起，分不清各自属于哪个项目。 */
+function collabProjectOf(run) {
+  const dir = String((run && run.cwd) || "").trim();
+  if (!dir) return { key: "__none__", name: "未指定项目", dir: "" };
+  return { key: dir.toLowerCase(), name: projectNameOf(dir) || dir, dir: dir };
+}
+
+function collabRenderRuns() {
+  const box = $("collab-runs");
+  const cnt = $("collab-count");
+  const fbox = $("collab-proj-filter");
+  if (!box) return;
+  const all = COLLAB.runs || [];
+  const wfFilter = String(COLLAB.runWfFilter || "");
+  const wfSel = wfFilter ? collabWfById(wfFilter) : null;
+  const scope = wfFilter
+    ? all.filter((r) => String(r.workflowId || "") === wfFilter)
+    : all;
+  const running = scope.filter((r) => String(r.status) === "running").length;
+
+  // 项目清单（按出现顺序；同名不同路径按完整路径区分）
+  const order = [];
+  const byKey = {};  scope.forEach((r) => {
+    const p = collabProjectOf(r);
+    if (!byKey[p.key]) { byKey[p.key] = { key: p.key, name: p.name, dir: p.dir, n: 0 }; order.push(p.key); }
+    byKey[p.key].n += 1;
+  });
+  // 选中的项目已经不在列表里了 → 回到"全部"
+  if (COLLAB.projFilter && !byKey[COLLAB.projFilter]) COLLAB.projFilter = "";
+
+  if (fbox) {
+    fbox.innerHTML = order.length > 1
+      ? `<button type="button" class="collab-proj-chip${COLLAB.projFilter ? "" : " on"}"`
+        + ` data-collab-proj="">全部 <i>${scope.length}</i></button>`
+        + order.map((k) => {
+          const p = byKey[k];
+          return `<button type="button" class="collab-proj-chip${COLLAB.projFilter === k ? " on" : ""}"`
+            + ` data-collab-proj="${esc(p.key)}" title="${esc(p.dir || "未指定工作目录")}">`
+            + `${esc(p.name)} <i>${p.n}</i></button>`;
+        }).join("")
+      : "";
+  }
+
+  const visible = COLLAB.projFilter
+    ? scope.filter((r) => collabProjectOf(r).key === COLLAB.projFilter)
+    : scope;
+
+  if (cnt) {
+    const bits = [];
+    if (scope.length) bits.push(scope.length + " 条");
+    if (wfSel) bits.push("工作流：" + (wfSel.name || ""));
+    if (order.length > 1) bits.push(order.length + " 个项目");
+    if (visible.length !== scope.length) bits.push("筛出 " + visible.length);
+    if (running) bits.push(running + " 运行中");
+    cnt.textContent = bits.join(" · ");
+    cnt.classList.toggle("busy", running > 0);
+  }
+  if (COLLAB.runsErr) {
+    box.innerHTML = `<div class="collab-empty"><span>${esc(COLLAB.runsErr)}</span></div>`;
+    return;
+  }
+  if (!scope.length) {
+    box.innerHTML = `<div class="collab-empty"><span>${wfSel ? "这个工作流还没有运行。" : "还没有任务。"}</span></div>`;
+    return;
+  }
+  if (!visible.length) {
+    box.innerHTML = `<div class="collab-empty"><span>这个项目还没有任务。</span></div>`;
+    return;
+  }
+  box.innerHTML = visible.map((r) => {
+    const st = String(r.status || "running");
+    const done = Number(r.done || 0);
+    const failed = Number(r.failed || 0);
+    const n = Number(r.members || 0);
+    const bits = [`${done}/${n} 完成`];
+    if (failed) bits.push(failed + " 失败");
+    if (st === "running") bits.push("运行中");
+    const p = collabProjectOf(r);
+    return `<div class="collab-run-row${String(r.id) === String(COLLAB.runId) ? " on" : ""}"`
+      + ` data-collab-run="${esc(r.id)}" title="${esc((r.task || "") + (p.dir ? "\n项目：" + p.dir : ""))}">`
+      + `<span class="collab-dot ${esc(st)}"></span>`
+      + `<span class="collab-run-t"><b>${esc(r.title || r.task || r.id)}</b>`
+      + `<span class="collab-run-tags">`
+      + `<span class="collab-run-proj" title="${esc(p.dir || "未指定工作目录")}">`
+      + `${treeIco(true, false)}<em>${esc(p.name)}</em></span>`
+      + (r.workflowName
+        ? `<span class="collab-run-wf" title="工作流：${esc(r.workflowName)}">${esc(r.workflowName)}</span>`
+        : "")
+      + `</span>`
+      + `<i>${esc(fmtTime(r.created))} · ${esc(bits.join(" · "))}</i></span>`
+      + `<button type="button" class="collab-run-del" data-collab-del="${esc(r.id)}" title="删除这条运行记录（已结束的才能删）">×</button>`
+      + `</div>`;
+  }).join("");
+}
+
+/* ---------------- 渲染：任务详情 ---------------- */
+
+function collabRenderRun() {
+  const empty = $("collab-empty");
+  const runBox = $("collab-run");
+  if (!empty || !runBox) return;
+  const run = COLLAB.run;
+  if (!run || COLLAB.view !== "run") {
+    collabRenderMain();
+    if (!run && COLLAB.view === "run") {
+      let why = "从左栏选一条运行记录，或新建一个工作流再跑。";
+      if (COLLAB.catErr) why = COLLAB.catErr;
+      else if (COLLAB.runErr) why = COLLAB.runErr;
+      else if (COLLAB.runsErr) why = COLLAB.runsErr;
+      empty.innerHTML = `<b>${COLLAB.catErr || !COLLAB.runId ? "本地协作" : "打不开这条任务"}</b>`
+        + `<span>${esc(why)}</span>`;
+    }
+    return;
+  }
+  collabRenderMain();
+
+  const st = String(run.status || "running");
+  const title = $("collab-task-title");
+  if (title) {
+    title.textContent = String(run.title || run.task || run.id || "任务");
+    title.title = String(run.task || "");
+  }
+  const stEl = $("collab-task-st");
+  if (stEl) {
+    stEl.className = "collab-st " + st;
+    stEl.textContent = collabStText(st);
+  }
+
+  const ms = run.members || [];
+  const done = ms.filter((m) => m.status === "done").length;
+  const bad = ms.filter((m) => ["failed", "timeout", "cancelled"].includes(m.status)).length;
+  const meta = $("collab-task-meta");
+  if (meta) {
+    const bits = [];
+    if (run.workflowName) {
+      bits.push(`工作流 <b class="collab-proj-name">${esc(run.workflowName)}</b>`);
+    }
+    const pj = collabProjectOf(run);
+    if (run.cwd) {
+      bits.push(`项目 <b class="collab-proj-name">${esc(pj.name)}</b>`
+        + ` <code title="${esc(run.cwd)}">${esc(run.cwd)}</code>`
+        + ` <button type="button" class="collab-proj-open" data-collab-open-proj="${esc(run.cwd)}"`
+        + ` title="在编码模式里打开这个项目目录">打开</button>`);
+    } else {
+      bits.push(`项目 <b class="collab-proj-name muted">未指定</b>（用各成员的默认工作目录）`);
+    }
+    bits.push(`开始 ${esc(fmtTime(run.created))}`);
+    bits.push(`成员 ${ms.length} · 完成 ${done}` + (bad ? ` · 失败/取消 ${bad}` : ""));
+    if (run.updated) bits.push(`更新 ${esc(fmtTime(run.updated))}`);
+    meta.innerHTML = bits.join(" · ") + `<div>任务：${esc(String(run.task || ""))}</div>`;
+  }
+
+  // 「推荐 X」：可点，跳到那一列（对不上就明说，不硬猜）
+  const pickEl = $("collab-pick");
+  if (pickEl) {
+    const pick = run.arbitration && String(run.arbitration.pick || "").trim();
+    if (pick) {
+      pickEl.innerHTML = `<button type="button" class="collab-pick" data-collab-pick="${esc(pick)}" `
+        + `title="跳到被推荐的那一列">推荐：<b>${esc(pick)}</b></button>`;
+    } else if (run.arbitration && run.arbitration.status === "running") {
+      pickEl.innerHTML = `<span class="collab-st running">审查中…</span>`;
+    } else {
+      pickEl.innerHTML = "";
+    }
+  }
+
+  collabRenderActions(run);
+  collabRenderPending(run);
+  collabRenderCols(run);
+}
+
+function collabRenderActions(run) {
+  const box = $("collab-task-actions");
+  if (!box) return;
+  const ms = run.members || [];
+  const doneOut = ms.filter((m) => m.kind !== "arbitration" && m.status === "done" && String(m.output || "").trim());
+  const st = String(run.status || "");
+  const parts = [];
+  if (run.workflowId) {
+    parts.push(`<button type="button" data-collab-back-wf="${esc(run.workflowId)}"`
+      + ` title="回到这个工作流的画布（可改成员/再跑）">← 工作流</button>`);
+  }
+  if (st === "running") {
+    parts.push(`<button type="button" class="danger" data-collab-cancel="" title="中断所有成员（已产出的内容保留）">取消全部</button>`);
+  } else {
+    parts.push(`<button type="button" data-collab-rerun="1" title="用同样成员再跑一遍（原记录保留）">重跑</button>`);
+  }
+  if (doneOut.length === 2) {
+    parts.push(`<button type="button" data-collab-diff="1">${COLLAB.diffOpen ? "收起差异" : "逐行差异"}</button>`);
+  }
+  const arbRunning = !!(run.arbitration && run.arbitration.status === "running");
+  if (doneOut.length >= 2 && !arbRunning) {
+    const avail = collabAvailAgents();
+    if (avail.length) {
+      const reviewer = ms.find((m) => m.kind !== "arbitration" && m.role === "reviewer" && m.engine);
+      const saved = COLLAB.arbEngine || (reviewer && reviewer.engine) || (avail[0] && avail[0].id) || "";
+      const opts = avail.map((a) => `<option value="${esc(a.id)}"${String(a.id) === String(saved) ? " selected" : ""}>${esc(a.label || a.id)}</option>`).join("");
+      parts.push(`<span class="collab-hint">仲裁者</span>`
+        + `<select id="collab-arb-engine" class="collab-arb-sel" title="让一个 agent 评审并给出「结论：推荐 X」">${opts}</select>`
+        + `<button type="button" data-collab-arb="1" title="再跑一个 reviewer 成员：评审全部方案并收口推荐 X">请它仲裁</button>`);
+    } else {
+      parts.push(`<span class="collab-hint">没有可用的 agent，无法仲裁</span>`);
+    }
+  } else if (arbRunning) {
+    parts.push(`<span class="collab-hint">审查者正在评……</span>`);
+  }
+  const pendN = (run.permissions || []).filter((p) => p.status === "pending").length;
+  parts.push(`<button type="button" data-collab-perm-open="1" title="成员权限 + 待批申请（位置更宽）">`
+    + `权限${pendN ? ` · ${pendN}` : ""}</button>`);
+  parts.push(`<button type="button" data-collab-export="1" title="导出这次任务的时间线 + 审批记录（JSON，不含成员正文）">导出审计</button>`);
+  parts.push(`<span class="collab-sp"></span><span class="collab-hint">本地运行 · 不经过云端</span>`);
+  box.innerHTML = parts.join("");
+}
+
+function collabRenderPending(run) {
+  const box = $("collab-pending");
+  const bar = $("collab-pend-bar");
+  if (!box) return;
+  const all = run.permissions || [];
+  const pend = all.filter((p) => p.status === "pending");
+  const settled = all.filter((p) => p.status !== "pending");
+  const ms = (run.members || []).filter((m) => m.kind !== "arbitration");
+
+  // ---- 窄条：只说「有几条、是谁、去处理」 ----
+  if (bar) {
+    if (!pend.length) { bar.hidden = true; bar.innerHTML = ""; }
+    else {
+      const p0 = pend[0];
+      bar.hidden = false;
+      bar.innerHTML = `<span class="collab-pend-dot"></span>`
+        + `<b>${pend.length} 条待你批准</b>`
+        + `<span class="collab-pend-first">${esc(p0.memberName || collabFindMemberName(p0.member))}`
+        + ` · ${esc(p0.title || p0.kind || "请求权限")}${p0.destructive ? " · 破坏性" : ""}</span>`
+        + `<span class="collab-sp"></span>`
+        + `<button type="button" class="primary" data-collab-perm-open="1">去处理…</button>`;
+    }
+  }
+
+  // ---- 抽屉：成员权限 + 待批卡片 + 审批历史 ----
+  if (!all.length && !ms.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    COLLAB.permOpen = false;
+    return;
+  }
+  box.hidden = false;
+  const open = !!COLLAB.permOpen;
+  box.classList.toggle("open", open);
+  const ask = Number((COLLAB.cat && COLLAB.cat.askTimeout) || 180) || 180;
+  const now = Date.now();
+  const levels = collabPermLevels();
+  const lvOpts = (cur) => levels.map((x) => `<option value="${esc(x.id || "")}"${String(x.id || "") === String(cur || "") ? " selected" : ""}>`
+    + `${esc(x.label || x.id || "跟随面板")}</option>`).join("");
+  let h = `<div class="collab-perm-drawer-h">`
+    + `<b>权限与批准</b><span class="muted">${pend.length ? pend.length + " 条待批" : "没有待批"}</span>`
+    + `<span class="collab-sp"></span><button type="button" class="wp-x" data-collab-perm-close="1" title="收起">×</button></div>`
+    + `<div class="collab-perm-drawer-b">`;
+
+  h += `<div class="collab-perm-sec"><div class="collab-perm-sec-h"><b>成员权限</b>`
+    + `<span class="muted">只影响这个成员；改完立刻生效</span></div>`;
+  h += ms.map((m) => `<div class="collab-perm-mrow">`
+    + `<div class="collab-perm-mname"><b>${esc(m.name || m.id)}</b>`
+    + `<span class="muted">${esc([m.roleLabel, m.engine].filter(Boolean).join(" · "))}</span></div>`
+    + `<select data-perm-level="${esc(m.id)}" title="这个成员的权限等级">${lvOpts(m.permLevel)}</select>`
+    + `</div>`).join("");
+  h += `<div class="collab-perm-note">「信任」= 非破坏性操作不再逐条问；<b>破坏性操作永远要你确认</b>（先隔离再放行）。</div></div>`;
+
+  h += `<div class="collab-perm-sec"><div class="collab-perm-sec-h"><b>待你批准</b>`
+    + `<span class="muted">逐条处理 · 破坏性只给「确认执行」</span></div>`;
+  if (!pend.length) {
+    h += `<div class="collab-perm-none">现在没有待批的申请。</div>`;
+  } else {
+    h += pend.map((p) => {
+      const created = Number(p.created || 0) / 1000;
+      const left = created ? Math.max(0, Math.round(created + ask - now / 1000)) : ask;
+      const cmd = String(p.command || "").trim();
+      const paths = (p.locations || []).join("、");
+      const danger = !!p.destructive;
+      return `<div class="collab-perm-i${danger ? " danger" : ""}" data-perm-card="${esc(p.id)}">`
+        + `<div class="collab-perm-h"><b>🔐 ${esc(p.memberName || collabFindMemberName(p.member))}</b>`
+        + `<span>${esc(p.title || p.kind || "请求权限")}</span>`
+        + (danger ? `<span class="collab-danger">破坏性操作</span>` : "")
+        + `<span class="collab-left">剩余 ${left}s</span></div>`
+        + (cmd ? `<div class="collab-perm-cmd">${esc(cmd)}</div>` : "")
+        + (paths ? `<div class="collab-perm-paths">涉及：${esc(paths)}</div>` : "")
+        + `<div class="collab-perm-ft">`
+        + `<button type="button" class="ok" data-perm-go="${esc(p.id)}" data-decision="once" title="只放行这一次">${danger ? "确认执行" : "允许一次"}</button>`
+        + (danger ? "" : `<button type="button" data-perm-go="${esc(p.id)}" data-decision="always" title="同样条件下以后不再问（写进 ACP 的「始终允许」记忆）">始终允许</button>`)
+        + `<button type="button" class="danger" data-perm-go="${esc(p.id)}" data-decision="reject" title="拒绝这一条（agent 会收到拒绝继续）">拒绝</button>`
+        + `</div></div>`;
+    }).join("");
+  }
+  h += `</div>`;
+
+  if (settled.length) {
+    h += `<div class="collab-perm-sec"><details class="collab-audit"><summary>审批历史 · ${settled.length} 条（谁批准了哪一条、命令原文都在）</summary>`
+      + settled.slice().reverse().map((p) => {
+        const st = String(p.status || "");
+        const label = st === "allowed" ? "已允许" : st === "denied" ? "已拒绝" : st === "timeout" ? "已超时" : st;
+        const cmd = String(p.command || "").trim();
+        return `<div class="collab-audit-row">`
+          + `<i>${esc(label)}</i><b>${esc(p.memberName || p.member || "")}</b>`
+          + `<span title="${esc(cmd || p.title || "")}">${esc(p.title || "")}${cmd ? " · " + esc(cmd) : ""}</span>`
+          + `<em>${esc(COLLAB_DEC[p.decision] || "")} · 你（本机） · ${esc(fmtTime(p.decidedAt))}</em></div>`;
+      }).join("") + `</details></div>`;
+  }
+  h += `</div>`;
+  box.innerHTML = h;
+}
+
+function collabPermToggle(open) {
+  COLLAB.permOpen = !!open;
+  if (COLLAB.run) collabRenderPending(COLLAB.run);
+  else {
+    const box = $("collab-pending");
+    if (box) box.classList.toggle("open", !!open);
+  }
+}
+
+async function collabSetMemberPerm(mid, level) {
+  const run = COLLAB.run;
+  if (!run) return;
+  const m = (run.members || []).find((x) => String(x.id) === String(mid));
+  try {
+    const r = await api("/orchestrate/member", {
+      method: "POST",
+      body: JSON.stringify({ run: run.id, member: mid, permLevel: level }),
+    });
+    if (r && r.run) COLLAB.run = r.run;
+    collabRenderRun();
+    setBanner(`已把「${(m && m.name) || mid}」的权限改成：${collabPermLabel(level)}`);
+  } catch (e) {
+    setBanner("改成员权限失败：" + ((e && e.message) || e), { sticky: true });
+    collabRenderRun();
+  }
+}
+
+function collabPermLabel(id) {
+  const want = String(id || "");
+  const hit = collabPermLevels().find((x) => String(x.id || "") === want);
+  return hit ? String(hit.label || want) : (want || "跟随面板");
+}
+
+/** 一个成员的完整内容块（正文 / 错误 / 最近工具 / 底部用量）。 */
+function collabColHtml(m) {
+  const st = String(m.status || "wait");
+  const out = String(m.output || "").trim();
+  const err = String(m.error || "").trim();
+  const acts = (m.activities || []).slice(-6);
+  const running = st === "wait" || st === "running";
+  const tok = m.tokens || {};
+  const ctx = m.context || null;
+  const foot = [];
+  if (tok.input != null || tok.output != null) {
+    foot.push(`tokens ${tok.input != null ? fmtTok(tok.input) + " 入" : ""}${tok.output != null ? " / " + fmtTok(tok.output) + " 出" : ""}`);
+  }
+  if (ctx && ctx.size) foot.push(`上下文 ${fmtTok(ctx.used || 0)} / ${fmtTok(ctx.size)}`);
+  if (m.started) foot.push("起 " + fmtTime(m.started));
+  if (m.ended) foot.push("止 " + fmtTime(m.ended));
+  const activity = acts.length
+    ? `<div class="collab-acts">` + acts.map((a) => {
+      const k = a.kind === "permission" ? "权限" : "工具";
+      const ast = String(a.status || "");
+      return `<div class="collab-act ${ast === "done" ? "done" : ast === "error" ? "error" : ""}" title="${esc(a.command || a.detail || "")}">`
+        + `<b>${esc(k)}</b><span>${esc(a.name || a.detail || "")}</span>`
+        + `<em>${ast === "done" ? "✓" : ast === "error" ? "失败" : ast === "waiting" ? "等待" : "…"}</em></div>`;
+    }).join("") + `</div>`
+    : "";
+  return `<div class="collab-col${m.kind === "arbitration" ? " arb" : ""}" data-mid="${esc(m.id)}">`
+    + `<div class="collab-col-head">`
+    + (m.roleLabel ? `<i class="collab-role">${esc(m.roleLabel)}</i>` : "")
+    + `<b>${esc(m.name || m.id)}</b><span class="collab-engine">${esc(m.engine || "")}</span>`
+    + `<span class="collab-st ${esc(st)}">${esc(collabStText(st))}</span>`
+    + `<span class="collab-perm-tag" title="这个成员的权限等级（在检查器 / 权限抽屉里改）">${esc(collabPermLabel(m.permLevel))}</span>`
+    + (running ? `<button type="button" class="collab-cancel" data-collab-cancel="${esc(m.id)}" title="只取消这一个成员">取消</button>` : "")
+    + `</div>`
+    + `<div class="collab-col-body">`
+    + (out ? renderText(stripModelWarning(out)) : `<div class="collab-col-wait">${running ? "还在做……" : "（没有返回正文）"}</div>`)
+    + (err ? `<div class="collab-col-err">${esc(err)}</div>` : "")
+    + activity
+    + `</div>`
+    + (foot.length ? `<div class="collab-col-foot">${foot.map(esc).join("<span>·</span>")}</div>` : "")
+    + `</div>`;
+}
+
+function collabRenderCols(run) {
+  const box = $("collab-cols");
+  if (!box) return;
+  const ms = run.members || [];
+  if (!ms.length) {
+    box.innerHTML = `<div class="collab-empty"><span>这个任务还没有成员。</span></div>`;
+    if ($("collab-mem")) $("collab-mem").hidden = true;
+    return;
+  }
+  // ★默认只看一个成员：选中的那个；没选过就挑正在跑的，否则第一个
+  let sel = String(COLLAB.memSel || "");
+  if (!ms.some((m) => String(m.id) === sel)) {
+    const first = ms.find((m) => m.status === "running" || m.status === "wait") || ms[0];
+    sel = String(first.id);
+    COLLAB.memSel = sel;
+  }
+  const multi = ms.length > 1;
+  const showAll = !!COLLAB.memAll;
+  const strip = $("collab-mem");
+  if (strip) {
+    strip.hidden = !multi;
+    if (multi) {
+      strip.innerHTML = ms.map((m) => {
+        const st = String(m.status || "wait");
+        const on = showAll ? "" : (String(m.id) === sel ? " on" : "");
+        return `<button type="button" class="collab-mem-chip${on}" data-collab-mem="${esc(m.id)}"`
+          + ` title="${esc((m.roleLabel ? m.roleLabel + " · " : "") + (m.engine || "") + " · 权限：" + collabPermLabel(m.permLevel))}">`
+          + `<i class="dot ${esc(st)}"></i>`
+          + (m.roleLabel ? `<em>${esc(m.roleLabel)}</em>` : "")
+          + `<b>${esc(m.name || m.id)}</b>`
+          + `<span>${esc(collabStText(st))}</span>`
+          + `</button>`;
+      }).join("")
+        + `<button type="button" class="collab-mem-chip all${showAll ? " on" : ""}" data-collab-all="1"`
+        + ` title="并排显示全部成员（对比用）">⊞ 并排</button>`;
+    } else {
+      strip.innerHTML = "";
+    }
+  }
+  const single = multi && !showAll;
+  box.classList.toggle("single", single);
+  const list = single ? ms.filter((m) => String(m.id) === sel) : ms;
+  box.innerHTML = list.map(collabColHtml).join("");
+  // 点过「推荐 X」之后重画也要保住高亮
+  if (COLLAB.pickId) {
+    Array.prototype.forEach.call(box.querySelectorAll(".collab-col"), (c) => {
+      c.classList.toggle("pick", String(c.dataset.mid) === String(COLLAB.pickId));
+    });
+  }
+}
+
+/* ---------------- 操作：取消 / 权限 / 仲裁 / 差异 / 重跑 ---------------- */
+
+/** 删除一条**已结束**的运行记录（后端拒绝删除还在跑 / 还在收尾的任务）。 */
+async function collabDeleteRun(id) {
+  const rid = String(id || "");
+  if (!rid) return;
+  const row = (COLLAB.runs || []).find((r) => String(r.id) === rid);
+  if (row && String(row.status) === "running") {
+    setBanner("任务还在跑：先点「取消全部」，等它停下来再删除", { sticky: true });
+    return;
+  }
+  if (!confirm("删除这条运行记录？\n成员输出、审批历史和这个任务的成员会话文件都会删掉，不能恢复。")) return;
+  try {
+    await api("/orchestrate/delete", { method: "POST", body: JSON.stringify({ id: rid }) });
+    const wasCurrent = String(COLLAB.runId) === rid;
+    // 作废任何正在飞的历史请求，再本地删掉（4s 轮询可能刚发出去）
+    COLLAB.runsSeq += 1;
+    COLLAB.runs = (COLLAB.runs || []).filter((r) => String(r.id) !== rid);
+    if (wasCurrent) {
+      COLLAB.runId = "";
+      COLLAB.run = null;
+      COLLAB.pickId = "";
+      COLLAB.diffOpen = false;
+      collabStopPoll();
+      const diff = $("collab-diff");
+      if (diff) { diff.hidden = true; diff.innerHTML = ""; }
+    }
+    collabRenderRuns();
+    if (wasCurrent) {
+      if (COLLAB.runs.length) await collabOpenRun(COLLAB.runs[0].id);
+      else { collabStopPoll(); collabRenderRun(); }
+    } else {
+      collabRenderRun();
+    }
+    // 后台再对一次账（失败也不用打扰用户）
+    collabLoadRuns(false);
+    setBanner("已删除运行记录");
+  } catch (e) {
+    setBanner("删除失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function collabCancel(memberId) {  const run = COLLAB.run;
+  if (!run) return;
+  const who = memberId ? collabFindMemberName(memberId) : "全部成员";
+  if (!confirm("取消 " + who + "？已经产出的内容会保留。")) return;
+  try {
+    const r = await api("/orchestrate/cancel", {
+      method: "POST",
+      body: JSON.stringify({ id: run.id, member: memberId || "" }),
+    });
+    if (r && r.run) COLLAB.run = r.run;
+    collabRenderRun();
+    setBanner("已取消：" + who);
+    if (!collabRunActive(COLLAB.run)) { collabStopPoll(); collabLoadRuns(); }
+  } catch (e) {
+    setBanner("取消失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function collabPerm(permId, decision) {
+  if (!permId) return;
+  // 先禁用这张卡的按钮：避免连点发出两次（第二次会 404「已结算」，看着像失败）
+  Array.prototype.forEach.call(document.querySelectorAll("[data-perm-card]"), (c) => {
+    if (String(c.dataset.permCard) !== String(permId)) return;
+    Array.prototype.forEach.call(c.querySelectorAll("button"), (b) => { b.disabled = true; });
+  });
+  try {
+    await api("/orchestrate/permission", {
+      method: "POST",
+      body: JSON.stringify({ id: permId, decision: decision }),
+    });
+    setBanner(decision === "reject" ? "已拒绝这一条" : (decision === "always" ? "已允许（并记住这一条）" : "已允许这一次"));
+    await collabFetchRun();
+    collabStartPoll();
+  } catch (e) {
+    setBanner("批复失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function collabArbitrate() {
+  const run = COLLAB.run;
+  if (!run) return;
+  const sel = $("collab-arb-engine");
+  const engine = String((sel && sel.value) || COLLAB.arbEngine || "").trim();
+  if (!engine) { setBanner("先选一个仲裁者（一个可用的 agent）"); return; }
+  try {
+    const r = await api("/orchestrate/arbitrate", {
+      method: "POST",
+      body: JSON.stringify({ id: run.id, engine: engine, name: "审查者" }),
+    });
+    if (r && r.run) COLLAB.run = r.run;
+    collabRenderRun();
+    collabStartPoll();
+    setBanner("已请审查者仲裁（结果会出现在最右侧那一列；抠到「推荐 X」会高亮）");
+  } catch (e) {
+    setBanner("仲裁失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+function collabToggleDiff() {
+  const box = $("collab-diff");
+  if (!box) return;
+  if (!box.hidden) {
+    box.hidden = true; box.innerHTML = ""; COLLAB.diffOpen = false;
+    collabRenderActions(COLLAB.run || {});
+    return;
+  }
+  const done = ((COLLAB.run && COLLAB.run.members) || [])
+    .filter((m) => m.kind !== "arbitration" && m.status === "done" && String(m.output || "").trim());
+  if (done.length !== 2) { setBanner("需要正好 2 个成员完成才能看逐行差异"); return; }
+  const lines = ccDiffLines(stripModelWarning(done[0].output), stripModelWarning(done[1].output));
+  if (!lines) { setBanner("两边回复太长，算差异会卡 —— 直接并排看吧"); return; }
+  const add = lines.filter((l) => l.startsWith("+")).length;
+  const del = lines.filter((l) => l.startsWith("-")).length;
+  box.innerHTML = `<div class="collab-diff-h">逐行差异：<b>${esc(done[0].name)}</b> → <b>${esc(done[1].name)}</b>`
+    + `<span class="muted">（+${add} / −${del} 行 · 按原文比）</span></div>`
+    + renderDiff(lines.join("\n"));
+  box.hidden = false;
+  COLLAB.diffOpen = true;
+  collabRenderActions(COLLAB.run || {});
+}
+
+function collabJumpPick(pick) {
+  const key = String(pick || "").toLowerCase().replace(/\s+/g, "");
+  if (!key) return;
+  const ms = ((COLLAB.run && COLLAB.run.members) || []);
+  const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, "");
+  let hit = ms.find((m) => norm(m.name) === key);
+  if (!hit) hit = ms.find((m) => norm(m.name) && (norm(m.name).includes(key) || key.includes(norm(m.name))));
+  if (!hit) hit = ms.find((m) => norm(m.output).includes(key));
+  if (!hit) {
+    setBanner(`结论里的「${pick}」对不上任何一列（成员：${ms.map((m) => m.name).join("、") || "无"}）`);
+    return;
+  }
+  COLLAB.pickId = String(hit.id);
+  COLLAB.memSel = String(hit.id);
+  if (COLLAB.run) collabRenderCols(COLLAB.run);
+  const cols = document.querySelectorAll("#collab-cols .collab-col");
+  Array.prototype.forEach.call(cols, (c) => c.classList.toggle("pick", String(c.dataset.mid) === String(COLLAB.pickId)));
+  const el = Array.prototype.find.call(cols, (c) => String(c.dataset.mid) === String(COLLAB.pickId));
+  if (el) { try { el.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" }); } catch { el.scrollIntoView(); } }
+  setBanner(`已跳到「${hit.name}」那一列`);
+}
+
+/** 导出审计（JSON）：时间线 + 谁批准了哪条 + 命令原文；**不含成员正文**（正文可能很大/敏感）。 */
+function collabExport() {
+  const run = COLLAB.run;
+  if (!run) { setBanner("先把任务打开再导出"); return; }
+  const data = {
+    exportedAt: new Date().toISOString(),
+    run: { id: run.id, task: run.task, title: run.title, cwd: run.cwd,
+           status: run.status, created: run.created, updated: run.updated },
+    members: (run.members || []).map((m) => ({
+      id: m.id, name: m.name, role: m.role, engine: m.engine, kind: m.kind,
+      status: m.status, created: m.created, started: m.started, ended: m.ended,
+      tokens: m.tokens || {}, context: m.context || null,
+      error: m.error || "", activities: m.activities || [],
+    })),
+    permissions: run.permissions || [],
+    arbitration: run.arbitration || null,
+  };
+  try {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cocraft-audit-" + String(run.id || "run") + ".json";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
+    setBanner("已导出审计（JSON）");
+  } catch (e) {
+    setBanner("导出失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function collabRerun() {  const run = COLLAB.run;
+  if (!run) return;
+  const members = (run.members || [])
+    .filter((m) => m.kind !== "arbitration")
+    .map((m) => ({ engine: m.engine, name: m.name, role: m.role }));
+  if (!members.length) { setBanner("这条任务没有可重跑的成员"); return; }
+  if (!confirm("用同样的成员再跑一遍？会新建一条任务记录（原来那条保留）。")) return;
+  try {
+    const r = await api("/orchestrate/start", {
+      method: "POST",
+      body: JSON.stringify({ task: run.task, cwd: run.cwd || "", members: members }),
+    });
+    const nr = r && r.run;
+    if (!nr) throw new Error("后端没有返回新任务");
+    await collabLoadRuns(false);
+    await collabOpenRun(nr.id);
+    setBanner("已重跑（新任务）");
+  } catch (e) {
+    setBanner("重跑失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+/* 一次性「新建任务」弹窗已移除：工作流是唯一入口
+   （左栏「工作流 +」新建；画布快速任务条 = 一次性开跑，不保存流程）。 */
+
+/* ---------------- 事件接线 ---------------- */
+
+function initCollab() {
+  const btn = $("btn-collab");
+  if (btn) btn.addEventListener("click", () => collabOpen(!collabIsOpen()));
+  const close = $("collab-close");
+  if (close) close.addEventListener("click", collabClose);
+  const refresh = $("collab-refresh");
+  if (refresh) refresh.addEventListener("click", async () => {
+    await collabLoadCatalog();
+    await collabLoadWorkflows(false);
+    await collabLoadRuns(!COLLAB.runId && !(COLLAB.workflows || []).length);
+    if (COLLAB.runId) await collabFetchRun();
+    collabStartPoll();
+    setBanner("已刷新");
+  });
+  const nw = $("collab-new-wf");
+  if (nw) nw.addEventListener("click", collabNewWorkflow);
+  const runsAll = $("collab-runs-all");
+  if (runsAll) runsAll.addEventListener("click", () => {
+    COLLAB.runWfFilter = "";
+    collabRenderRuns();
+  });
+
+  // ★左栏：工作流（点选中；▶ 用默认任务一键跑）
+  const wfList = $("collab-wf-list");
+  if (wfList) wfList.addEventListener("click", (e) => {
+    const runBtn = e.target.closest("[data-wf-run]");
+    if (runBtn) { e.stopPropagation(); collabQuickRun(runBtn.dataset.wfRun); return; }
+    const row = e.target.closest("[data-wf]");
+    if (row) collabSelectWf(row.dataset.wf);
+  });
+
+  // ★工作流头 / 快速运行
+  const wfName = $("collab-wf-name");
+  if (wfName) wfName.addEventListener("click", () => {
+    const wf = collabWf();
+    if (!wf) return;
+    const v = prompt("工作流名字", wf.name || "");
+    if (v == null) return;
+    wf.name = String(v).trim() || wf.name;
+    collabSaveWfSoon();
+    collabRenderWf();
+    collabRenderWfList();
+  });
+  const wfCwd = $("collab-wf-cwd");
+  if (wfCwd) wfCwd.addEventListener("click", collabPickWfCwd);
+  const wfAdd = $("collab-wf-add");
+  if (wfAdd) wfAdd.addEventListener("click", collabAddMember);
+  const wfLayout = $("collab-wf-layout");
+  if (wfLayout) wfLayout.addEventListener("click", () => {
+    const wf = collabWf();
+    if (!wf) return;
+    wf.layout = { zoom: COLLAB.canvas.zoom, nodes: {} };
+    COLLAB.canvas.sel = "";
+    collabRenderCanvas();
+    collabRenderInspector();
+    collabFitCanvas();
+    collabSaveWfSoon();
+  });
+  const wfDup = $("collab-wf-dup");
+  if (wfDup) wfDup.addEventListener("click", collabDuplicateWf);
+  const wfDel = $("collab-wf-del");
+  if (wfDel) wfDel.addEventListener("click", collabDeleteWf);
+  const quickRun = $("collab-quick-run");
+  if (quickRun) quickRun.addEventListener("click", () => collabQuickRun());
+  const quickInput = $("collab-quick-task");
+  if (quickInput) quickInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      collabQuickRun();
+    }
+  });
+
+  // ★画布：拖动 / 缩放 / 双击 / 删除
+  const cv = $("collab-canvas");
+  if (cv) {
+    cv.addEventListener("pointerdown", collabCanvasPointerDown);
+    cv.addEventListener("wheel", collabCanvasWheel, { passive: false });
+    cv.addEventListener("dblclick", collabCanvasDblClick);
+    cv.addEventListener("click", collabCanvasClick);
+  }
+  const insp = $("collab-inspector");
+  if (insp) insp.addEventListener("change", collabInspectorChanged);
+
+  // 窗口尺寸变化 → 画布重新适应（节流）
+  window.addEventListener("resize", () => {
+    if (!COLLAB.open || COLLAB.view !== "wf") return;
+    if (COLLAB.canvas.resizeTimer) clearTimeout(COLLAB.canvas.resizeTimer);
+    COLLAB.canvas.resizeTimer = setTimeout(collabFitCanvas, 250);
+  });
+
+  // 左栏：按项目筛选（同一个项目可能有多组工作流）
+  const pf = $("collab-proj-filter");
+  if (pf) pf.addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-collab-proj]");
+    if (!chip) return;
+    COLLAB.projFilter = chip.dataset.collabProj || "";
+    collabRenderRuns();
+  });
+
+  // 左栏：点一条历史 / 删一条历史
+  const runsBox = $("collab-runs");
+  if (runsBox) runsBox.addEventListener("click", (e) => {
+    const del = e.target.closest("[data-collab-del]");
+    if (del) {
+      e.stopPropagation();
+      collabDeleteRun(del.dataset.collabDel);
+      return;
+    }
+    const row = e.target.closest("[data-collab-run]");
+    if (row) collabOpenRun(row.dataset.collabRun);
+  });
+
+  // 右栏：动作 / 权限 / 取消
+  const root = $("collab");
+  if (root) root.addEventListener("click", (e) => {
+    const openProj = e.target.closest("[data-collab-open-proj]");
+    if (openProj) {
+      const dir = openProj.dataset.collabOpenProj || "";
+      if (dir) { collabClose(); codeOpenAt(dir, ""); }
+      return;
+    }
+    const backWf = e.target.closest("[data-collab-back-wf]");
+    if (backWf) { collabSelectWf(backWf.dataset.collabBackWf); return; }
+    const cancel = e.target.closest("[data-collab-cancel]");
+    if (cancel) { collabCancel(cancel.dataset.collabCancel || ""); return; }
+    const perm = e.target.closest("[data-perm-go]");
+    if (perm) { collabPerm(perm.dataset.permGo, perm.dataset.decision); return; }
+    if (e.target.closest("[data-collab-perm-open]")) { collabPermToggle(true); return; }
+    if (e.target.closest("[data-collab-perm-close]")) { collabPermToggle(false); return; }
+    const memChip = e.target.closest("[data-collab-mem]");
+    if (memChip) {
+      COLLAB.memSel = String(memChip.dataset.collabMem || "");
+      COLLAB.memAll = false;
+      if (COLLAB.run) collabRenderCols(COLLAB.run);
+      return;
+    }
+    if (e.target.closest("[data-collab-all]")) {
+      COLLAB.memAll = true;
+      if (COLLAB.run) collabRenderCols(COLLAB.run);
+      return;
+    }
+    const diff = e.target.closest("[data-collab-diff]");
+    if (diff) { collabToggleDiff(); return; }
+    const arb = e.target.closest("[data-collab-arb]");
+    if (arb) { collabArbitrate(); return; }
+    const pick = e.target.closest("[data-collab-pick]");
+    if (pick) { collabJumpPick(pick.dataset.collabPick); return; }
+    const exp = e.target.closest("[data-collab-export]");
+    if (exp) { collabExport(); return; }
+    const rerun = e.target.closest("[data-collab-rerun]");
+    if (rerun) { collabRerun(); return; }
+  });
+  if (root) root.addEventListener("change", (e) => {
+    const sel = e.target.closest("#collab-arb-engine");
+    if (sel) COLLAB.arbEngine = String(sel.value || "");
+    const lv = e.target.closest("[data-perm-level]");
+    if (lv) collabSetMemberPerm(lv.dataset.permLevel, lv.value);
+  });
+
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (collabIsOpen() && COLLAB.permOpen) { collabPermToggle(false); return; }
+    if (collabIsOpen()) collabClose();
+  });
+}
+
+
 (async function boot() {
   // 版本号：自动取本文件被加载时带的 ?v=（与服务端 /healthz 报告的版本比对，用来触发自动刷新）
   $("ui-ver").textContent = "ui " + (UI_VER || "?");
@@ -12026,6 +14429,7 @@ async function updReportStatus() {
   initBrandName();
   initAttachments();
   initCopy();
+  initMsgNav();                          // 回到底部 / 问题导航（跳到某次提问）
   initPartToggle();                      // 折叠块展开状态记忆
   initSelCopy();                         // 选中片段 → 浮出「复制选中」
   initTrace();                           // 顶栏「轨迹」：思考 / 工具调用
@@ -12039,6 +14443,7 @@ async function updReportStatus() {
   restoreMusicState();                   // 刷新后面板内歌曲信息 / 队列 / 进度恢复
   initSettings();
   initTrust();                           // 顶栏「信任」：权限等级 / 待批准 / 始终允许
+  initCollab();                          // 顶栏「协作」：本地多 agent 工作台（不登录）
   // 自定义素材（头像 / 空会话主图与贴纸）：拉回来后再画一次首屏（接口没有就安静跳过）
   loadAppearance().then(() => refreshAppearanceArt());
   initModelPicker();

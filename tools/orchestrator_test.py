@@ -35,6 +35,7 @@ import orchestrator as orch  # noqa: E402
 MOCK = os.path.join(BACKEND, "acp_mock_agent.py")
 orch.ROOT = os.path.join(TMP, "_orchestrator")
 orch.RUNS_DIR = os.path.join(orch.ROOT, "runs")
+orch.WORKFLOWS_FILE = os.path.join(TMP, "_collab_workflows.json")   # 别碰真实的
 orch.ASK_TIMEOUT = 8
 orch.RUN_TIMEOUT = 20
 orch._load_ok_models = lambda: {}
@@ -103,6 +104,120 @@ def main() -> int:
         cat = orch.catalog()
         ok("catalog 列出 4 个 agent", len(cat.get("agents") or []) == 4, repr(cat.get("agents")))
         ok("catalog 带角色 + 预设", bool(cat.get("roles")) and isinstance(cat.get("presets"), list))
+        ok("catalog 带 askTimeout / runTimeout（前端倒计时用）",
+           int(cat.get("askTimeout") or 0) > 0 and int(cat.get("runTimeout") or 0) > 0,
+           repr((cat.get("askTimeout"), cat.get("runTimeout"))))
+
+        print("\n== 0a. ★agent 自己的 mode 覆盖基线（工作台 / 群聊桥都要跟 engine 一致） ==")
+        REG["agents"].append({"id": "mock-mode", "label": "Mock 模式", "mode": "agent",
+                              "command": [sys.executable, MOCK], "cwd": TMP,
+                              "env": {"ACP_MOCK_SIMPLE": "1"}, "provider": "mock"})
+        try:
+            _e, base_mode, _env, _cwd = orch._resolve_engine("mock-mode")
+            ok("agent 有 mode → 覆盖 baseline", base_mode.get("mode") == "agent",
+               repr(base_mode.get("mode")))
+            _e2, base_plain, _env2, _cwd2 = orch._resolve_engine("mock")
+            ok("agent 没 mode → 用 baseline.mode", base_plain.get("mode") == "read-only",
+               repr(base_plain.get("mode")))
+        finally:
+            REG["agents"].pop()
+
+        print("\n== 0c. 节点级权限（per-member permLevel） ==")
+        ok("catalog 带 permLevels（前端下拉用）",
+           any(str(x.get("id")) == "trust" for x in (cat.get("permLevels") or [])),
+           repr(cat.get("permLevels")))
+        wfrm = orch._wf_clean_members([
+            {"engine": "mock", "role": "implementer", "name": "t", "permLevel": "trust"},
+            {"engine": "mock", "role": "reviewer", "name": "r", "permLevel": "nonsense"},
+        ])
+        ok("保存工作流时保留成员权限", wfrm[0].get("permLevel") == "trust", repr(wfrm[0]))
+        ok("不认识的权限值 → 空（跟随面板，不猜）", wfrm[1].get("permLevel") == "", repr(wfrm[1]))
+        orch._RUNS["run_mem"] = {"id": "run_mem", "cwd": TMP, "status": "running",
+                                 "members": [{"id": "m1", "name": "t", "permLevel": "trust"}],
+                                 "permissions": []}
+        mr = orch.set_member("run_mem", "m1", {"permLevel": "exec"})
+        ok("运行中改成员权限（立刻生效）", mr["members"][0].get("permLevel") == "exec",
+           repr(mr["members"][0]))
+        perm_run = {"id": "run_perm", "cwd": TMP, "permissions": [], "members": []}
+        dd = orch._ask_permission(perm_run, {"id": "m1", "name": "t", "permLevel": "trust"},
+                                  "execute", "Run command", [], [],
+                                  {"command": "echo hello"})
+        ok("信任成员：非破坏性自动放行", dd == "once" and not perm_run["permissions"], dd)
+        import threading as _th
+        box = {}
+        def _ask_danger():
+            box["d"] = orch._ask_permission(
+                perm_run, {"id": "m1", "name": "t", "permLevel": "trust"},
+                "execute", "Run command", [], [],
+                {"command": "Remove-Item -Recurse -Force D:\\\\x"})
+        th = _th.Thread(target=_ask_danger, daemon=True)
+        th.start()
+        pid = wait_until(lambda: (perm_run.get("permissions") or [{}])[-1].get("id"), timeout=3)
+        ok("信任成员：破坏性仍然排队等你确认", bool(pid), repr(pid))
+        if pid:
+            orch.reply_permission(pid, "reject")
+        th.join(3)
+        ok("拒绝后返回 reject", box.get("d") == "reject", repr(box.get("d")))
+        orch._RUNS.pop("run_mem", None)
+
+        print("\n== 0b. 工作流：可复用配置（成员 / 默认任务 / 画布布局） ==")
+        wf = orch.save_workflow({
+            "name": "登录重构", "cwd": TMP,
+            "taskTemplate": "把登录拆成独立模块",
+            "members": [
+                {"id": "m1", "role": "implementer", "name": "impl", "engine": "mock"},
+                {"id": "m2", "role": "reviewer", "name": "rev", "engine": "mock"},
+            ],
+            "layout": {"zoom": 1.2, "nodes": {"task": {"x": 40, "y": 100},
+                                              "m1": {"x": 320, "y": 60}}},
+        })
+        wid = wf.get("id") or ""
+        ok("新建工作流拿到 id", bool(wid.startswith("wf_")), wid)
+        ok("列表里能查到", any(str(w.get("id")) == wid for w in orch.list_workflows()), wid)
+        upd = orch.save_workflow({"id": wid, "name": "登录重构 v2", "cwd": TMP,
+                                  "taskTemplate": "把登录拆成独立模块",
+                                  "members": wf["members"],
+                                  "layout": {"zoom": 1.1,
+                                             "nodes": {"m1": {"x": 500, "y": 200}}}})
+        ok("★更新沿用同一个 id（不是又建一条）", upd.get("id") == wid, upd.get("id"))
+        ok("画布布局落盘（坐标 + 缩放）",
+           (upd.get("layout") or {}).get("nodes", {}).get("m1", {}).get("x") == 500
+           and abs(float((upd.get("layout") or {}).get("zoom") or 0) - 1.1) < 1e-6,
+           repr(upd.get("layout")))
+        try:
+            orch.save_workflow({"name": "空", "members": []})
+            ok("空成员 → 拒绝", False)
+        except ValueError:
+            ok("空成员 → 拒绝", True)
+        try:
+            orch.start_run("x", workflow_id="wf_not_exist")
+            ok("不存在的工作流 → 拒绝", False)
+        except ValueError:
+            ok("不存在的工作流 → 拒绝", True)
+
+        print("\n== 0c. 从工作流启动：成员/目录/标题直接用工作流的 ==")
+        wr = orch.start_run("", workflow_id=wid)
+        ok("run 关联 workflowId / 名称",
+           wr.get("workflowId") == wid and wr.get("workflowName") == "登录重构 v2",
+           repr((wr.get("workflowId"), wr.get("workflowName"))))
+        ok("★成员来自工作流（2 个）", len(wr.get("members") or []) == 2)
+        ok("目录来自工作流", wr.get("cwd") == TMP, wr.get("cwd"))
+        got_wf = wait_until(lambda: (orch.get_run(wr["id"]).get("status") in ("done", "partial", "failed")
+                                     and orch.get_run(wr["id"])) or None, 20)
+        ok("从工作流跑完", bool(got_wf), repr(got_wf and got_wf.get("status")))
+        listed = [r for r in orch.list_runs() if str(r.get("id")) == wr["id"]]
+        ok("运行历史带 workflowId（左栏能归组）",
+           bool(listed) and listed[0].get("workflowId") == wid, repr(listed[:1]))
+        wf2 = next((w for w in orch.list_workflows() if str(w.get("id")) == wid), {})
+        ok("工作流记下 lastRunId / runCount",
+           wf2.get("lastRunId") == wr["id"] and int(wf2.get("runCount") or 0) >= 1,
+           repr((wf2.get("lastRunId"), wf2.get("runCount"))))
+        cp = orch.duplicate_workflow(wid)
+        ok("复制工作流：新 id、成员一样",
+           cp.get("id") != wid and len(cp.get("members") or []) == 2, cp.get("id"))
+        ok("删除工作流不删运行记录",
+           orch.delete_workflow(cp["id"]) is True and bool(orch.get_run(wr["id"])), "")
+        ok("删除不存在 → False", orch.delete_workflow("wf_nope") is False)
 
         print("\n== 1. 并发派活（两个成员各自独立会话） ==")
         run = orch.start_run("各写一句", members=[
@@ -122,6 +237,25 @@ def main() -> int:
         ok("输出是 mock 回复", all("MOCK-REPLY" in (m.get("output") or "") for m in ms),
            repr([(m.get("output") or "")[:30] for m in ms]))
         ok("活动里有 usage_update/工具（至少不空或正常完成）", True)
+
+        print("\n== 1b. 并发：两个任务同时跑（不是一次只能一个） ==")
+        ra = orch.start_run("并发 A", members=[{"engine": "mock-slow", "name": "A"}])
+        rb = orch.start_run("并发 B", members=[{"engine": "mock-slow", "name": "B"}])
+        time.sleep(0.8)
+        ga, gb = orch.get_run(ra["id"]), orch.get_run(rb["id"])
+        ok("两个任务同时 running",
+           ga.get("status") == "running" and gb.get("status") == "running",
+           repr((ga.get("status"), gb.get("status"))))
+        ok("两个任务各自有活着的成员/进程",
+           len([k for k in orch._ACTIVE if str(k[0]) in (ra["id"], rb["id"])]) == 2,
+           repr([k for k in orch._ACTIVE if str(k[0]) in (ra["id"], rb["id"])]))
+        orch.cancel_run(ra["id"])
+        orch.cancel_run(rb["id"])
+        both = wait_until(lambda: (lambda a, b: (a, b) if (a.get("members") and b.get("members")
+                          and a["members"][0].get("status") == "cancelled"
+                          and b["members"][0].get("status") == "cancelled") else None)(
+                              orch.get_run(ra["id"]), orch.get_run(rb["id"])), 10)
+        ok("两个都能各自取消", bool(both), repr([x.get("status") for x in (both or ())]))
 
         print("\n== 2. 失败隔离（一个引擎不存在） ==")
         run2 = orch.start_run("混合", members=[
@@ -175,6 +309,39 @@ def main() -> int:
         ok("从磁盘读回任务", bool(disk) and disk.get("task") == "各写一句", repr(disk.get("task")))
         ok("成员结果也在", len(disk.get("members") or []) == 2)
         ok("run json 存在", os.path.isfile(os.path.join(orch.RUNS_DIR, rid + ".json")))
+        runs = orch.list_runs()
+        ok("历史列表：内存 + 磁盘合并（不是只回内存里那一条）", len(runs) >= 4,
+           repr([r.get("id") for r in runs]))
+        ok("历史列表带 done/failed/running 计数（左栏「x/y 完成」不用再拉详情）",
+           all(("done" in r and "failed" in r and "running" in r) for r in runs))
+        ok("★历史列表带 cwd（左栏按项目分组/筛选，不只知道任务名）",
+           all(("cwd" in r and isinstance(r.get("cwd"), str)) for r in runs))
+
+        print("\n== 5b. 删除运行记录 ==")
+        dr = orch.start_run("待删除", members=[{"engine": "mock", "name": "x"}])
+        did = dr["id"]
+        wait_until(lambda: (orch.get_run(did).get("status") not in ("running", "wait") or None), 20)
+        wait_until(lambda: (not any(str(k[0]) == did for k in orch._ACTIVE)) or None, 10)
+        ok("删除已结束任务 → True", orch.delete_run(did) is True)
+        ok("删除后内存/磁盘都查不到",
+           not orch.get_run(did) and not os.path.isfile(os.path.join(orch.RUNS_DIR, did + ".json")),
+           repr(orch.get_run(did)))
+        ok("删除不存在的任务 → False", orch.delete_run("run_nope") is False)
+        try:
+            orch.delete_run("..\\..\\etc")
+            ok("非法 id 被拒绝", False)
+        except ValueError:
+            ok("非法 id 被拒绝（不会越界删文件）", True)
+        slow = orch.start_run("正在跑不能删", members=[{"engine": "mock-slow", "name": "慢"}])
+        try:
+            orch.delete_run(slow["id"])
+            ok("跑着的任务不能删（先取消）", False)
+        except ValueError as e:
+            ok("跑着的任务不能删（先取消）", "取消" in str(e), repr(e))
+        orch.cancel_run(slow["id"])
+        wait_until(lambda: (orch.get_run(slow["id"]).get("members") or [{}])[0].get("status") == "cancelled", 10)
+        wait_until(lambda: (not any(str(k[0]) == slow["id"] for k in orch._ACTIVE)) or None, 10)
+        ok("取消并收尾后可以删除", orch.delete_run(slow["id"]) is True)
 
         print("\n== 6. 仲裁（reviewer 跑一次，抠「推荐 X」） ==")
         orch.arbitrate(rid, "mock-arb", "评审员")

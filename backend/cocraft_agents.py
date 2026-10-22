@@ -119,7 +119,7 @@ def role_line(role) -> str:
         return ""
     meta = ROLES[r]
     return ("\n\n【你的角色：%s（%s）】\n%s\n"
-            "（群里可能有别的角色同时在干同一件事 —— **只做你这个角色该做的**，别抢别人的活。）"
+            "（同一任务里可能有别的角色同时在干 —— **只做你这个角色该做的**，别抢别人的活。）"
             % (meta["label"], r, meta["brief"]))
 
 
@@ -644,6 +644,80 @@ def changes(chat, aid) -> dict:
     return res
 
 
+PERM_LOG_FILE = os.path.join(STATE_DIR, "_cc_perm_log.json")
+_PERM_LOG_LOCK = threading.Lock()
+PERM_LOG_MAX = 500
+
+
+def _perm_log_add(aid, chat, entry) -> None:
+    """记一条「权限申请 → 谁批准 / 拒绝 / 超时 / 按等级自动放行」的审计（落盘，重启不丢）。
+
+    ⚠ 只记**结论**（一次申请一条），不记"正在等" —— 待批由前端从群消息里推。
+    ★ 刻意保留**命令原文 / 路径 / 拥有者 id / 回复原话**：
+      「谁批准了什么」必须能追溯到具体那一条，不能只给统计（信任面板的红线）。
+    """
+    try:
+        a = find(aid) or {}
+    except Exception:  # noqa: BLE001
+        a = {}
+    rec = {
+        "id": "pm-%d" % time.time_ns(),
+        "ts": time.time(),
+        "chat": "" if chat is None else str(chat),
+        "aid": str(aid or ""),
+        "agent": str(a.get("display") or a.get("name") or aid or ""),
+        "owner": str(entry.get("owner") or ""),
+        "kind": str(entry.get("kind") or ""),
+        "title": str(entry.get("title") or "")[:300],
+        "cmd": str(entry.get("cmd") or "")[:300],
+        "paths": [str(x)[:300] for x in (entry.get("locations") or [])[:8]],
+        "destructive": bool(entry.get("destructive")),
+        "verdict": str(entry.get("verdict") or ""),      # once / always / reject / auto
+        "by": str(entry.get("by") or ""),                # owner / level / timeout / no-ctx / send
+        "reply": str(entry.get("reply") or "")[:160],
+    }
+    try:
+        with _PERM_LOG_LOCK:
+            try:
+                with open(PERM_LOG_FILE, "r", encoding="utf-8") as fh:
+                    arr = json.load(fh)
+            except Exception:  # noqa: BLE001
+                arr = []
+            if not isinstance(arr, list):
+                arr = []
+            arr.append(rec)
+            arr = arr[-PERM_LOG_MAX:]
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = PERM_LOG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(arr, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, PERM_LOG_FILE)
+    except Exception:  # noqa: BLE001
+        pass                  # 审计落盘失败绝不能挡住权限流程本身
+
+
+def perm_log(limit: int = 80) -> list:
+    """最近的权限审计（新 → 旧）。读不到回空列表。"""
+    try:
+        with _PERM_LOG_LOCK:
+            with open(PERM_LOG_FILE, "r", encoding="utf-8") as fh:
+                arr = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(arr, list):
+        return []
+    out = [r for r in arr if isinstance(r, dict)]
+
+    def _ts(r):
+        try:
+            return float(r.get("ts") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    out.sort(key=_ts, reverse=True)      # 坏 ts 不让整个接口 500
+    return out[:max(1, int(limit))]
+
+
 def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
                     cmd="", destructive=False, ws_root="") -> str:
     """把权限申请发到群里，**只等 agent 拥有者**回复。
@@ -657,7 +731,10 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
       把这条命令要动的目标复制进面板隔离区 `runtime/quarantine/`，之后可一键恢复（不走 OS 回收站）。
     """
     if level_ok and not destructive:
-        return "always"                       # 等级已放行 → 不打扰拥有者（破坏性除外：永远要问）
+        # 等级已放行 → 不打扰拥有者（破坏性除外：永远要问）。
+        # ⚠ **不写审计**：这类是"策略自动放行"，不是"谁批准了"；写进去会把真正的审批记录冲掉，
+        #   而且每个读/命令都重写一遍审计文件（IO 放大）。活动流里已经能看到这些操作。
+        return "always"
     # ★ 建桥 / 冷启动太早 → **等 perm_ctx 就绪**（WS 连上、群已知），别静默拒绝。
     owner, ws, chat = _perm_ctx_now(aid)
     t_w = time.time()
@@ -671,12 +748,16 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
     if not owner or not ws or chat is None:
         acp_log("[cocraft-agents] %s 权限：等了 %.0fs 仍拿不到 owner/ws → 保守拒绝"
                 % (aid, time.time() - t_w))
+        _perm_log_add(aid, chat or "", {"kind": kind, "title": title, "cmd": cmd,
+                                       "locations": locations, "destructive": destructive,
+                                       "verdict": "reject", "by": "no-ctx"})
         return "reject"
     if time.time() - t_w >= 0.5:
         acp_log("[cocraft-agents] %s 权限：等到 perm_ctx 就绪（%.1fs）后发到群里"
                 % (aid, time.time() - t_w))
     paths = "、".join(str(x) for x in (locations or [])[:4])
     budget = ask_timeout()
+    # ★ 等 perm_ctx 的这段时间里注册表可能刚落盘 —— 重读一次，别用空名字发申请
     a = find(aid) or {}
     aname = str(a.get("name") or "")
     cmdtxt = " ".join(str(cmd or "").split())[:300]
@@ -691,6 +772,9 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
               + ("；回「始终可以」则以后同类不再问"
                  if not destructive else ""), int(budget)))
     if not _send_message(aid, chat, tip):
+        _perm_log_add(aid, chat, {"kind": kind, "title": title, "cmd": cmd,
+                                  "locations": locations, "destructive": destructive,
+                                  "owner": owner, "verdict": "reject", "by": "send"})
         return "reject"
     # ★C1：权限申请也进活动流（前端画「正在申请权限」那张卡）
     _ptcid = "perm-%d" % int(time.time() * 1000)
@@ -727,11 +811,21 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
                             # ★ 可逆执行：**放行前**先隔离（不信 OS 回收站）
                             _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root)
                         _act_finish(chat, _ptcid, "allowed", detail="拥有者回复：%s" % c[:120])
+                        _perm_log_add(aid, chat, {"kind": kind, "title": title, "cmd": cmd,
+                                                  "locations": locations,
+                                                  "destructive": destructive,
+                                                  "owner": owner, "verdict": v,
+                                                  "by": "owner", "reply": c})
                         return v
                     if _DENY.search(c):
                         _seen_push(fr.get("id"))
                         _send_message(aid, chat, "⛔ 已拒绝：" + title)
                         _act_finish(chat, _ptcid, "denied", detail="拥有者回复：%s" % c[:120])
+                        _perm_log_add(aid, chat, {"kind": kind, "title": title, "cmd": cmd,
+                                                  "locations": locations,
+                                                  "destructive": destructive,
+                                                  "owner": owner, "verdict": "reject",
+                                                  "by": "owner", "reply": c})
                         return "reject"
             leftovers.append(fr)           # 别人说的 / 别的会话 → 留给主循环
     finally:
@@ -743,6 +837,9 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
             except Exception: pass
     _send_message(aid, chat, "⌛ 权限申请超时（%d 秒无人批准），已拒绝：%s" % (int(budget), title))
     _act_finish(chat, _ptcid, "timeout")
+    _perm_log_add(aid, chat, {"kind": kind, "title": title, "cmd": cmd,
+                              "locations": locations, "destructive": destructive,
+                              "owner": owner, "verdict": "reject", "by": "timeout"})
     return "reject"
 
 
@@ -795,10 +892,6 @@ def _patch(aid, **kv) -> dict:
     return out
 
 
-_DANGER_RE = re.compile(r"danger|full[-_ ]?access|bypass|yolo|never[-_ ]?ask|unrestricted|skip.*approv", re.I)
-_PERMK_RE = re.compile(r"permission|approval|sandbox|mode|yolo|trust|autonomy", re.I)
-
-
 def guard_note(engine) -> str:
     """这个「大脑」会不会请求权限？
 
@@ -821,9 +914,11 @@ def guard_note(engine) -> str:
         env.update(entry.get("env") or {})
     except Exception:  # noqa: BLE001
         env = {}
-    for k, v in env.items():
-        if _PERMK_RE.search(str(k)) and _DANGER_RE.search(str(v or "")):
-            return "该大脑声明「%s=%s」→ 它不请求权限，权限等级与群审批对它不生效" % (k, v)
+    # 与注册表的安全兜底共用同一套判据（免得两边正则各写一份、慢慢走偏）
+    hits = acp_agents.dangerous_env(env)
+    if hits:
+        k, v = hits[0]
+        return "该大脑声明「%s=%s」→ 它不请求权限，权限等级与群审批对它不生效" % (k, v)
     return ""
 
 
@@ -982,10 +1077,12 @@ def _build_bridge(aid) -> dict:
     entry = acp_agents.find_agent(reg, eng)
     if not entry:
         raise RuntimeError("绑定的引擎不存在：%s" % eng)
-    b = acp_agents.baseline()
+    b = acp_agents.effective_baseline(entry)   # ★agent 自己的 mode 覆盖基线（与 engine 一致）
     env = {}
     env.update(b.get("env") or {})
     env.update(entry.get("env") or {})
+    # ★安全兜底（第 ② 层）：群聊大脑也不允许静默用「永不问」模式
+    env, _sec_fixes = acp_agents.sanitize_agent_env(entry.get("id"), env)
     cfg_cwd = entry.get("cwd") or b.get("cwd") or ""
     t_build = time.time()
     svc = AcpService(list(entry.get("command") or []), cwd=cfg_cwd, env=env, log=acp_log,

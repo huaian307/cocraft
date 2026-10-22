@@ -44,7 +44,7 @@ backend/server.py  ──  engines.active_engine() 分派
 | `backend/acp_mock_agent.py` | **开发用假 agent**（说 ACP v1），不需要任何外部运行时；已覆盖 plan / usage / 工具进度 / 权限（含 allow_always）/ `session/list` |
 | `tools/acp_demo.py` | 一键联调：独立端口起面板（不动线上 8787 / 不改全局引擎） |
 | `tools/acp_engine_ui_test.py` | 无头交互测试：真在浏览器里切换引擎并验证 SSE 重连 |
-| `tools/acp_events_test.py` | ★无头回归：真拉起假 agent，逐条断言事件映射 / 用量 / 记忆 / 导入（46 项） |
+| `tools/acp_events_test.py` | ★无头回归：真拉起假 agent，逐条断言事件映射 / 用量 / 记忆 / 导入（48 项） |
 | `tools/acp_api_test.py` | ★无头回归：起真 `server.py`（临时端口 + 假 agent，进程内注入）打 `/api/*`，专抓路由互相遮挡（25 项） |
 
 ## 3. 接口契约（`base.Engine`）
@@ -94,7 +94,7 @@ class Engine:
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /api/session/remote?cwd=&cursor=` | 列出 **agent 侧**已有会话（`session/list`），每条带 `imported` / `localID`；不支持时回 `{supported:false, error}` |
+| `GET /api/session/remote?cwd=&cursor=&internal=` | 列出 **agent 侧**已有会话（`session/list`），每条带 `imported` / `localID`；默认**隐藏内部会话**（群聊 AI 成员 / 本地协作），`internal=1` 给全量并带 `internal` 标记 + `internalCount`；不支持时回 `{supported:false, error}` |
 | `POST /api/session/import` `{id, title?}` | 把一条 agent 会话「领」进面板（幂等）；只建指向它的本地记录，**不复制历史**（ACP 没有读别人消息的接口） |
 | `GET /api/permission/always?session=` | 列出「始终允许」的记忆规则 |
 | `DELETE /api/permission/always` `{session?,kind?,id?}` | 清记忆；都不给 = 全清（回 `{ok, removed}`） |
@@ -192,10 +192,16 @@ fork:{}, …}`，所以能列出 **Codex 客户端里聊过的那些会话**（"
 
 1. `supports_session_list()` —— ⚠ **只能判"键在不在"**：宣告值常是**空对象** `{}`，
    `bool({})` 是 `False`，会把支持的 agent 误判成不支持。
-2. `list_remote()` → `{supported, sessions:[{id,title,cwd,updatedAt,imported,localID}], cursor}`
+2. `list_remote(cwd=None, cursor="", include_internal=False)` → `{supported, sessions:[{id,title,cwd,updatedAt,internal,imported,localID}], cursor, total, internalCount}`
+   - **默认 `include_internal=False`**：隐藏**面板内部**的会话（群聊 AI 成员 / 本地协作 Runner），
+     否则「接续」列表会被几十条 `【你的角色：…】` 淹没。
+   - 内部会话识别三路：桥的 `_cocraft_bridge_sessions.json`、`_orchestrator/runs/<run>/*.sessions.json`、
+     标题特征（`【你的角色：` / `你是群聊成员` / `【最近的群聊记录】` / `群聊AI·` / `协作·` / `【仲裁】`）。
+   - 前端「接续」弹窗分「项目会话 / 内部会话」两个标签；接续内部会话会二次确认。
 3. `import_remote(id, title?)` → 建一条指向该 agent 会话的本地记录（`agentSessionId=id`），
    并 `session/resume` 接回一次以收回模型/审批模式；**历史不复制**（ACP 没有读消息的接口），
    所以导入后会话里是空的，但 agent 那边上下文还在，接着聊即可。
+   - 它自己核对 cwd 时用 `list_remote(include_internal=True)`，不会因为默认过滤而找不到内部会话。
 4. 再导一次同一个 id 是**幂等**的（回同一条本地会话）。
 
 ## 5. 一键联调
@@ -250,7 +256,7 @@ python tools\acp_demo.py            :: 默认 http://127.0.0.1:8799
 仓库里的回归脚本：
 
 ```bat
-python tools\acp_events_test.py       :: ★无头：真拉起假 agent，断言事件/用量/记忆/导入（46 项）
+python tools\acp_events_test.py       :: ★无头：真拉起假 agent，断言事件/用量/记忆/导入（48 项）
 python tools\acp_api_test.py          :: ★无头：起真 server.py 打 /api/*，抓路由遮挡（25 项）
 python tools\acp_engine_ui_test.py    :: 无头交互：切换引擎 + 验证 SSE 重连
 python tools\check_features.py        :: 功能体检（含 29 条 ACP 后端断言，共 267 项）
@@ -411,11 +417,31 @@ provider 写死成 `deepseek`，换个 agent 就贴错牌子；改成中性又�
    - **现在的配置 = `workspace-write`**（`_acp_agents.json` → `dsh.env.DSH_PERMISSION_MODE`）。实测行为：
      **工作区（+ 系统 TEMP）内免问直接做；区外会发 `session/request_permission`（"提高等级"）**，拒了就写不进去
      ⇒ **面板权限等级 / 群聊拥有者审批管得住 dsh**（2026-10-12 用真实注册表复测：区外写 → 1 次申请 → 拒绝 → 文件未创建）。
+   - ⚠ **2026-10-19 复核发现过一次回归**：当前 `_acp_agents.json` 里又变成了 `danger-full-access`
+     （根因：**旧的 `_acp.json` 里一直留着 full-access** —— 注册表一旦被重建/覆盖，bootstrap 会从它把 dsh 收回来）。
+     已同时改回：`_acp_agents.json` **和** `_acp.json` 都写 `workspace-write`（各自留了
+     `.bak-before-dsh-sandbox` 备份）；并当场用真实 dsh 复测：
+     **工作区内 → `DSH-OK` 正常；区外写 → 弹出「工具调用」申请 → 拒绝 → dsh 自报"被文件沙箱拒绝"，文件未创建**。
+     ⇒ 现在配置与文档一致；**以后如果 dsh 又"不问就干"，先查这两个 json 的 `DSH_PERMISSION_MODE`**。
+   - **★代码级兜底（`0.2.3` 起，不再只靠手动改配置）**：
+     ① `agents.load_registry()` / `update_agent()` / `add_agent()` **读/写时就地纠正**危险值并落盘；
+     ② `engine.config()` / 本地协作 Runner / 群聊桥在**拼子进程 env 前再兜一次**；
+     ③ `agents.public()` 回 `dangerous / dangerousNote`，agentlist **红字**提示。
+     显式放行（默认关）二选一：`runtime/state/_security.json` → `{"allowDangerousAgents": true}`，
+     或 env `COCRAFT_ALLOW_DANGEROUS_AGENTS=1`；放行后仍会标红警告。
+     每次纠正写一行 `runtime/logs/security.log`。回归 `tools/agent_safety_test.py`（22 项）。
      ⚠ 同一个变量**也**决定审批策略（`cordis.default.yml`：`danger-full-access` → `policy:'never'`）→
      写 full-access 就等于"永不问"，等级与群审批对它**全部失效**（桥会给这种大脑加 `warn` 红字）。
      ⚠ 代价：可写集合 = 工作区 + `os.tmpdir()`（**临时目录永远可写**）；Windows ACL 是 **partial enforcement**
      （受限令牌保留 Everyone、NTFS 硬链接可绕）；fs 工具是**策略层围栏**（README 自己写明"不是安全边界"），
      bash 才是内核级（受限令牌）。沙箱不可用时它**拒绝执行**、**不会静默降级**（真遇到再切回 full-access）。
+   - **★上下文估算（`0.2.4`）**：dsh 只在 `session/prompt` 结果里给 `usage`，不发 `usage_update`。
+     面板现在用本轮 usage 估一个 `context {used, size:0, estimated:true}`（优先 `totalTokens`，
+     否则 input+output），并推 `session.usage.update` → 输入框显示 **「上下文 ~N」**。
+     `size` 保持 0（**不编窗口上限**，所以不显示「剩 X%」）；真实 `usage_update` 到达时绝不覆盖。
+   - **斜杠命令**：dsh-acp **没有实现 `available_commands_update`，也没有命令解析** →
+     技能弹窗里的「斜杠命令」永远为空（现在是如实说明，不再说"跑过一轮就有"）。
+     要真正有命令只能改 dsh-acp（fork/PR）或加面板自己的快捷命令（那不是 dsh 的命令）。
    - `spawn bash` 需要 **Git 的 bash 在 PATH**：本机 Git 装在 `D:\Git`，而 PATH 只有 `D:\Git\cmd`。
      **已改成自动探测**：`process.py` 的 `_git_bin_dirs()`（按 PATH 里的 git.exe 反推 + 常见安装位置）
      + `_inject_git_path()` 在起子进程时自动把 `D:\Git\bin`、`usr\bin`、`mingw64\bin` 等补进 PATH —— **不用手配**。

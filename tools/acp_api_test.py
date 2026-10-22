@@ -130,7 +130,15 @@ def main() -> int:
         check("GET /api/session/remote 200", st == 200, str(js)[:200])
         check("supported = true", (js or {}).get("supported") is True, str(js)[:200])
         rlist = (js or {}).get("sessions") or []
-        check("2 remote sessions", len(rlist) == 2, str(js)[:200])
+        check("2 project sessions (internal hidden by default)", len(rlist) == 2, str(js)[:200])
+        check("internal count reported", int((js or {}).get("internalCount") or 0) == 1,
+              str(((js or {}).get("total"), (js or {}).get("internalCount"))))
+        st, jall = call("GET", "/api/session/remote?internal=1")
+        rall = (jall or {}).get("sessions") or []
+        check("?internal=1 returns all 3 + internal flags",
+              st == 200 and len(rall) == 3
+              and sum(1 for x in rall if x.get("internal")) == 1,
+              str(jall)[:240])
         rid = rlist[0]["id"] if rlist else ""
 
         st, js2 = call("POST", "/api/session/import", {"id": rid})

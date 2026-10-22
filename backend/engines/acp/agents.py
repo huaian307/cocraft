@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 
 from .. import STATE_DIR
@@ -30,6 +31,29 @@ ROOT_DIR = os.path.dirname(os.path.dirname(STATE_DIR))
 
 AGENTS_FILE = os.path.join(STATE_DIR, "_acp_agents.json")
 LEGACY_FILE = os.path.join(STATE_DIR, "_acp.json")
+SECURITY_FILE = os.path.join(STATE_DIR, "_security.json")
+
+# ---------------- ★安全策略：不允许「永不问」的 agent 静默运行 ----------------
+# 背景（2026-10-19 复核）：dsh 的 `DSH_PERMISSION_MODE` 曾经回退成 `danger-full-access` ——
+# 那种模式下 dsh **根本不发 session/request_permission**，面板的权限等级 / 群聊拥有者审批
+# 对它全部失效。更阴的是旧的 `_acp.json` 里一直留着这个值：注册表只要被重建/覆盖，
+# bootstrap 就会把 dsh 连同「全权限」一起收回来。
+#
+# 所以这里做**三层兜底**：
+#   ① `load_registry()` / `update_agent()` / `add_agent()`：读/写时就地纠正并落盘；
+#   ② `engine.config()` / orchestrator / 群聊桥：拼出给子进程的 env 前再纠正一次
+#      （防调用方拿着旧 dict 绕过第 ① 层）；
+#   ③ `public()` 把 `dangerous` 标记回给前端 → agentlist 显示红字。
+# 真要「全权限」必须**显式**开启：env `COCRAFT_ALLOW_DANGEROUS_AGENTS=1`
+# 或 `runtime/state/_security.json` → `{"allowDangerousAgents": true}`。
+DANGER_ENV_RE = re.compile(
+    r"danger|full[-_ ]?access|bypass|yolo|never[-_ ]?ask|unrestricted|skip.*approv", re.I)
+PERM_ENV_KEY_RE = re.compile(r"permission|approval|sandbox|mode|yolo|trust|autonomy", re.I)
+
+# 已知 agent 的「安全默认值」。其它 agent（codex/claude/opencode）的模式不是靠 env 表达，
+# 不能瞎改；它们的危险模式由 `guard_note()` 报警。
+SAFE_ENV = {"dsh": {"DSH_PERMISSION_MODE": "workspace-write"}}
+ALLOW_DANGER_ENV = "COCRAFT_ALLOW_DANGEROUS_AGENTS"
 
 
 def _read_json(path: str) -> dict:
@@ -39,6 +63,92 @@ def _read_json(path: str) -> dict:
         return d if isinstance(d, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _security_log(msg: str) -> None:
+    """安全相关的事写一行日志（别只在界面上闪一下）。"""
+    try:
+        d = os.path.join(ROOT_DIR, "runtime", "logs")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "security.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def allow_dangerous_agents() -> bool:
+    """是否**显式**允许「永不问」的 agent（默认否）。"""
+    v = str(os.environ.get(ALLOW_DANGER_ENV) or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return bool(_read_json(SECURITY_FILE).get("allowDangerousAgents"))
+
+
+def dangerous_env(env: dict) -> list:
+    """env 里「权限/审批/沙箱」相关的危险值 → [(key, value)]。"""
+    out = []
+    for k, v in (env or {}).items():
+        if PERM_ENV_KEY_RE.search(str(k)) and DANGER_ENV_RE.search(str(v or "")):
+            out.append((str(k), str(v)))
+    return out
+
+
+def sanitize_agent_env(agent_id, env, allow=None) -> tuple:
+    """就地把已知 agent 的「永不问」模式改成安全值。返回 `(env, fixes)`。
+
+    * 默认只处理 `SAFE_ENV` 里列出的 agent（目前只有 dsh）；
+    * `allow=True`（显式放行）时**原样返回**；
+    * `fixes` 每项 = `{key, from, to}`，供日志 / 测试核对。
+    """
+    aid = str(agent_id or "")
+    safe = SAFE_ENV.get(aid)
+    out = dict(env or {})
+    if not safe:
+        return out, []
+    if allow is None:
+        allow = allow_dangerous_agents()
+    if allow:
+        return out, []
+    fixed = []
+    dangers = dict(dangerous_env(out))
+    for k, val in safe.items():
+        if k in dangers:
+            fixed.append({"key": k, "from": out.get(k), "to": val})
+            out[k] = val
+        elif k not in out:
+            # 显式补上安全值：让配置文件自己就有据可查（dsh 的默认也是 workspace-write）
+            out[k] = val
+            fixed.append({"key": k, "from": None, "to": val})
+    return out, fixed
+
+
+def sanitize_registry(reg: dict, allow=None) -> list:
+    """纠正整个注册表里的危险模式（只动 SAFE_ENV 里已知的 agent）。返回 fixes。"""
+    if not isinstance(reg, dict):
+        return []
+    if allow is None:
+        allow = allow_dangerous_agents()
+    fixes = []
+    for a in (reg.get("agents") or []):
+        if not isinstance(a, dict):
+            continue
+        env, f = sanitize_agent_env(a.get("id"), a.get("env"), allow=allow)
+        if f:
+            a["env"] = env
+            for x in f:
+                x = dict(x)
+                x["agent"] = a.get("id")
+                fixes.append(x)
+    return fixes
+
+
+def security_note(a: dict) -> str:
+    """给前端看的一句话（空串 = 正常）。"""
+    hit = dangerous_env((a or {}).get("env") or {})
+    if not hit:
+        return ""
+    k, v = hit[0]
+    return "危险：%s=%s —— 该 agent 不请求权限，面板等级 / 群审批对它无效" % (k, v)
 
 
 def _node_from(legacy: dict) -> str:
@@ -149,10 +259,11 @@ def bootstrap() -> dict:
     legacy = _read_json(LEGACY_FILE)
     agents = []
     if legacy.get("command"):
+        legacy_env, _legacy_fixes = sanitize_agent_env("dsh", legacy.get("env") or {})
         agents.append({
             "id": "dsh", "label": "DeepSeek Harness（dsh-acp）", "builtin": True,
             "command": legacy.get("command"), "cwd": legacy.get("cwd") or "",
-            "env": legacy.get("env") or {}, "note": "来自旧的 _acp.json 配置",
+            "env": legacy_env, "note": "来自旧的 _acp.json 配置",
         })
     agents.extend(_codex_defaults(legacy))
     agents.extend(_claude_defaults(legacy))
@@ -189,6 +300,13 @@ def load_registry() -> dict:
     reg = _read_json(AGENTS_FILE)
     if not (isinstance(reg.get("agents"), list) and reg.get("agents")):
         reg = bootstrap()
+    # ★安全兜底：读的时候就纠正「永不问」模式，并落盘（旧 _acp.json / 手工编辑都绕不过）
+    fixes = sanitize_registry(reg)
+    if fixes:
+        save_registry(reg)
+        _security_log("[安全] 已把危险权限模式改回安全值：" + ", ".join(
+            "%s.%s: %s → %s" % (x.get("agent"), x.get("key"), x.get("from"), x.get("to"))
+            for x in fixes))
     return reg
 
 
@@ -227,6 +345,22 @@ def baseline() -> dict:
     """所有 agent 共享的基线（cwd / env / mode）——避免每个 agent 各配一份。"""
     b = load_registry().get("baseline")
     return b if isinstance(b, dict) else {}
+
+
+def effective_baseline(entry) -> dict:
+    """把 agent 自己的 `mode` 合并进基线（**agent 覆盖基线**）。
+
+    ⚠ 为什么需要：不同 agent 的模式名不一样（Codex：read-only / agent /
+      agent-full-access；OpenCode：build / plan），全局只写一个 baseline.mode
+      总会有 agent 对不上。engine.py 一直这么做，但**工作台 / 群聊桥**当初没有合并，
+      结果 codex 在协作里拿的是 Codex 默认的 `agent`（Approve for me）→ 内建
+      `codex-auto-review` 审每条命令 → DeepSeek 不认这个模型 → 连只读命令都被拒。
+    """
+    b = dict(baseline())
+    mode = str((entry or {}).get("mode") or "").strip()
+    if mode:
+        b["mode"] = mode
+    return b
 
 
 def _slug(label: str) -> str:
@@ -911,6 +1045,10 @@ def add_agent(label: str, command, cwd: str = "", env: dict = None, note: str = 
          "provider": str(provider or "")}
     if not a["provider"]:                      # 没手填 → 从命令/env 猜一个（猜不出就留空）
         a["provider"] = guess_provider(a)
+    env, fixes = sanitize_agent_env(aid, a.get("env"))
+    if fixes:
+        a["env"] = env
+        _security_log("[安全] 新增 agent 的危险权限模式已改回安全值（%s）" % aid)
     reg.setdefault("agents", []).append(a)
     save_registry(reg)
     return a
@@ -983,6 +1121,12 @@ def update_agent(aid: str, patch: dict) -> dict:
     for k in ("label", "command", "cwd", "env", "note", "provider", "mode"):
         if k in patch and patch[k] is not None:
             a[k] = patch[k]
+    # ★写的时候也纠正：用户/接口把 dsh 改成 danger-full-access 也不会真的生效（除非显式放行）
+    env, fixes = sanitize_agent_env(aid, a.get("env"))
+    if fixes:
+        a["env"] = env
+        _security_log("[安全] 拒绝写入危险权限模式（%s）：%s" % (
+            aid, ", ".join("%s=%s" % (x.get("key"), x.get("from")) for x in fixes)))
     save_registry(reg)
     return a
 
@@ -1206,17 +1350,34 @@ def autofill(reg: dict = None, save: bool = True) -> dict:
 # ---------------- 「可用」到底怎么算（按类型看真依赖）----------------
 
 _det_cache = {"t": 0.0, "val": None}
+_det_lock = threading.Lock()
 
 
-def detect_all_cached(max_age: float = 15.0) -> dict:
-    """detect_all 会扫目录，做个 15s 缓存，别每次轮询都扫。"""
+def detect_all_cached(max_age: float = 300.0) -> dict:
+    """`detect_all()` 要扫盘（实测 1~9s，取决于磁盘/杀软），所以做缓存。
+
+    ⚠ 缓存时间不能短：以前是 **15s** —— 打开 agent 列表时一旦过期就要**同步重扫**，
+      用户看到的就是「点开 agentlist 卡好几秒 / 切 agent 卡」。
+      现在默认 **5 分钟**，并且**从检测完成时开始计时**（长扫描不会把 TTL 吃掉）。
+      需要立刻重新探测的地方（「扫描本机」/自动检测）自己调 `invalidate_detect_cache()`。
+    """
     now = time.time()
     if _det_cache["val"] and (now - _det_cache["t"]) < max_age:
         return _det_cache["val"]
-    val = detect_all()
-    _det_cache["t"] = now
-    _det_cache["val"] = val
-    return val
+    with _det_lock:                     # 并发请求只扫一次（否则会几路同时扫盘，更慢）
+        now = time.time()
+        if _det_cache["val"] and (now - _det_cache["t"]) < max_age:
+            return _det_cache["val"]
+        val = detect_all()
+        _det_cache["t"] = time.time()
+        _det_cache["val"] = val
+        return val
+
+
+def invalidate_detect_cache() -> None:
+    """让下一次探测重新扫盘（用户点「扫描本机 / 自动检测」时用）。"""
+    with _det_lock:
+        _det_cache["t"] = 0.0
 
 
 def _kind(a: dict) -> str:
@@ -1296,4 +1457,7 @@ def public(a: dict, det: dict = None) -> dict:
         "mode": str(a.get("mode") or ""),
         # 没配时给一个「猜出来的」建议（前端编辑框可一键填入；不写入注册表）
         "providerGuess": "" if str(a.get("provider") or "").strip() else guess_provider(a),
+        # ★安全：这个 agent 是否声明了「永不问」的权限模式（正常应为空）
+        "dangerous": bool(dangerous_env(a.get("env") or {})),
+        "dangerousNote": security_note(a),
     }

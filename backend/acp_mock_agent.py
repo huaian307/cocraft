@@ -31,12 +31,15 @@ for _s in (sys.stdin, sys.stdout):
         pass
 
 STATE = {"sid": "", "prompt_id": None, "client_caps": {}, "turn": 0}
-# session/list 用的两条"agent 侧已有会话"
+# session/list 用的三条"agent 侧已有会话"（第三条是**内部会话**：群聊 / 本地协作那种）
 REMOTE = [
     {"sessionId": "remote_alpha", "cwd": "D:/agentlist/shared", "title": "整理共享工作区",
      "updatedAt": "2026-09-26T02:10:00Z"},
     {"sessionId": "remote_beta", "cwd": "D:/agentlist/shared", "title": "",
      "updatedAt": "2026-09-25T23:00:00Z"},
+    {"sessionId": "remote_internal", "cwd": "D:/agentlist/shared",
+     "title": "【你的角色：实现者】只回复 OK 两个字母",
+     "updatedAt": "2026-10-20T08:00:00Z"},
 ]
 
 MODEL_OPTS = {"id": "model", "name": "Model", "category": "model", "type": "select",

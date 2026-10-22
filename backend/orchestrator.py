@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -33,11 +34,14 @@ from engines.acp.service import AcpService, BusyError, _load_ok_models
 
 ROOT = os.path.join(STATE_DIR, "_orchestrator")
 RUNS_DIR = os.path.join(ROOT, "runs")
+WORKFLOWS_FILE = os.path.join(STATE_DIR, "_collab_workflows.json")   # ★可复用的工作流（成员/默认任务/画布布局）
+KEEP_WORKFLOWS = 200
 KEEP_RUNS = 60
 ASK_TIMEOUT = float(os.environ.get("COCRAFT_ORCH_ASK_TIMEOUT") or 180)   # 等批准（秒）
 RUN_TIMEOUT = float(os.environ.get("COCRAFT_ORCH_TIMEOUT") or 600)       # 单个成员上限（秒）
 
 _LOCK = threading.RLock()
+_WF_LOCK = threading.RLock()
 _RUNS: dict = {}          # run_id -> run dict（内存权威；落盘用于重启后查看）
 _ACTIVE: dict = {}        # (run_id, member_id) -> {"svc":..., "sid":...}
 _CANCEL: dict = {}        # (run_id, member_id) -> Event
@@ -83,7 +87,7 @@ def _member_public(m: dict) -> dict:
     return {k: m.get(k) for k in
             ("id", "name", "role", "roleLabel", "engine", "status", "output", "error",
              "created", "started", "ended", "tokens", "context", "activities",
-             "kind", "sessionID", "cancelled", "files", "pick")}
+             "kind", "sessionID", "cancelled", "files", "pick", "permLevel")}
 
 
 def public_run(run: dict) -> dict:
@@ -91,6 +95,8 @@ def public_run(run: dict) -> dict:
         return {}
     return {"id": run.get("id"), "task": run.get("task"), "cwd": run.get("cwd"),
             "title": run.get("title"), "status": run.get("status"),
+            "workflowId": run.get("workflowId") or "",
+            "workflowName": run.get("workflowName") or "",
             "created": run.get("created"), "updated": run.get("updated"),
             "members": [_member_public(m) for m in (run.get("members") or [])],
             # 全部申请（pending + 已结算）都回；「谁批准了什么」要能追溯
@@ -100,19 +106,40 @@ def public_run(run: dict) -> dict:
 
 
 def list_runs(limit: int = 30) -> list:
+    """最近任务：**内存 + 磁盘一起**（打开某条历史后它也进了内存，不能因此把别的历史挤掉）。
+
+    列表多回 `done / failed / running` 三个计数：工作台左栏直接写「3/3 完成」，
+    不用为每一条再拉一次详情。
+    """
     with _LOCK:
         runs = list(_RUNS.values())
-    if not runs and os.path.isdir(RUNS_DIR):
-        for name in sorted(os.listdir(RUNS_DIR), reverse=True)[:limit]:
-            if name.endswith(".json"):
-                d = _load_file(name[:-5])
-                if d:
-                    runs.append(d)
+    have = {str(r.get("id") or "") for r in runs}
+    if os.path.isdir(RUNS_DIR):
+        for name in sorted(os.listdir(RUNS_DIR), reverse=True)[:max(limit * 2, 40)]:
+            if not name.endswith(".json"):
+                continue
+            rid = name[:-5]
+            if rid in have:
+                continue
+            d = _load_file(rid)
+            if d:
+                runs.append(d)
+                have.add(rid)
     runs.sort(key=lambda r: r.get("created") or 0, reverse=True)
-    return [{"id": r.get("id"), "task": r.get("task"), "title": r.get("title"),
-             "status": r.get("status"), "created": r.get("created"),
-             "updated": r.get("updated"), "members": len(r.get("members") or [])}
-            for r in runs[:limit]]
+    out = []
+    for r in runs[:limit]:
+        ms = r.get("members") or []
+        states = [m.get("status") for m in ms]
+        out.append({"id": r.get("id"), "task": r.get("task"), "title": r.get("title"),
+                    "cwd": r.get("cwd") or "",          # ★左栏要按项目分组/筛选：必须带上工作目录
+                    "workflowId": r.get("workflowId") or "",
+                    "workflowName": r.get("workflowName") or "",
+                    "status": r.get("status"), "created": r.get("created"),
+                    "updated": r.get("updated"), "members": len(ms),
+                    "done": sum(1 for x in states if x == "done"),
+                    "failed": sum(1 for x in states if x in ("failed", "timeout", "cancelled")),
+                    "running": sum(1 for x in states if x in ("wait", "running"))})
+    return out
 
 
 def get_run(run_id: str) -> dict:
@@ -127,7 +154,225 @@ def get_run(run_id: str) -> dict:
     return public_run(run)
 
 
+# ---------------- ★工作流（可复用：成员 / 默认任务 / 画布布局） ----------------
+
+def _wf_pos(v) -> dict:
+    """画布坐标：只存 x/y（设计像素），夹到一个合理范围，坏值当 0。"""
+    try:
+        x = float((v or {}).get("x") or 0)
+        y = float((v or {}).get("y") or 0)
+    except (TypeError, ValueError):
+        x = y = 0.0
+    return {"x": max(-4000.0, min(12000.0, x)),
+            "y": max(-4000.0, min(12000.0, y))}
+
+
+def _wf_clean_members(raw) -> list:
+    """校验/清洗成员（与 start_run 同一口径）。保留 `m1..mN` 形式的 id（画布布局要用）。"""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("至少要有一个成员")
+    if len(raw) > 8:
+        raise ValueError("一次最多 8 个成员")
+    out, used = [], set()
+    for i, r in enumerate(raw):
+        r = r if isinstance(r, dict) else {}
+        engine = str(r.get("engine") or "").strip()
+        if not engine:
+            raise ValueError("成员 #%d 没选引擎" % (i + 1))
+        role = norm_role(r.get("role"))
+        name = re.sub(r"\s+", " ", str(r.get("name") or "").strip())[:24] or ("m%d" % (i + 1))
+        mid = str(r.get("id") or "").strip()
+        if not re.match(r"^m\d+$", mid) or mid in used:
+            mid = "m%d" % (i + 1)
+            while mid in used:
+                mid = "m%d" % (int(mid[1:]) + 1)
+        used.add(mid)
+        out.append({"id": mid, "role": role, "name": name, "engine": engine,
+                    "permLevel": norm_perm_level(r.get("permLevel"))})
+    return out
+
+
+def _wf_load() -> dict:
+    try:
+        with _WF_LOCK:
+            with open(WORKFLOWS_FILE, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {"version": 1, "workflows": []}
+    if not isinstance(d, dict):
+        return {"version": 1, "workflows": []}
+    if not isinstance(d.get("workflows"), list):
+        d["workflows"] = []
+    return d
+
+
+def list_workflows(cwd: str = "") -> list:
+    """工作流列表（按 updated 倒序；cwd 可选过滤，大小写不敏感）。"""
+    d = _wf_load()
+    out = [w for w in (d.get("workflows") or []) if isinstance(w, dict)]
+    if cwd:
+        key = str(cwd).replace("\\", "/").rstrip("/").lower()
+        out = [w for w in out
+               if str(w.get("cwd") or "").replace("\\", "/").rstrip("/").lower() == key]
+    out.sort(key=lambda w: w.get("updated") or 0, reverse=True)
+    return out
+
+
+def save_workflow(data) -> dict:
+    """新建 / 更新一个工作流。`data.id` 为空 = 新建。"""
+    data = data if isinstance(data, dict) else {}
+    name = re.sub(r"\s+", " ", str(data.get("name") or "").strip())[:40] or "未命名工作流"
+    members = _wf_clean_members(data.get("members"))
+    cwd = str(data.get("cwd") or "").strip()
+    task = str(data.get("taskTemplate") or "").strip()[:2000]
+    layout = data.get("layout") if isinstance(data.get("layout"), dict) else {}
+    nodes = {}
+    for k, v in (layout.get("nodes") or {}).items():
+        if isinstance(v, dict):
+            nodes[str(k)[:24]] = _wf_pos(v)
+    try:
+        zoom = float(layout.get("zoom") or 1)
+    except (TypeError, ValueError):
+        zoom = 1.0
+    zoom = max(0.6, min(1.6, zoom))
+    now = _now()
+    with _WF_LOCK:
+        d = _wf_load()
+        wfs = d.get("workflows") or []
+        wid = str(data.get("id") or "").strip()
+        cur = next((w for w in wfs if isinstance(w, dict)
+                    and str(w.get("id")) == wid), None) if wid else None
+        if cur is None:
+            wid = "wf_%s_%s" % (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
+            cur = {"id": wid, "created": now, "runCount": 0, "lastRunId": ""}
+            wfs.append(cur)
+        cur.update({"name": name, "cwd": cwd, "taskTemplate": task,
+                    "members": members, "layout": {"zoom": zoom, "nodes": nodes},
+                    "updated": now})
+        wfs.sort(key=lambda w: w.get("updated") or 0, reverse=True)
+        d["workflows"] = wfs[:KEEP_WORKFLOWS]
+        d["version"] = 1
+        _atomic_write(WORKFLOWS_FILE, d)
+    return dict(cur)
+
+
+def delete_workflow(wid: str) -> bool:
+    """删除工作流。⚠ **不删任何 run**（历史运行保留，只是不再归属）。"""
+    wid = str(wid or "").strip()
+    if not wid or wid.startswith(".") or "/" in wid or "\\" in wid:
+        raise ValueError("非法的工作流 id")
+    with _WF_LOCK:
+        d = _wf_load()
+        wfs = [w for w in (d.get("workflows") or []) if isinstance(w, dict)]
+        left = [w for w in wfs if str(w.get("id")) != wid]
+        if len(left) == len(wfs):
+            return False
+        d["workflows"] = left
+        _atomic_write(WORKFLOWS_FILE, d)
+    return True
+
+
+def duplicate_workflow(wid: str, name: str = "") -> dict:
+    """复制一份（成员 + 默认任务 + 画布布局），新 id、运行计数归零。"""
+    wid = str(wid or "").strip()
+    with _WF_LOCK:
+        d = _wf_load()
+        src = next((w for w in (d.get("workflows") or [])
+                    if isinstance(w, dict) and str(w.get("id")) == wid), None)
+        if not src:
+            raise ValueError("没有这个工作流")
+        cp = json.loads(json.dumps(src))
+        now = _now()
+        cp["id"] = "wf_%s_%s" % (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
+        cp["name"] = re.sub(r"\s+", " ", str(name or "").strip())[:40] or (str(src.get("name") or "") + " 副本")[:40]
+        cp["created"] = now
+        cp["updated"] = now
+        cp["runCount"] = 0
+        cp["lastRunId"] = ""
+        d.setdefault("workflows", []).append(cp)
+        d["workflows"].sort(key=lambda w: w.get("updated") or 0, reverse=True)
+        d["workflows"] = d["workflows"][:KEEP_WORKFLOWS]
+        _atomic_write(WORKFLOWS_FILE, d)
+    return cp
+
+
+def _wf_touch_run(wid: str, rid: str) -> None:
+    """run 启动后，把 lastRunId / runCount 写回工作流（不改成员快照）。"""
+    if not wid:
+        return
+    with _WF_LOCK:
+        d = _wf_load()
+        hit = False
+        for w in (d.get("workflows") or []):
+            if isinstance(w, dict) and str(w.get("id")) == str(wid):
+                w["lastRunId"] = str(rid)
+                w["runCount"] = int(w.get("runCount") or 0) + 1
+                w["updated"] = _now()
+                hit = True
+                break
+        if hit:
+            _atomic_write(WORKFLOWS_FILE, d)
+
+
+def delete_run(run_id: str) -> bool:
+    """删除一条**已结束**的运行记录（JSON + 该任务的成员会话文件）。
+
+    * 还在跑 → 明确拒绝（先「取消全部」，等进程退出再删）；
+    * 不删 agent 侧（opencode-acp 共享库）的会话 —— 那是 agent 自己的数据。
+    """
+    rid = str(run_id or "").strip()
+    if not rid or os.path.basename(rid) != rid or ".." in rid:
+        raise ValueError("非法的任务 id")
+    with _LOCK:
+        run = _RUNS.get(rid) or _load_file(rid)
+        if not run:
+            return False
+        if str(run.get("status") or "") == "running" or any(
+                m.get("status") in ("wait", "running") for m in (run.get("members") or [])):
+            raise ValueError("任务还在跑：先点「取消全部」，等它停下来再删除")
+        if any(str(k[0]) == rid for k in _ACTIVE):
+            raise ValueError("任务还在收尾（agent 进程没退出）：等几秒再删")
+        # 清掉这个任务残留的待批 / 取消标记（正常应该已经空了）
+        for pid in [p for p, v in _PENDING.items() if str(v.get("run")) == rid]:
+            _PENDING.pop(pid, None)
+        for key in [k for k in _CANCEL if str(k[0]) == rid]:
+            _CANCEL.pop(key, None)
+        _RUNS.pop(rid, None)
+    try:
+        os.remove(_run_path(rid))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        acp_log("[orchestrator] 删除运行记录文件失败 %s：%s" % (rid, exc))
+    run_dir = os.path.join(ROOT, "runs", rid)
+    if os.path.isdir(run_dir):
+        try:
+            shutil.rmtree(run_dir)
+        except OSError as exc:
+            acp_log("[orchestrator] 删除运行目录失败 %s：%s" % (rid, exc))
+    acp_log("[orchestrator] 已删除运行记录 %s" % rid)
+    return True
+
+
 # ---------------- 权限队列 ----------------
+
+# ★每个成员可以有自己的权限等级（节点级）：""=跟随面板；trust=信任（非破坏性自动放行）
+PERM_LEVELS = [
+    {"id": "", "label": "跟随面板", "note": "用面板当前等级"},
+    {"id": "ask", "label": "全部询问", "note": "每条命令都问"},
+    {"id": "read", "label": "只读自动", "note": "读自动；写/执行要问"},
+    {"id": "edit", "label": "读写自动", "note": "工作区内读写自动"},
+    {"id": "exec", "label": "执行自动", "note": "工作区内读写执行自动"},
+    {"id": "trust", "label": "信任（非破坏性自动）", "note": "不再逐条问；破坏性操作仍然必须你确认"},
+]
+_PERM_IDS = {x["id"] for x in PERM_LEVELS}
+
+
+def norm_perm_level(v) -> str:
+    """成员权限等级归一；不认识的值回空（= 跟随面板），不猜。"""
+    s = str(v or "").strip().lower()
+    return s if s in _PERM_IDS else ""
+
 
 def _pending_public(p: dict) -> dict:
     return {k: p.get(k) for k in
@@ -170,11 +415,17 @@ def _ask_permission(run: dict, member: dict, kind, title, locations, options, in
     cmd = str((info or {}).get("command") or "")
     destructive = _is_destructive(cmd, title)
     net = _is_net(kind, title, cmd, locations)
-    level = perm_level()
-    ok = (not destructive) and ((net and allow_network())
+    # ★节点级权限：成员自己的 permLevel 优先（"trust" = 非破坏性一律放行，破坏性仍然要问）
+    mlevel = norm_perm_level(member.get("permLevel"))
+    level = mlevel or perm_level()
+    ok = (not destructive) and (mlevel == "trust"
+                                or (net and allow_network())
                                 or allowed_by_level(level, kind, title, cmd, locations,
                                                     run.get("cwd") or ""))
     if ok:
+        if mlevel == "trust":
+            acp_log("[orchestrator] %s/%s 自动放行（成员信任，非破坏性）：%s"
+                    % (run["id"], member["id"], title or kind or ""))
         return "once"
     pid = "operm_%s" % uuid.uuid4().hex[:10]
     p = {"id": pid, "run": run["id"], "member": member["id"],
@@ -242,10 +493,12 @@ def _resolve_engine(engine: str):
     entry = acp_agents.find_agent(reg, engine)
     if not entry:
         raise ValueError("没有这个 ACP agent：%s" % engine)
-    base = acp_agents.baseline()
+    base = acp_agents.effective_baseline(entry)   # ★agent 自己的 mode 覆盖基线（与 engine 一致）
     env = {}
     env.update(base.get("env") or {})
     env.update(entry.get("env") or {})
+    # ★安全兜底（第 ② 层）：本地协作也不允许静默用「永不问」模式
+    env, _sec_fixes = acp_agents.sanitize_agent_env(entry.get("id"), env)
     cwd = str(entry.get("cwd") or base.get("cwd") or "").strip()
     return entry, base, env, cwd
 
@@ -265,12 +518,24 @@ def _assistant_text(svc, sid, mid) -> str:
             continue
         parts = [str(p.get("text") or "") for p in (m.get("content") or [])
                  if isinstance(p, dict) and p.get("type") == "text"]
-        txt = "\n".join(x for x in parts if x).strip()
+        txt = _strip_model_warning("\n".join(x for x in parts if x).strip())
         if txt:
             return txt
         if mid:
             return ""
     return ""
+
+
+_MODEL_WARN_RE = re.compile(
+    r"^\s*Warning: Model metadata for `[^`]*` not found\.[^\n]*\n+", re.I)
+
+
+def _strip_model_warning(text: str) -> str:
+    """Codex 在自定义 provider 下会把「Model metadata … not found」当正文开头（纯噪音）。
+
+    面板本身在渲染时也剥一次；这里再剥一次 → 工作台 / 仲裁 / 对比拿到的都是干净正文。
+    """
+    return _MODEL_WARN_RE.sub("", str(text or "")).strip()
 
 
 def _member_snapshot(svc, sid) -> tuple:
@@ -288,7 +553,9 @@ def _update_run(run: dict) -> None:
             states = [m.get("status") for m in (run.get("members") or [])]
             if states and all(x in ("done", "failed", "timeout", "cancelled") for x in states):
                 done = [x for x in states if x == "done"]
-                if not done:
+                if not done and all(x == "cancelled" for x in states):
+                    run["status"] = "cancelled"
+                elif not done:
                     run["status"] = "failed"
                 elif len(done) == len(states):
                     run["status"] = "done"
@@ -452,11 +719,30 @@ def catalog() -> dict:
         roles, presets = roles_public(), team_presets()
     except Exception:  # noqa: BLE001
         roles, presets = {k: {"label": v.get("label", k)} for k, v in ROLES.items()}, []
-    return {"agents": out, "roles": roles, "presets": presets}
+    return {"agents": out, "roles": roles, "presets": presets,
+            # ★节点级权限等级（画布检查器 / 运行详情里给每个成员单独设）
+            "permLevels": PERM_LEVELS,
+            # 前端要用它算「待批还剩多少秒」；不暴露的话只能猜一个 180
+            "askTimeout": int(ASK_TIMEOUT), "runTimeout": int(RUN_TIMEOUT)}
 
 
-def start_run(task: str, cwd: str = "", members=None, title: str = "") -> dict:
+def start_run(task: str, cwd: str = "", members=None, title: str = "",
+              workflow_id: str = "") -> dict:
+    # ★ 从工作流启动：成员/目录/标题直接用工作流的（成员快照进 run，之后改工作流不影响历史）
+    wf = None
+    if workflow_id:
+        wf = next((w for w in list_workflows() if str(w.get("id")) == str(workflow_id)), None)
+        if wf is None:
+            raise ValueError("工作流不存在（可能已被删除）")
+        if not members:
+            members = wf.get("members")
+        if not str(cwd or "").strip():
+            cwd = wf.get("cwd") or ""
+        if not str(title or "").strip():
+            title = wf.get("name") or ""
     task = str(task or "").strip()
+    if not task and wf:
+        task = str(wf.get("taskTemplate") or "").strip()
     if not task:
         raise ValueError("任务不能为空")
     if not isinstance(members, list) or not members:
@@ -474,12 +760,15 @@ def start_run(task: str, cwd: str = "", members=None, title: str = "") -> dict:
         name = re.sub(r"\s+", " ", str(raw.get("name") or "").strip())[:24] or ("m%d" % (i + 1))
         ms.append({"id": "m%d" % (i + 1), "name": name, "role": role,
                    "roleLabel": (ROLES.get(role) or {}).get("label") or "",
-                   "engine": engine, "status": "wait", "output": "", "error": "",
+                   "engine": engine, "permLevel": norm_perm_level(raw.get("permLevel")),
+                   "status": "wait", "output": "", "error": "",
                    "created": _now(), "started": 0, "ended": 0,
                    "tokens": {}, "context": None, "activities": [],
                    "kind": "member", "sessionID": "", "cancelled": False})
     run = {"id": rid, "task": task, "title": str(title or task)[:80],
            "cwd": str(cwd or "").strip(), "status": "running",
+           "workflowId": str((wf or {}).get("id") or ""),
+           "workflowName": str((wf or {}).get("name") or ""),
            "created": _now(), "updated": _now(), "members": ms,
            "permissions": [], "arbitration": None, "error": ""}
     with _LOCK:
@@ -487,7 +776,13 @@ def start_run(task: str, cwd: str = "", members=None, title: str = "") -> dict:
         _save(run)
     os.makedirs(os.path.join(ROOT, "runs", rid), exist_ok=True)
     _start_threads(run)
-    acp_log("[orchestrator] 开始任务 %s：%d 个成员" % (rid, len(ms)))
+    if wf:
+        try:
+            _wf_touch_run(str(wf.get("id")), rid)
+        except Exception:  # noqa: BLE001
+            pass
+    acp_log("[orchestrator] 开始任务 %s：%d 个成员%s"
+            % (rid, len(ms), ("（工作流 %s）" % wf.get("name")) if wf else ""))
     return public_run(run)
 
 
@@ -512,6 +807,38 @@ def cancel_run(run_id: str, member_id: str = "") -> dict:
         if not member_id:
             run["status"] = "cancelled"
         _save(run)
+    return public_run(run)
+
+
+def set_member(run_id: str, member_id: str, patch) -> dict:
+    """改某个成员的运行时设置（目前只允许 permLevel）。
+
+    ★ 运行中也能改：改完**下一条**权限申请立刻按新等级判（不用重启任务）。
+      （已经挂起的申请不会被自动放行 —— 那一条仍然要你拍板。）
+    """
+    rid = str(run_id or "")
+    mid = str(member_id or "")
+    with _LOCK:
+        run = _RUNS.get(rid)
+    if run is None:
+        run = _load_file(rid)
+        if run:
+            with _LOCK:
+                _RUNS[rid] = run
+    if not run:
+        raise ValueError("没有这个任务：%s" % rid)
+    m = next((x for x in (run.get("members") or []) if str(x.get("id")) == mid), None)
+    if not m:
+        raise ValueError("这个任务没有成员：%s" % mid)
+    patch = patch if isinstance(patch, dict) else {}
+    if "permLevel" in patch:
+        m["permLevel"] = norm_perm_level(patch.get("permLevel"))
+    m["updated"] = _now()
+    run["updated"] = _now()
+    with _LOCK:
+        _save(run)
+    acp_log("[orchestrator] %s/%s 成员权限 -> %s"
+            % (rid, mid, m.get("permLevel") or "跟随面板"))
     return public_run(run)
 
 
@@ -542,7 +869,7 @@ def arbitrate(run_id: str, engine: str, name: str = "审查者") -> dict:
     for m in done:
         label = m.get("name") or m.get("id")
         blocks.append("【方案｜%s（%s）】\n%s" % (label, m.get("roleLabel") or m.get("role") or "成员",
-                                                str(m.get("output") or "").strip()))
+                                                _strip_model_warning(m.get("output") or "")))
     prompt = ("你是本次任务的**审查者**。下面是同一次任务里几位成员的方案，请评审并给出结论。\n"
               "要求：① 每个方案给 1-2 句具体评价（指出问题，不写场面话）；"
               "② 结尾单独一行用「结论：推荐 <方案名>」收口，并说一句为什么；"

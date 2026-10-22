@@ -123,6 +123,16 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
     step("★ACP：用 session.context（剩 50%）", /剩 50%/.test(__txt(chip)), __txt(chip));
     step("★tooltip 标「agent 上报」", /来源：agent 上报的 usage_update/.test(chip.title), chip.title);
 
+    /* ---------- 3′. dsh 这类：只有 prompt usage → 后端估算 ---------- */
+    state.current = { id: "s1", title: "t", model: { id: "deepseek-v4-flash" },
+                      context: { used: 20924, size: 0, estimated: true } };
+    state.messages = [];
+    ctxSync();
+    step("★dsh 估算：显示「上下文 ~2.1 万」，不编百分比",
+         /上下文 ~2\.1 万/.test(__txt(chip)) && !/剩/.test(__txt(chip)), __txt(chip));
+    step("★tooltip 说明是「本轮 tokens 估算」+ 窗口上限未知",
+         /本轮 tokens 估算/.test(chip.title) && /窗口上限未知/.test(chip.title), chip.title);
+
     /* ---------- 4. 事件：session.usage.update 实时更新 ---------- */
     state.current.context = null;
     handleEvent({ type: "session.usage.update",

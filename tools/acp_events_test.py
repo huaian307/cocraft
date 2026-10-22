@@ -225,7 +225,16 @@ def main() -> int:
     print("[6] remote sessions: list + import")
     remote = svc.list_remote()
     check("session/list supported", remote.get("supported") is True, str(remote)[:200])
-    check("two remote sessions listed", len(remote.get("sessions") or []) == 2, str(remote)[:200])
+    check("project sessions only by default (2)", len(remote.get("sessions") or []) == 2,
+          str(remote)[:300])
+    check("internal count reported (1)", int(remote.get("internalCount") or 0) == 1,
+          str((remote.get("total"), remote.get("internalCount"))))
+    allr = svc.list_remote(include_internal=True)
+    check("include_internal returns 3 with internal flag",
+          len(allr.get("sessions") or []) == 3
+          and all(("internal" in x) for x in (allr.get("sessions") or []))
+          and sum(1 for x in (allr.get("sessions") or []) if x.get("internal")) == 1,
+          str(allr)[:300])
     first = (remote.get("sessions") or [{}])[0]
     check("not-imported flagged", first.get("imported") is False, str(first)[:200])
     imported = svc.import_remote(first["id"])
@@ -247,7 +256,85 @@ def main() -> int:
     svc.interrupt(imported["id"])
     drain(q, until_types=("session.execution.succeeded", "session.error"), timeout=20)
 
-    print("[7] cleanup")
+    print("[7] running turn: 中途补充要求 → 排队，本轮结束自动投递")
+    qenv = dict(os.environ)
+    qenv["ACP_MOCK_SIMPLE"] = "1"
+    qenv["ACP_MOCK_DELAY"] = "0.6"
+    qsvc = AcpService([sys.executable, MOCK], cwd=tmp, env=qenv,
+                      log=lambda s: None, agent_id="mockq", provider_id="mock")
+    qev = []
+    _qemit = qsvc._emit
+
+    def _qspy(ev):
+        qev.append(ev)
+        _qemit(ev)
+    qsvc._emit = _qspy
+    qid = qsvc.create_session(title=u"queue")["id"]
+    r1 = qsvc.prompt(qid, u"第一轮：先做基础工作")
+    r2 = qsvc.prompt(qid, u"补充要求：再加一条")
+    check("第一轮正常开跑", r1.get("ok") is True and not r1.get("queued"), str(r1))
+    check("★跑着的时候发第二条 → 排队（不再 409）",
+          r2.get("queued") is True and r2.get("position") == 1, str(r2))
+    check("排队时发 session.inbox.enqueued",
+          any(e.get("type") == "session.inbox.enqueued" for e in qev))
+    _deadline = time.time() + 20
+    while time.time() < _deadline:
+        if [e.get("type") for e in qev].count("session.execution.succeeded") >= 2:
+            break
+        time.sleep(0.1)
+    check("★第一轮结束后自动投递（session.inbox.delivered）",
+          any(e.get("type") == "session.inbox.delivered" for e in qev))
+    qmsgs, _ = qsvc.messages(qid, 50)       # 新 → 旧
+    qusers = [m for m in qmsgs if m.get("type") == "user"]
+    qadd = [m for m in qusers if u"补充要求" in (m.get("text") or "")]
+    check("两条用户消息都在历史里", len(qusers) >= 2, len(qusers))
+    check("★排队那条已被标成送达（queued 清掉、delivered=True）",
+          bool(qadd) and not qadd[0].get("queued") and qadd[0].get("delivered") is True,
+          str(qadd[:1])[:200])
+    check("两轮都有助手回复", sum(1 for m in qmsgs if m.get("type") == "assistant") >= 2)
+    check("★时间戳单调：排队那条晚于第一轮（不会排到前面）",
+          len(qusers) >= 2 and ((qusers[0].get("time") or {}).get("created") or 0)
+          > ((qusers[1].get("time") or {}).get("created") or 0))
+
+    print("[7b] 队列上限")
+    old_max = svc_mod.MAX_INBOX
+    svc_mod.MAX_INBOX = 1
+    q2env = dict(qenv)
+    q2env["ACP_MOCK_DELAY"] = "0.8"
+    q2 = AcpService([sys.executable, MOCK], cwd=tmp, env=q2env,
+                    log=lambda s: None, agent_id="mockq2", provider_id="mock")
+    q2id = q2.create_session(title=u"queue-limit")["id"]
+    q2.prompt(q2id, u"开跑")
+    q2.prompt(q2id, u"第一条补充")
+    raised = False
+    try:
+        q2.prompt(q2id, u"第二条补充（应被拒）")
+    except Exception as exc:  # noqa: BLE001
+        raised = "排队已满" in str(exc)
+    check("★排队超过上限 → 明确拒绝（不无限堆）", raised)
+    time.sleep(1.6)
+    q2.close()
+    svc_mod.MAX_INBOX = old_max
+
+    print("[8] 重启后：没发出去的排队消息标「未送达」（不自动跑）")
+    qs = qsvc._sessions[qid]
+    qs["messages"].append({"id": "u_undelivered_test", "type": "user",
+                           "text": u"重启前没发出去", "queued": True,
+                           "time": {"created": int(time.time() * 1000)}})
+    qsvc._save()
+    q3 = AcpService([sys.executable, MOCK], cwd=tmp, env=qenv,
+                    log=lambda s: None, agent_id="mockq", provider_id="mock")
+    s3 = q3._sessions.get(qid) or {}
+    m3 = [m for m in (s3.get("messages") or []) if m.get("id") == "u_undelivered_test"]
+    check("★载入后标成 undelivered、queued 清掉",
+          bool(m3) and m3[0].get("undelivered") is True and not m3[0].get("queued"),
+          str(m3[:1])[:200])
+    check("重启不自动补跑（inbox 为空）", not (s3.get("inbox") or []),
+          str(s3.get("inbox")))
+    q3.close()
+    qsvc.close()
+
+    print("[9] cleanup")
     n = svc.forget_always()
     check("all memory cleared", n >= 1 and svc.always_rules() == [], "removed=%s" % n)
     svc.close()

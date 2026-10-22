@@ -49,6 +49,7 @@ STUB = r"""<script>
   window.__confirms = [];
   window.__confirmOk = true;
   window.__always404 = false;
+  window.__badShapes = false;      // ★把列表接口都换成"错形状"，验证前端不会被打崩
   window.LEVEL = "edit";
   window.ALWAYS = [
     { id: "ar_execute_d_ws", agent: "codex-node", session: "s1", kind: "execute",
@@ -104,6 +105,49 @@ STUB = r"""<script>
     if (/^\/api\/session\/[^/]+\/(form|message)/.test(path)) {
       return J({ data: [] });
     }
+    // ★信任面板新增四块的数据源（可撤销 / 审批时间线 / agent 活动 / 本地协作）
+    if (window.__badShapes) {
+      if (path === "/quarantine/list" || path === "/snapshot/list" || path === "/ccagent/permissions"
+          || path === "/ccagent/activity" || path === "/orchestrate/runs" || path === "/orchestrate/pending") {
+        return J({ ok: true, items: "nope", data: "nope", runs: 5, pending: {} });
+      }
+    }
+    if (path === "/quarantine/list") {
+      return J({ ok: true, data: { items: [
+        { id: "3/20261021-101010", ts: "20261021-101010", scope: "3",
+          taken_at: Math.floor(Date.now() / 1000) - 120,
+          note: "破坏性操作", cmd: "Remove-Item -Recurse -Force build",
+          count: 12, bytes: 4096, missed: 1 },
+      ], stats: { store_bytes: 1, quarantine: 1 } } });
+    }
+    if (path === "/snapshot/list") {
+      return J({ ok: true, data: { items: [
+        { ts: "20261021-101500", taken_at: Math.floor(Date.now() / 1000) - 60,
+          label: "turn", count: 37, with_content: false },
+      ] } });
+    }
+    if (path === "/ccagent/permissions") {
+      return J({ ok: true, items: [
+        { id: "pm-1", ts: Math.floor(Date.now() / 1000) - 30, agent: "yiyi", owner: "8",
+          kind: "execute", title: "Run command", cmd: "npm test", verdict: "once",
+          by: "owner", reply: "@yiyi 可以", destructive: false },
+        { id: "pm-2", ts: Math.floor(Date.now() / 1000) - 300, agent: "yiyi", owner: "8",
+          kind: "execute", title: "Run command", cmd: "Remove-Item -Force build",
+          verdict: "reject", by: "timeout", destructive: true },
+      ] });
+    }
+    if (path === "/ccagent/activity") {
+      return J({ ok: true, max: 3, items: [
+        { id: "t1", rev: 3, chat: "7", agent: "yiyi", tool: "运行命令", summary: "npm test",
+          status: "completed", ts: Math.floor(Date.now() / 1000) - 20 },
+        { id: "t2", rev: 2, chat: "7", agent: "yiyi", tool: "修改文件", summary: "app.js",
+          status: "running", ts: Math.floor(Date.now() / 1000) - 10 },
+        { id: "t3", rev: 1, chat: "7", agent: "yiyi", tool: "权限申请", summary: "删除 build",
+          status: "denied", ts: Math.floor(Date.now() / 1000) - 5 },
+      ] });
+    }
+    if (path === "/orchestrate/runs") return J({ ok: true, runs: [] });
+    if (path === "/orchestrate/pending") return J({ ok: true, pending: [] });
 
     for (var i = 0; i < DEAD.length; i++) {
       if (s.indexOf(DEAD[i]) >= 0) return Promise.resolve(new Response("{}", { status: 200 }));
@@ -265,6 +309,51 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
          __txt(document.getElementById("trust-always")));
     window.__always404 = false;
 
+    /* ---------- 8.5 ★信任面板新增四块（方向 3 收尾） ---------- */
+    var pl = __txt(document.getElementById("trust-permlog"));
+    step("★群聊审批时间线：谁批准了什么（命令原文 + 拥有者 + 时间）",
+         /yiyi/.test(pl) && /npm test/.test(pl) && /拥有者 8/.test(pl) && /允许一次/.test(pl), pl);
+    step("★拒绝/超时也留痕，破坏性单独标出来",
+         /拒绝/.test(pl) && /超时未批/.test(pl) && /破坏性/.test(pl), pl);
+    var uu = __txt(document.getElementById("trust-undo"));
+    step("★可撤销：隔离区记录 + 当前会话快照（复用现有入口）",
+         /隔离区/.test(uu) && /Remove-Item/.test(uu) && /快照/.test(uu)
+         && !!document.querySelector('#trust-undo [data-trust-jump="quar"]')
+         && !!document.querySelector('#trust-undo [data-trust-jump="undo"]'), uu);
+    var ac = __txt(document.getElementById("trust-act"));
+    step("★agent 活动：中文状态 + 谁 + 做了什么",
+         /完成/.test(ac) && /进行中/.test(ac) && /已拒绝/.test(ac) && /npm test/.test(ac), ac);
+    try {
+      localStorage.setItem("cocraft.cc.decisions", JSON.stringify([
+        { chat: "7", task: "重构登录", pick: "方案二", reviewer: "yiyi", target: "qwerty",
+          ts: Date.now() - 1000 },
+      ]));
+    } catch (e) {}
+    await trustRefresh();
+    await __s(300);
+    var dec = __txt(document.getElementById("trust-dec"));
+    step("★派活/仲裁结论：推荐谁 + 哪个任务 + 谁审的",
+         /推荐/.test(dec) && /方案二/.test(dec) && /重构登录/.test(dec), dec);
+    document.querySelector('#trust-undo [data-trust-jump="quar"]').click();
+    await __s(400);
+    step("★点「打开」复用现有隔离区入口（信任面板收起）",
+         !!document.getElementById("trust").hidden
+         && !document.getElementById("quar").hidden);
+    var qx = document.getElementById("quar-close");
+    if (qx) qx.click();
+    await __s(150);
+
+    /* ---------- 8.6 ★接口返回错形状也不崩（列表归一成空） ---------- */
+    window.__badShapes = true;
+    await trustRefresh();
+    await __s(400);
+    var badTxt = __txt(document.getElementById("trust-permlog")) + " | "
+      + __txt(document.getElementById("trust-undo")) + " | " + __txt(document.getElementById("trust-act"));
+    step("★接口返回错形状（对象/字符串）也不崩，列表归一成空",
+         /还没有审批记录/.test(badTxt) && /隔离区是空的/.test(badTxt) && /还没有活动/.test(badTxt),
+         badTxt);
+    window.__badShapes = false;
+
     /* ---------- 9. Esc 关闭 ---------- */
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -306,6 +395,10 @@ function __sh(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   var te = document.querySelector("[data-trust-open]");
   if (te) te.click();
   await __sh(400);
+  // 滚到新增的四块（可撤销 / 审批时间线 / 活动 / 结论）—— 截图核对用
+  var tb = document.querySelector("#trust .trust-body");
+  if (tb) tb.scrollTop = tb.scrollHeight;
+  await __sh(200);
 })();
 </script>
 """

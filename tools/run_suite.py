@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""把 23 套无头回归**一次跑完**（本地 / CI 都用这一个）。
+r"""把 33 套无头回归**一次跑完**（本地 / CI 都用这一个）。
 
 用法（在项目根目录）：
     python tools\run_suite.py                 :: 全部（本地开发机）
@@ -35,6 +35,7 @@ TESTS = [
     "music_bar_test",
     "history_page_test",
     "trace_time_test",
+    "msg_nav_test",
     "compact_render_test",
     "cocraft_unread_test",
     "cocraft_activity_test",
@@ -47,8 +48,16 @@ TESTS = [
     "team_test",
     "trust_panel_test",
     "context_chip_test",
+    "context_estimate_test",
+    "cross_engine_model_test",
+    "inbox_queue_test",
+    "workflow_canvas_ui_test",
+    "perm_audit_test",
     "acp_session_sync_test",
+    "internal_sessions_test",
     "orchestrator_test",
+    "agent_safety_test",
+    "collab_ui_test",
     "agent_install_test",
     "acp_events_test",
     "acp_api_test",

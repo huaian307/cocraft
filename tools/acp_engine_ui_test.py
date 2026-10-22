@@ -141,6 +141,18 @@ setTimeout(async function () {
     out.impOpen = !document.getElementById("import").hidden;
     out.impCur = ((document.getElementById("imp-cur") || {}).textContent || "").slice(0, 80);
     out.impRows = document.querySelectorAll("#imp-list [data-imp]").length;
+    out.impTabs = !!document.getElementById("imp-tabs")
+      && !document.getElementById("imp-tabs").hidden;
+    out.impProjectCount = ((document.getElementById("imp-n-project") || {}).textContent || "").trim();
+    out.impInternalCount = ((document.getElementById("imp-n-internal") || {}).textContent || "").trim();
+    var itab = document.querySelector('#imp-tabs [data-imp-tab="internal"]');
+    if (itab) itab.click();
+    await wait(250);
+    out.impInternalRows = document.querySelectorAll("#imp-list [data-imp]").length;
+    var ptab = document.querySelector('#imp-tabs [data-imp-tab="project"]');
+    if (ptab) ptab.click();
+    await wait(250);
+    out.impRowsAfterTab = document.querySelectorAll("#imp-list [data-imp]").length;
     // ⚠ 点**还没导入**的那条（已导入的点下去只是打开它，会话数不会 +1）
     var fresh = [].slice.call(document.querySelectorAll("#imp-list [data-imp]"))
       .filter(function (r) { return r.querySelector(".dot.ok") && r.textContent.indexOf("已导入") < 0; })[0];
@@ -360,6 +372,8 @@ def main() -> int:
     print("  按钮宽度:", d.get("modeBtnW"), "px（>34 才算放开了方图标宽度）| 被截断:", d.get("modeBtnClipped"))
     print("  --- 从 agent 导入会话 ---")
     print("  按钮可见/弹窗打开:", d.get("impBtnVisible"), "/", d.get("impOpen"), "| 列表:", d.get("impCur"))
+    print("  项目/内部标签:", d.get("impProjectCount"), "/", d.get("impInternalCount"),
+          "| 行:", d.get("impRows"), "| 内部行:", d.get("impInternalRows"), "| 切回项目:", d.get("impRowsAfterTab"))
     print("  行数:", d.get("impRows"), "| 点一下后弹窗关闭:", d.get("impClosed"),
           "| 面板会话 +", d.get("impDelta"), "| 当前:", d.get("impCurSession"))
     print("  --- 模型 API Key ---")
@@ -418,6 +432,11 @@ def main() -> int:
         and d.get("impBtnVisible") is True
         and d.get("impOpen") is True
         and (d.get("impRows") or 0) >= 2
+        and d.get("impTabs") is True
+        and (d.get("impProjectCount") or "") == "2"
+        and (d.get("impInternalCount") or "") == "1"
+        and (d.get("impInternalRows") or 0) == 1
+        and (d.get("impRowsAfterTab") or 0) >= 2
         and d.get("impClosed") is True
         and (d.get("impDelta") or 0) >= 1
         # 模型 API Key：行在、能保存、界面只拿到掩码、值框被清空
