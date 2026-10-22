@@ -90,6 +90,13 @@ def main() -> int:
     svc_mod.STATE_DIR = tmp
     svc_mod._ALWAYS_FILE = os.path.join(tmp, "_acp_always.json")
 
+    # ★本地协作的状态也隔离（否则 workflows/save|archive 会写真实的 _collab_workflows.json）
+    import orchestrator as orch_mod                       # noqa: E402
+    orch_mod.ROOT = os.path.join(tmp, "_orchestrator")
+    orch_mod.RUNS_DIR = os.path.join(orch_mod.ROOT, "runs")
+    orch_mod.WORKFLOWS_FILE = os.path.join(tmp, "_collab_workflows.json")
+    orch_mod._RUNS.clear()
+
     # inject the mock agent as the only agent, in memory (no file writes)
     reg = {"active": "mock",
            "baseline": {"cwd": tmp, "env": {}, "mode": "read-only"},
@@ -437,6 +444,41 @@ def main() -> int:
         check("POST /orchestrate/start empty task -> 400", st == 400, str(js)[:160])
         st, js = call("POST", "/orchestrate/permission", {"id": "nope", "decision": "once"})
         check("POST /orchestrate/permission unknown -> 404", st == 404, str(js)[:160])
+        # ★P3：归档 / 另存为工作流（0.2.14）
+        st, js = call("POST", "/orchestrate/workflows/save",
+                      {"name": "P3 归档", "cwd": tmp,
+                       "members": [{"id": "m1", "role": "implementer", "name": "impl",
+                                    "engine": "mock"}]})
+        _wf = (js or {}).get("workflow") or {}
+        check("POST /orchestrate/workflows/save -> 200 + id",
+              st == 200 and bool(_wf.get("id")), str(js)[:200])
+        check("老格式（没有 stages）→ 归一成一个默认阶段",
+              len(_wf.get("stages") or []) == 1
+              and (_wf.get("stages") or [{}])[0].get("id") == "s1", str(_wf.get("stages"))[:200])
+        # ★P4：阶段随工作流保存 / 成员归属 / 条件与策略归一
+        st, js = call("POST", "/orchestrate/workflows/save",
+                      {"name": "P4 阶段", "cwd": tmp,
+                       "stages": [{"name": "实现"},
+                                  {"name": "审查", "when": "onFailure",
+                                   "onFail": "continue", "retries": 1}],
+                       "members": [{"id": "m1", "engine": "mock", "stage": "s1"},
+                                   {"id": "m2", "engine": "mock", "stage": "s2"}]})
+        _pwf = (js or {}).get("workflow") or {}
+        check("workflows/save 带 stages（顺序 + 成员 stage + 条件/策略）",
+              st == 200 and len(_pwf.get("stages") or []) == 2
+              and [m.get("stage") for m in (_pwf.get("members") or [])] == ["s1", "s2"]
+              and _pwf["stages"][1].get("when") == "onFailure"
+              and _pwf["stages"][1].get("onFail") == "continue"
+              and int(_pwf["stages"][1].get("retries") or 0) == 1, str(js)[:300])
+        st, js = call("POST", "/orchestrate/workflows/archive",
+                      {"id": _wf.get("id"), "archived": True})
+        check("POST /orchestrate/workflows/archive -> archived=True（不删）",
+              st == 200 and ((js or {}).get("workflow") or {}).get("archived") is True,
+              str(js)[:200])
+        st, js = call("POST", "/orchestrate/workflows/archive", {"id": "wf_nope"})
+        check("archive unknown -> 400", st == 400, str(js)[:160])
+        st, js = call("POST", "/orchestrate/workflows/from-run", {"id": "run_nope"})
+        check("POST /orchestrate/workflows/from-run unknown -> 400", st == 400, str(js)[:160])
     finally:
         try:
             eng = server.engines.get_engine("acp")

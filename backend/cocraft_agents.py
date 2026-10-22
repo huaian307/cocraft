@@ -370,6 +370,32 @@ def perm_level() -> str:
     return v if v in ("ask", "read", "edit", "exec", "all") else "ask"
 
 
+# ★方向 3 收尾：群聊成员可以有自己的「权限上限」（只会比面板更严，不会更宽）
+PERM_LEVELS = ("ask", "read", "edit", "exec", "all")
+PERM_RANK = {name: i for i, name in enumerate(PERM_LEVELS)}
+
+
+def norm_member_perm(v) -> str:
+    """成员自己的上限（空 = 跟随面板）。不认识的值一律当成"跟随面板"。"""
+    v = str(v or "").strip()
+    return v if v in PERM_RANK else ""
+
+
+def effective_perm_level(a: dict) -> tuple:
+    """返回 (生效等级, 人话来源)。
+
+    规则：**上限只能收紧**。生效 = min(面板, 成员上限)；
+    成员没设 → 跟随面板；上限比面板宽 → 仍按面板（不能靠"成员上限"给自己放权）。
+    """
+    panel = perm_level()
+    cap = norm_member_perm((a or {}).get("permLevel"))
+    if not cap:
+        return panel, "跟随面板"
+    if PERM_RANK[cap] < PERM_RANK[panel]:
+        return cap, "成员上限 %s" % cap
+    return panel, "面板更严（%s）" % panel
+
+
 def _in_dir(paths, root) -> bool:
     """`paths` **全部**都在 `root` 里 → True。
 
@@ -925,12 +951,19 @@ def guard_note(engine) -> str:
 def public(a: dict) -> dict:
     aid = str(a.get("id"))
     w = _workers.get(aid)
+    cap = norm_member_perm(a.get("permLevel"))
+    eff, eff_src = effective_perm_level(a)
     return {"id": a.get("id"), "name": a.get("name") or "", "display": a.get("display") or "",
             "engine": a.get("engine") or "", "chats": list(a.get("chats") or []),
             "enabled": bool(a.get("enabled")), "running": bool(w and w.get("running")),
             "warn": guard_note(a.get("engine")),
             "role": norm_role(a.get("role")),
             "roleLabel": (ROLES.get(norm_role(a.get("role"))) or {}).get("label") or "",
+            # ★方向 3 收尾：成员自己的权限上限 + 当前生效等级（只紧不松）
+            "permLevel": cap,
+            "effectivePermLevel": eff,
+            "effectivePermLevelFrom": eff_src,
+            "panelPermLevel": perm_level(),
             "created": a.get("created") or 0}
 
 
@@ -1055,11 +1088,14 @@ def set_enabled(aid, on) -> dict:
 
 
 def update_agent(aid, patch: dict) -> dict:
-    allow = {k: v for k, v in (patch or {}).items() if k in ("engine", "display", "role")}
+    allow = {k: v for k, v in (patch or {}).items()
+             if k in ("engine", "display", "role", "permLevel")}
     if not allow:
         return public(find(aid))
     if "role" in allow:
         allow["role"] = norm_role(allow["role"])
+    if "permLevel" in allow:                 # ★方向 3：成员自己的权限上限（空 = 跟随面板）
+        allow["permLevel"] = norm_member_perm(allow["permLevel"])
     if "engine" in allow:                      # 换大脑 → 丢掉旧桥（下次重建）
         _drop_bridge(aid)
     return public(_patch(aid, **allow))
@@ -1097,7 +1133,9 @@ def _build_bridge(aid) -> dict:
     _ws_root = cfg_cwd or ""
 
     def _auto_perm(kind, title, locations, options, info=None):
-        _level = perm_level()      # ★ 每次现读：面板里改了等级立刻生效（不用重建桥）
+        # ★ 每次现读：面板等级 / 成员自己的上限改了都立刻生效（不用重建桥）
+        a_now = find(aid) or a
+        _level, _src = effective_perm_level(a_now)
         cmd = str((info or {}).get("command") or "")
         destructive = _is_destructive(cmd, title)
         net = _is_net(kind, title, cmd, locations)
@@ -1106,8 +1144,8 @@ def _build_bridge(aid) -> dict:
                                     or allowed_by_level(_level, kind, title, cmd, locations, _ws_root))
         verdict = _perm_ask_group(aid, kind, title, locations, ok, cmd=cmd,
                                   destructive=destructive, ws_root=_ws_root)
-        acp_log("[cocraft-agents] %s 权限 -> %s（等级=%s%s%s，%s）"
-                % (aid, verdict, _level,
+        acp_log("[cocraft-agents] %s 权限 -> %s（等级=%s，%s%s%s，%s）"
+                % (aid, verdict, _level, _src,
                    "，联网放行" if (net and allow_network() and not destructive) else "",
                    "，破坏性→必须确认" if destructive else "", title))
         return verdict or None

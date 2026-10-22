@@ -219,6 +219,209 @@ def main() -> int:
            orch.delete_workflow(cp["id"]) is True and bool(orch.get_run(wr["id"])), "")
         ok("删除不存在 → False", orch.delete_workflow("wf_nope") is False)
 
+        print("\n== 0b-2. ★P3：归档 / 旧 run「另存为工作流」 ==")
+        aw = orch.archive_workflow(wid, True)
+        ok("归档：archived=True（不删除）",
+           aw.get("archived") is True and bool(orch.get_run(wr["id"])), repr(aw.get("archived")))
+        aw2 = orch.archive_workflow(wid, False)
+        ok("取消归档", aw2.get("archived") is False, repr(aw2.get("archived")))
+        ok("归档不删运行记录 / 工作流还在",
+           bool(orch.get_run(wr["id"]))
+           and any(str(w.get("id")) == wid for w in orch.list_workflows()))
+        try:
+            orch.archive_workflow("wf_nope")
+            ok("归档不存在 → 拒绝", False)
+        except ValueError:
+            ok("归档不存在 → 拒绝", True)
+        orphan = orch.start_run("旧任务正文", cwd=TMP, members=[
+            {"engine": "mock", "name": "impl2", "role": "implementer"},
+            {"engine": "mock", "name": "rev2", "role": "reviewer"},
+        ])
+        wait_until(lambda: (orch.get_run(orphan["id"]).get("status") in
+                            ("done", "partial", "failed") and orch.get_run(orphan["id"])) or None, 20)
+        ok("旧 run 没有 workflowId（先确认前提）",
+           not (orphan.get("workflowId") or ""), repr(orphan.get("workflowId")))
+        n0 = len(orch.list_workflows())
+        fw = orch.workflow_from_run(orphan["id"])
+        ok("另存为工作流：新 id + 成员按 run 快照",
+           bool(fw.get("id")) and len(fw.get("members") or []) == 2, repr(fw.get("id")))
+        ok("默认任务 = 那次的任务",
+           fw.get("taskTemplate") == "旧任务正文", repr(fw.get("taskTemplate")))
+        ok("run 被认领（workflowId 写回）",
+           (orch.get_run(orphan["id"]).get("workflowId") or "") == fw.get("id"),
+           repr(orch.get_run(orphan["id"]).get("workflowId")))
+        ok("列表 +1", len(orch.list_workflows()) == n0 + 1)
+        fw2 = orch.workflow_from_run(orphan["id"])
+        ok("★同一成员组合再存一次 → 复用（不重复造）",
+           fw2.get("id") == fw.get("id") and fw2.get("existing") is True,
+           repr(fw2.get("existing")))
+        ok("重复另存没有新增工作流", len(orch.list_workflows()) == n0 + 1)
+        orch.archive_workflow(fw["id"], True)
+        fw3 = orch.workflow_from_run(orphan["id"])
+        ok("已有工作流被归档 → 另存时自动放回来",
+           fw3.get("id") == fw.get("id") and fw3.get("archived") is False,
+           repr(fw3.get("archived")))
+        orch._RUNS["run_arb_only"] = {"id": "run_arb_only", "cwd": TMP, "task": "x",
+                                      "members": [{"id": "m1", "name": "arb", "engine": "mock",
+                                                   "kind": "arbitration"}]}
+        try:
+            orch.workflow_from_run("run_arb_only")
+            ok("只有仲裁者的 run → 拒绝另存", False)
+        except ValueError:
+            ok("只有仲裁者的 run → 拒绝另存", True)
+        finally:
+            orch._RUNS.pop("run_arb_only", None)
+
+        print("\n== 0d. ★P4：阶段串行 / 条件 / 失败策略 / 重试 / 取消 ==")
+        st0, ms0 = orch.norm_stages(None, [{"id": "m1", "role": "implementer",
+                                            "name": "a", "engine": "mock"}])
+        ok("没有 stages → 一个默认阶段（老工作流兼容）",
+           len(st0) == 1 and st0[0]["id"] == "s1" and ms0[0]["stage"] == "s1",
+           repr((st0, ms0)))
+        st1, ms1 = orch.norm_stages(
+            [{"id": "s2", "name": "审查", "when": "onSuccess", "onFail": "continue",
+              "retries": 9}],
+            [{"id": "m1", "engine": "mock", "stage": "s2"},
+             {"id": "m2", "engine": "mock", "stage": "nope"}])
+        ok("阶段 id 重排 + 成员归属（认不出的落到第一个阶段）",
+           [s["id"] for s in st1] == ["s1"] and ms1[0]["stage"] == "s1"
+           and ms1[1]["stage"] == "s1", repr((st1, ms1)))
+        ok("retries 夹到 0~2 / when、onFail 归一",
+           st1[0]["retries"] == 2 and st1[0]["when"] == "onSuccess"
+           and st1[0]["onFail"] == "continue", repr(st1[0]))
+
+        swf = orch.save_workflow({
+            "name": "两阶段", "cwd": TMP, "taskTemplate": "串联任务",
+            "stages": [{"name": "实现"}, {"name": "审查"}],
+            "members": [
+                {"id": "m1", "role": "implementer", "name": "impl", "engine": "mock",
+                 "stage": "s1"},
+                {"id": "m2", "role": "reviewer", "name": "rev", "engine": "mock",
+                 "stage": "s2"},
+            ],
+        })
+        ok("工作流保存 stages（成员带 stage）",
+           len(swf.get("stages") or []) == 2
+           and [m.get("stage") for m in swf["members"]] == ["s1", "s2"],
+           repr(swf.get("stages")))
+        sr = orch.start_run("", workflow_id=swf["id"])
+        ok("run 带阶段快照（2 阶段，s1/s2）",
+           [x.get("id") for x in (sr.get("stages") or [])] == ["s1", "s2"]
+           and all("status" in x for x in (sr.get("stages") or [])),
+           repr(sr.get("stages")))
+        sgot = wait_until(lambda: (orch.get_run(sr["id"]).get("status") in
+                                   ("done", "partial", "failed") and orch.get_run(sr["id"])) or None,
+                          30)
+        ok("两阶段跑完（done）", sgot and sgot.get("status") == "done",
+           repr(sgot and sgot.get("status")))
+        sms = {m["id"]: m for m in (sgot or {}).get("members") or []}
+        sst = {x["id"]: x for x in (sgot or {}).get("stages") or []}
+        ok("★阶段串行：阶段 2 的成员在阶段 1 结束后才开始",
+           sms["m2"]["started"] >= sms["m1"]["ended"] - 5,
+           "m1 ended=%s m2 started=%s" % (sms["m1"].get("ended"), sms["m2"].get("started")))
+        ok("两个阶段都 done / 阶段 2 在阶段 1 之后",
+           sst["s1"]["status"] == "done" and sst["s2"]["status"] == "done"
+           and sst["s2"]["started"] >= sst["s1"]["ended"] - 5, repr(sst))
+        body2 = orch._stage_body(sgot, sst["s2"], "### 实现者 · impl\nMOCK-REPLY 1")
+        ok("★阶段 2 的提示词带「上一阶段产出」+ 阶段身份",
+           "第 2/2 阶段" in body2 and "上一阶段产出" in body2 and "MOCK-REPLY" in body2,
+           body2[:180])
+        dig = orch._stage_digest(sst["s1"], [sms["m1"]])
+        ok("阶段产出摘要带成员名与正文", "impl" in dig and "MOCK-REPLY" in dig, dig[:140])
+
+        cwf = orch.save_workflow({
+            "name": "条件阶段", "cwd": TMP,
+            "stages": [{"name": "实现"}, {"name": "仅失败时", "when": "onFailure"}],
+            "members": [
+                {"id": "m1", "engine": "mock", "name": "a", "stage": "s1"},
+                {"id": "m2", "engine": "mock", "name": "b", "stage": "s2"},
+            ],
+        })
+        cr = orch.start_run("条件任务", workflow_id=cwf["id"])
+        cgot = wait_until(lambda: (orch.get_run(cr["id"]).get("status") in
+                                   ("done", "partial", "failed") and orch.get_run(cr["id"])) or None,
+                          30)
+        cst = {x["id"]: x for x in (cgot or {}).get("stages") or []}
+        cms = {m["id"]: m for m in (cgot or {}).get("members") or []}
+        ok("onFailure 条件：上一阶段成功 → 该阶段 skipped（成员也 skipped）",
+           cst.get("s2", {}).get("status") == "skipped"
+           and cms.get("m2", {}).get("status") == "skipped",
+           repr((cst.get("s2", {}).get("status"), cms.get("m2", {}).get("status"))))
+        ok("条件跳过不会把 run 变成 partial", (cgot or {}).get("status") == "done",
+           repr((cgot or {}).get("status")))
+
+        bwf = orch.save_workflow({
+            "name": "失败即停", "cwd": TMP,
+            "stages": [{"name": "坏引擎", "onFail": "stop", "retries": 1},
+                       {"name": "不该跑"}],
+            "members": [
+                {"id": "m1", "engine": "not-exist", "name": "bad", "stage": "s1"},
+                {"id": "m2", "engine": "mock", "name": "next", "stage": "s2"},
+            ],
+        })
+        br = orch.start_run("失败任务", workflow_id=bwf["id"])
+        bgot = wait_until(lambda: (orch.get_run(br["id"]).get("status") in
+                                   ("failed", "partial", "done") and orch.get_run(br["id"])) or None,
+                          30)
+        bst = {x["id"]: x for x in (bgot or {}).get("stages") or []}
+        bms = {m["id"]: m for m in (bgot or {}).get("members") or []}
+        ok("onFail=stop：阶段 1 失败 → 阶段 2 skipped",
+           bst.get("s1", {}).get("status") == "failed"
+           and bst.get("s2", {}).get("status") == "skipped",
+           repr((bst.get("s1", {}).get("status"), bst.get("s2", {}).get("status"))))
+        ok("run 状态 failed（不是 done）", (bgot or {}).get("status") == "failed",
+           repr((bgot or {}).get("status")))
+        ok("★重试：retries=1 → 失败成员多跑一次",
+           int(bms.get("m1", {}).get("retryCount") or 0) == 1,
+           repr(bms.get("m1", {}).get("retryCount")))
+
+        kwf = orch.save_workflow({
+            "name": "失败继续", "cwd": TMP,
+            "stages": [{"name": "坏引擎", "onFail": "continue"}, {"name": "照样跑"}],
+            "members": [
+                {"id": "m1", "engine": "not-exist", "name": "bad", "stage": "s1"},
+                {"id": "m2", "engine": "mock", "name": "next", "stage": "s2"},
+            ],
+        })
+        kr = orch.start_run("继续任务", workflow_id=kwf["id"])
+        kgot = wait_until(lambda: (orch.get_run(kr["id"]).get("status") in
+                                   ("partial", "failed", "done") and orch.get_run(kr["id"])) or None,
+                          30)
+        kst = {x["id"]: x for x in (kgot or {}).get("stages") or []}
+        ok("onFail=continue：阶段 1 失败，阶段 2 仍然跑（done）",
+           kst.get("s1", {}).get("status") == "failed"
+           and kst.get("s2", {}).get("status") == "done",
+           repr((kst.get("s1", {}).get("status"), kst.get("s2", {}).get("status"))))
+        ok("run 状态 partial（有人成功有人失败）",
+           (kgot or {}).get("status") == "partial", repr((kgot or {}).get("status")))
+
+        # 取消：阶段 1 还在跑 → 取消全部 → 阶段 2 不该启动
+        twf = orch.save_workflow({
+            "name": "取消阶段", "cwd": TMP,
+            "stages": [{"name": "慢"}, {"name": "后面"}],
+            "members": [
+                {"id": "m1", "engine": "mock-slow", "name": "slow", "stage": "s1"},
+                {"id": "m2", "engine": "mock", "name": "later", "stage": "s2"},
+            ],
+        })
+        tr = orch.start_run("取消任务", workflow_id=twf["id"])
+        wait_until(lambda: (orch.get_run(tr["id"]).get("members") or [{}])[0].get("status")
+                   == "running", 10)
+        orch.cancel_run(tr["id"])
+        tgot = wait_until(lambda: (orch.get_run(tr["id"]).get("members") or [{}])[0].get("status")
+                          == "cancelled" and orch.get_run(tr["id"]), 15)
+        tms = {m["id"]: m for m in (tgot or {}).get("members") or []}
+        tst = {x["id"]: x for x in (tgot or {}).get("stages") or []}
+        ok("★取消：阶段 2 不会启动（skipped / started=0）",
+           tms.get("m2", {}).get("status") == "skipped"
+           and int(tms.get("m2", {}).get("started") or 0) == 0,
+           repr((tms.get("m2", {}).get("status"), tms.get("m2", {}).get("started"))))
+        ok("取消后阶段 2 标记 skipped",
+           tst.get("s2", {}).get("status") == "skipped",
+           repr(tst.get("s2", {}).get("status")))
+        ok("run 状态 cancelled", (tgot or {}).get("status") == "cancelled",
+           repr((tgot or {}).get("status")))
+
         print("\n== 1. 并发派活（两个成员各自独立会话） ==")
         run = orch.start_run("各写一句", members=[
             {"engine": "mock", "name": "甲", "role": "implementer"},

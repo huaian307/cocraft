@@ -57,6 +57,7 @@ TESTS = [
     "internal_sessions_test",
     "orchestrator_test",
     "agent_safety_test",
+    "agent_perm_cap_test",
     "collab_ui_test",
     "agent_install_test",
     "acp_events_test",

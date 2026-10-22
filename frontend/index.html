@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft · 絵梨衣</title>
 <link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style.css?v=0.2.13">
+<link rel="stylesheet" href="/style.css?v=0.2.19">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -202,9 +202,17 @@
           </aside>
           <div class="collab-main">
             <div id="collab-empty" class="collab-empty">
-              <b>还没有工作流</b>
-              <span>点左上「＋」新建一个工作流：选几个本机 agent（实现者 / 审查者 / 测试者…），
-                之后每次只要写一句任务就能开跑，不用再选成员。</span>
+              <b>三步开始用工作流</b>
+              <ol class="collab-steps">
+                <li><i>1</i><span><strong>新建工作流</strong> —— 点左栏「工作流 ＋」；
+                  也可以打开一条旧运行，点「存为工作流」把当时的成员组合留下来。</span></li>
+                <li><i>2</i><span><strong>在画布上配成员</strong> —— 双击节点改角色 / 名字 / 大脑 / 权限；
+                  拖动排版，滚轮缩放，「排布」重新摆整齐。</span></li>
+                <li><i>3</i><span><strong>写一句任务开跑</strong> —— 顶部快速任务条按 Enter（或 Ctrl+Enter /
+                  ▶ 运行）；留空就用默认任务。</span></li>
+              </ol>
+              <button type="button" id="collab-empty-new" data-collab-empty-new="1" class="primary">＋ 新建工作流</button>
+              <span class="collab-empty-note">本机运行：每个成员一个独立 agent 进程，可同时开多个任务；不登录、不上云。</span>
             </div>
 
             <!-- ★工作流视图：头 + 快速任务 + 画布 + 检查器 -->
@@ -215,11 +223,14 @@
                 <span class="collab-sp"></span>
                 <button type="button" id="collab-wf-cwd" title="换这个工作流的项目目录">目录</button>
                 <button type="button" id="collab-wf-add" title="加一个成员">＋ 成员</button>
+                <button type="button" id="collab-wf-add-stage" title="加一个阶段（阶段之间串行、阶段内并行）">＋ 阶段</button>
+                <button type="button" id="collab-wf-split" title="按角色拆成阶段：实现/测试 → 审查（审查者不再和实现者并行）">分阶段</button>
                 <button type="button" id="collab-wf-layout" title="重新自动排布节点">排布</button>
                 <button type="button" id="collab-wf-dup" title="复制这个工作流">复制</button>
+                <button type="button" id="collab-wf-archive" title="归档：收进左栏「已归档」，不删除">归档</button>
                 <button type="button" id="collab-wf-del" class="danger" title="删除工作流（历史运行保留）">删除</button>
               </div>
-              <div class="collab-quick">
+              <div id="collab-quick" class="collab-quick">
                 <input id="collab-quick-task" type="text" autocomplete="off"
                        placeholder="这次要做什么？（Enter 直接开跑；留空用默认任务）">
                 <button type="button" id="collab-quick-run" class="primary">▶ 运行</button>
@@ -231,6 +242,12 @@
                   <div id="collab-cv-nodes" class="cv-nodes"></div>
                 </div>
                 <div class="cv-hint">拖动节点排版 · 滚轮缩放 · 双击节点改角色/大脑 · ▶ 运行</div>
+                <!-- ★首次进画布的一次性提示（点「知道了」后记 localStorage） -->
+                <div id="collab-cv-tip" class="cv-tip" hidden>
+                  <b>画布怎么用</b>
+                  <span>拖动节点排版 · 滚轮缩放 · 双击节点改设置 · Delete 删除选中成员 · Ctrl+Enter 开跑</span>
+                  <button type="button" data-cv-tip-close="1">知道了</button>
+                </div>
               </div>
               <div id="collab-inspector" class="collab-inspector" hidden></div>
             </div>
@@ -1183,7 +1200,7 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/app.js?v=0.2.13"></script>
+<script src="/app.js?v=0.2.19"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

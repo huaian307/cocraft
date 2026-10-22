@@ -72,9 +72,13 @@ STUB = r"""<script>
   };
   var AGENTS = [
     { id: 11, name: "yiyi", display: "yiyi", engine: "opencode-acp", chats: ["1"],
-      enabled: true, running: true, role: "reviewer", roleLabel: "审查者", warn: "", created: 1 },
+      enabled: true, running: true, role: "reviewer", roleLabel: "审查者", warn: "", created: 1,
+      permLevel: "", effectivePermLevel: "ask", panelPermLevel: "ask",
+      effectivePermLevelFrom: "跟随面板" },
     { id: 12, name: "qwerty", display: "qwerty", engine: "codex-node", chats: ["1"],
-      enabled: true, running: true, role: "implementer", roleLabel: "实现者", warn: "", created: 2 }
+      enabled: true, running: true, role: "implementer", roleLabel: "实现者", warn: "", created: 2,
+      permLevel: "read", effectivePermLevel: "read", panelPermLevel: "ask",
+      effectivePermLevelFrom: "成员上限 read" }
   ];
   var PRESETS = [
     { id: "dev", label: "开发 + 审查 + 测试", builtin: true, rows: [
@@ -117,9 +121,18 @@ STUB = r"""<script>
     }
     if (path === "/ccagent/update") {
       var b = JSON.parse((o && o.body) || "{}");
-      window.__calls.push(["update", String(b.id), b.role]);
       var hit = AGENTS.filter(function (a) { return String(a.id) === String(b.id); })[0];
-      if (hit) { hit.role = b.role || ""; hit.roleLabel = (ROLES[b.role] || {}).label || ""; }
+      if (b.permLevel !== undefined) {
+        window.__calls.push(["perm", String(b.id), b.permLevel]);
+        if (hit) {
+          hit.permLevel = b.permLevel || "";
+          hit.effectivePermLevel = b.permLevel || hit.panelPermLevel || "ask";
+          hit.effectivePermLevelFrom = b.permLevel ? ("成员上限 " + b.permLevel) : "跟随面板";
+        }
+      } else {
+        window.__calls.push(["update", String(b.id), b.role]);
+        if (hit) { hit.role = b.role || ""; hit.roleLabel = (ROLES[b.role] || {}).label || ""; }
+      }
       return J({ ok: true, agent: hit || {}, agents: AGENTS });
     }
     if (path === "/ccagent/create") {
@@ -247,6 +260,31 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
     out.info.upd = upd;
     step("★改角色 → POST /ccagent/update {id, role}",
          upd.length === 1 && upd[0][1] === "11" && upd[0][2] === "tester", JSON.stringify(upd));
+    /* ---------- 3b. ★方向 3 收尾：成员自己的权限上限 ---------- */
+    var permSel11 = document.querySelector('[data-perm-for="11"]');
+    step("★每个成员行都有「权限上限」下拉（跟随面板 + 5 档）",
+         !!permSel11 && permSel11.options.length === 6 && permSel11.value === "",
+         permSel11 ? ("n=" + permSel11.options.length + " v=" + permSel11.value) : "(没有)");
+    var permSel12 = document.querySelector('[data-perm-for="12"]');
+    step("★已有上限的成员按值选中（qwerty = read）",
+         !!permSel12 && permSel12.value === "read", permSel12 && permSel12.value);
+    step("★行里显示当前生效等级",
+         /生效：/.test(__txt(document.querySelector("#cc-ai-list .cc-ai-eff"))),
+         __txt(document.querySelector("#cc-ai-list .cc-ai-eff")));
+    window.__calls.length = 0;
+    if (permSel11) {
+      permSel11.value = "edit";
+      permSel11.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    await __s(300);
+    var pcs = (window.__calls || []).filter(function (c) { return c[0] === "perm"; });
+    step("★改权限上限 → POST /ccagent/update {id, permLevel}",
+         pcs.length === 1 && pcs[0][1] === "11" && pcs[0][2] === "edit",
+         JSON.stringify(pcs));
+    step("★保存后成员数据跟着变（生效 = min(面板, 上限)）",
+         CC.ai[0].permLevel === "edit" && CC.ai[0].effectivePermLevel === "edit",
+         JSON.stringify([CC.ai[0].permLevel, CC.ai[0].effectivePermLevel]));
+
     // 复原（后面「请审查者仲裁」需要 yiyi 仍是审查者）
     CC.ai[0].role = "reviewer";
     CC.ai[0].roleLabel = "审查者";

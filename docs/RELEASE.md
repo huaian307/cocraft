@@ -51,6 +51,43 @@ python packaging\build.py
 - 文档写明绕过步骤（"更多信息 → 仍要运行"）；
 - 不把未签名包描述成"已验证安全"。
 
+### 3.2 证书怎么获取（2026-10 实操选项）
+
+> ⚠ 2023-06 起 CA/B Forum 规定：公开 CA 的 OV/EV 代码签名私钥**必须在硬件令牌 / 云 HSM 里**，
+> 不再给可导出的 PFX。所以要么插 USB Token，要么用**云签名**（CI 友好）。
+
+| 方案 | 适合谁 | 大概费用 | 门槛 / 说明 |
+| --- | --- | --- | --- |
+| **SignPath.io Foundation** | 公开开源项目 | **免费** | 项目公开、OSI 许可证；GitHub Actions 集成；证书由 SignPath 托管 |
+| **Certum Open Source Code Signing** | 公开开源项目（个人可申） | 约 €20–40/年 | 需公开仓库/项目主页；云签名 SimplySign，无需公司 |
+| **Azure Trusted Signing** | 有主体、长期项目 | 约 $10/月起（按签名量） | 微软托管证书；需符合资格（通常要求组织与经营历史）；`signtool` 可直接用 |
+| **商业 OV（Certum / Sectigo / SSL.com / DigiCert）** | 商业分发 | 约 $200–600/年 | 需**营业执照**、电话/地址核验；1–7 天；云签名或 Token |
+| **EV** | 需要最强身份背书 | 约 $400–900/年 | 审核更严；Token/HSM；并不等于"永久免 SmartScreen" |
+| 国内代理（沃通 / 天威诚信 / 亚洲诚信等） | 有国内主体 | ¥1500–4000/年 | OV 需营业执照；开票方便 |
+| **自签名证书** | 仅内测 / 企业内分发 | 免费 | 公网用户仍显示"未知发布者"；**不能替代公开 CA** |
+
+**给本项目的建议**（仓库公开、个人维护）：
+1. 优先 **SignPath.io Foundation**（免费、CI 集成最好）；
+2. 次选 **Certum Open Source Code Signing**（便宜、个人可办、云签名）；
+3. 要走商业分发且有营业执照 → 商业 **OV + 云签名**（别买 EV，性价比低）。
+
+**申请大致流程**：选 CA → 提交项目/主体资料（开源项目给仓库地址；商业给营业执照、电话、地址）
+→ 身份/域名/电话核验 → 拿到云签名账号或 Token → 按 §3 用 `signtool` 签。
+
+**签名命令（云签名 / Token 都一样）**：
+
+```bat
+signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /a ^
+  dist\cocraft-setup-<ver>-windows-x64.exe
+signtool verify /pa /v dist\cocraft-setup-<ver>-windows-x64.exe
+```
+
+- **只签自己产出的文件**（安装包；如以后有自建 exe 再签它）——**不要重签随包的 node/python/codex 等第三方 exe**。
+- **必须带时间戳**，否则证书到期后旧安装包的签名会失效。
+- SmartScreen 是**声誉制**：新证书也可能先被拦，靠下载量/时间积累；不要在 Release 里承诺"绝不弹"。
+- CI（GitHub Actions）里用云签名（SignPath / Azure Trusted Signing / SSL.com eSigner / Certum SimplySign），
+  不要试图把 Token 带进 runner。
+
 ## 4. 虚拟机验证矩阵（必须在干净机做）
 
 | 场景 | 检查 |

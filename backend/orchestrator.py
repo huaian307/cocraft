@@ -67,6 +67,9 @@ def _run_path(run_id: str) -> str:
 
 
 def _save(run: dict) -> None:
+    # ★删除运行记录后，还在收尾的线程可能再 _save 一次（会把删掉的文件写回来）
+    if run.get("_deleted"):
+        return
     run["updated"] = _now()
     try:
         _atomic_write(_run_path(run["id"]), run)
@@ -87,7 +90,8 @@ def _member_public(m: dict) -> dict:
     return {k: m.get(k) for k in
             ("id", "name", "role", "roleLabel", "engine", "status", "output", "error",
              "created", "started", "ended", "tokens", "context", "activities",
-             "kind", "sessionID", "cancelled", "files", "pick", "permLevel")}
+             "kind", "sessionID", "cancelled", "files", "pick", "permLevel",
+             "stage", "retryCount")}
 
 
 def public_run(run: dict) -> dict:
@@ -98,6 +102,8 @@ def public_run(run: dict) -> dict:
             "workflowId": run.get("workflowId") or "",
             "workflowName": run.get("workflowName") or "",
             "created": run.get("created"), "updated": run.get("updated"),
+            # ★阶段快照（P4）：状态 / 条件 / 失败策略 / 重试都在里面
+            "stages": [dict(s) for s in (run.get("stages") or []) if isinstance(s, dict)],
             "members": [_member_public(m) for m in (run.get("members") or [])],
             # 全部申请（pending + 已结算）都回；「谁批准了什么」要能追溯
             "permissions": [p for p in (run.get("permissions") or [])],
@@ -188,8 +194,88 @@ def _wf_clean_members(raw) -> list:
                 mid = "m%d" % (int(mid[1:]) + 1)
         used.add(mid)
         out.append({"id": mid, "role": role, "name": name, "engine": engine,
-                    "permLevel": norm_perm_level(r.get("permLevel"))})
+                    "permLevel": norm_perm_level(r.get("permLevel")),
+                    "stage": str(r.get("stage") or "").strip()})
     return out
+
+
+# ---------------- ★阶段（P4：串行阶段 / 条件 / 失败策略 / 重试） ----------------
+
+STAGE_WHEN = ("always", "onSuccess", "onFailure")
+STAGE_ONFAIL = ("stop", "continue")
+MAX_STAGE_RETRIES = 2
+MAX_STAGES = 8
+
+
+def _stage_when(v) -> str:
+    v = str(v or "").strip()
+    return v if v in STAGE_WHEN else "always"
+
+
+def _stage_onfail(v) -> str:
+    v = str(v or "").strip()
+    return v if v in STAGE_ONFAIL else "stop"
+
+
+def _stage_retries(v) -> int:
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return max(0, min(MAX_STAGE_RETRIES, n))
+
+
+def norm_stages(raw_stages, members) -> tuple:
+    """把「阶段 + 成员归属」统一成 `s1..sN`（老数据 / 直传成员都兼容）。
+
+    * 没有 stages（`0.2.14` 及更早的工作流、或直接传 members 的 start）→ **一个默认阶段**；
+    * 阶段 id 重排成 `s1..sN`（顺序就是执行顺序）；
+    * 成员的 `stage` 认 `s2` / `2` / 原始 id，认不出就落到第一个阶段；
+    * 空阶段**保留**（画布上可能刚加还没放人），执行时直接算完成。
+    """
+    ms = []
+    for i, m in enumerate(members or []):
+        m = dict(m) if isinstance(m, dict) else {}
+        m.setdefault("id", "m%d" % (i + 1))
+        ms.append(m)
+    raw_list = raw_stages if isinstance(raw_stages, list) else []
+    stages, orig_ids = [], []
+    for i, s in enumerate(raw_list[:MAX_STAGES]):
+        s = s if isinstance(s, dict) else {}
+        orig_ids.append(str(s.get("id") or "").strip())
+        stages.append({
+            "id": "s%d" % (i + 1),
+            "name": (re.sub(r"\s+", " ", str(s.get("name") or "").strip())[:24]
+                     or ("阶段 %d" % (i + 1))),
+            "when": _stage_when(s.get("when")),
+            "onFail": _stage_onfail(s.get("onFail")),
+            "retries": _stage_retries(s.get("retries")),
+        })
+    if not stages:
+        stages = [{"id": "s1", "name": "全部成员", "when": "always",
+                   "onFail": "stop", "retries": 0}]
+    ids = [s["id"] for s in stages]
+
+    def pick(v):
+        v = str(v or "").strip()
+        if not v:
+            return ids[0]
+        if v in ids:
+            return v
+        m = re.match(r"^s?(\d+)$", v)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= len(ids):
+                return ids[n - 1]
+        if v in orig_ids:
+            i = orig_ids.index(v)
+            if i < len(ids):
+                return ids[i]
+        return ids[0]
+
+    for m in ms:
+        m["stage"] = pick(m.get("stage"))
+    return stages, ms
 
 
 def _wf_load() -> dict:
@@ -207,9 +293,19 @@ def _wf_load() -> dict:
 
 
 def list_workflows(cwd: str = "") -> list:
-    """工作流列表（按 updated 倒序；cwd 可选过滤，大小写不敏感）。"""
+    """工作流列表（按 updated 倒序；cwd 可选过滤，大小写不敏感）。
+
+    ⚠ `archived` 是 P3 新增的字段（归档只是"收起来"，**不删除**）：
+    老数据没有这个键 → 统一补成 False，前端不用再判 undefined。
+    """
     d = _wf_load()
     out = [w for w in (d.get("workflows") or []) if isinstance(w, dict)]
+    for w in out:
+        if "archived" not in w:
+            w["archived"] = False
+        # ★老工作流没有 stages → 内存里补一个默认阶段（不写盘，真正的归一发生在 save）
+        st, ms = norm_stages(w.get("stages"), w.get("members"))
+        w["stages"], w["members"] = st, ms
     if cwd:
         key = str(cwd).replace("\\", "/").rstrip("/").lower()
         out = [w for w in out
@@ -223,6 +319,7 @@ def save_workflow(data) -> dict:
     data = data if isinstance(data, dict) else {}
     name = re.sub(r"\s+", " ", str(data.get("name") or "").strip())[:40] or "未命名工作流"
     members = _wf_clean_members(data.get("members"))
+    stages, members = norm_stages(data.get("stages"), members)
     cwd = str(data.get("cwd") or "").strip()
     task = str(data.get("taskTemplate") or "").strip()[:2000]
     layout = data.get("layout") if isinstance(data.get("layout"), dict) else {}
@@ -244,9 +341,13 @@ def save_workflow(data) -> dict:
                     and str(w.get("id")) == wid), None) if wid else None
         if cur is None:
             wid = "wf_%s_%s" % (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
-            cur = {"id": wid, "created": now, "runCount": 0, "lastRunId": ""}
+            cur = {"id": wid, "created": now, "runCount": 0, "lastRunId": "",
+                   "archived": False}
             wfs.append(cur)
+        # ★归档状态不在 payload 里（前端自动保存不会误改）；只由 archive_workflow 动
+        cur.setdefault("archived", False)
         cur.update({"name": name, "cwd": cwd, "taskTemplate": task,
+                    "stages": stages,
                     "members": members, "layout": {"zoom": zoom, "nodes": nodes},
                     "updated": now})
         wfs.sort(key=lambda w: w.get("updated") or 0, reverse=True)
@@ -289,11 +390,107 @@ def duplicate_workflow(wid: str, name: str = "") -> dict:
         cp["updated"] = now
         cp["runCount"] = 0
         cp["lastRunId"] = ""
+        cp["archived"] = False        # ★副本不继承归档状态（复制通常是想用）
         d.setdefault("workflows", []).append(cp)
         d["workflows"].sort(key=lambda w: w.get("updated") or 0, reverse=True)
         d["workflows"] = d["workflows"][:KEEP_WORKFLOWS]
         _atomic_write(WORKFLOWS_FILE, d)
     return cp
+
+
+def archive_workflow(wid: str, archived: bool = True) -> dict:
+    """★归档 / 取消归档（P3）：**不删除任何东西**，只让左栏把它收进折叠区。
+
+    * 归档的不会被默认选中（`collabLoadWorkflows` 里跳过）；
+    * 成员 / 默认任务 / 画布布局 / 运行历史全部原样保留；
+    * 跑过的 run 仍然带着 `workflowId`，随时能从「已归档」里点回来。
+    """
+    wid = str(wid or "").strip()
+    if not wid or wid.startswith(".") or "/" in wid or "\\" in wid:
+        raise ValueError("非法的工作流 id")
+    with _WF_LOCK:
+        d = _wf_load()
+        w = next((x for x in (d.get("workflows") or [])
+                  if isinstance(x, dict) and str(x.get("id")) == wid), None)
+        if not w:
+            raise ValueError("没有这个工作流")
+        w["archived"] = bool(archived)
+        _atomic_write(WORKFLOWS_FILE, d)
+        return dict(w)
+
+
+def _wf_sig(cwd: str, members) -> tuple:
+    """工作流「成员组合」指纹：目录 + 每个成员的 (阶段, 角色, 名字, 大脑)。
+    ⚠ 不比 id / permLevel —— 同一套人马重新跑过几遍也不该存成好几个工作流。"""
+    ckey = str(cwd or "").replace("\\", "/").rstrip("/").lower()
+    parts = []
+    for m in (members or []):
+        if not isinstance(m, dict):
+            continue
+        parts.append((str(m.get("stage") or "s1"), str(m.get("role") or ""),
+                      str(m.get("name") or ""), str(m.get("engine") or "")))
+    return (ckey, tuple(parts))
+
+
+def workflow_from_run(run_id: str, name: str = "") -> dict:
+    """★把一条**已有的运行**另存为工作流（P3）。
+
+    * 成员取 run 的成员快照（**排除仲裁者** `kind=arbitration`）；
+    * 默认任务 = 那次的任务；目录 = 那次的工作目录；
+    * **按「目录 + 成员组合」去重**：已经有一模一样的工作流就复用它（`existing=True`），
+      不重复造 —— 这是"另存为"最容易踩的坑；
+    * 存完把这条 run 认领到新工作流（`workflowId/Name`）—— 这是**用户显式操作**，
+      不是"自动猜旧 run 属于谁"。
+    """
+    rid = str(run_id or "").strip()
+    if not rid or os.path.basename(rid) != rid or ".." in rid:
+        raise ValueError("非法的任务 id")
+    with _LOCK:
+        run = _RUNS.get(rid) or _load_file(rid)
+    if not run:
+        raise ValueError("没有这个任务")
+    raw = [m for m in (run.get("members") or [])
+           if isinstance(m, dict) and str(m.get("kind") or "") != "arbitration"
+           and str(m.get("engine") or "").strip()]
+    if not raw:
+        raise ValueError("这条运行没有可用的成员（可能只有仲裁者）")
+    members = []
+    for i, m in enumerate(raw[:8]):
+        members.append({"id": "m%d" % (i + 1), "role": norm_role(m.get("role")),
+                        "name": str(m.get("name") or ""),
+                        "engine": str(m.get("engine") or ""),
+                        "permLevel": norm_perm_level(m.get("permLevel")),
+                        "stage": str(m.get("stage") or "s1")})
+    stages = [{"id": str(s.get("id") or ""), "name": str(s.get("name") or ""),
+               "when": s.get("when"), "onFail": s.get("onFail"),
+               "retries": s.get("retries")}
+              for s in (run.get("stages") or []) if isinstance(s, dict)]
+    cwd = str(run.get("cwd") or "")
+    sig = _wf_sig(cwd, members)
+    for w in list_workflows():
+        if _wf_sig(w.get("cwd"), w.get("members")) == sig:
+            if w.get("archived"):
+                w = archive_workflow(w.get("id"), False)
+            return dict(w, existing=True)
+    nm = re.sub(r"\s+", " ", str(name or run.get("title") or run.get("task") or "").strip())[:40] \
+        or "从运行另存"
+    wf = save_workflow({"name": nm, "cwd": cwd,
+                        "taskTemplate": str(run.get("task") or ""),
+                        "stages": stages,
+                        "members": members,
+                        "layout": {"zoom": 1, "nodes": {}}})
+    # 认领这条 run（历史记录本身不变，只补归属）
+    with _LOCK:
+        cur = _RUNS.get(rid) or _load_file(rid) or {}
+        if cur:
+            cur["workflowId"] = str(wf.get("id") or "")
+            cur["workflowName"] = str(wf.get("name") or "")
+            _RUNS[rid] = cur
+            _save(cur)
+    _wf_touch_run(wf.get("id"), rid)
+    fresh = next((w for w in list_workflows()
+                  if str(w.get("id")) == str(wf.get("id"))), wf)
+    return dict(fresh, existing=False)
 
 
 def _wf_touch_run(wid: str, rid: str) -> None:
@@ -337,6 +534,7 @@ def delete_run(run_id: str) -> bool:
             _PENDING.pop(pid, None)
         for key in [k for k in _CANCEL if str(k[0]) == rid]:
             _CANCEL.pop(key, None)
+        run["_deleted"] = True          # 让还在收尾的线程别再 _save（否则文件会被写回来）
         _RUNS.pop(rid, None)
     try:
         os.remove(_run_path(rid))
@@ -547,17 +745,31 @@ def _member_snapshot(svc, sid) -> tuple:
         return {}, None
 
 
+TERMINAL_STATES = ("done", "failed", "timeout", "cancelled", "skipped")
+TERMINAL_STAGES = ("done", "partial", "failed", "skipped", "cancelled")
+
+
 def _update_run(run: dict) -> None:
     with _LOCK:
         if run.get("status") in ("running",):
+            # ★P4：还有阶段没跑完就**别提前收口**（成员全终态 ≠ 整个任务结束）
+            stages = [s for s in (run.get("stages") or []) if isinstance(s, dict)]
+            if stages and any(str(s.get("status") or "wait") not in TERMINAL_STAGES
+                              for s in stages):
+                _save(run)
+                return
             states = [m.get("status") for m in (run.get("members") or [])]
-            if states and all(x in ("done", "failed", "timeout", "cancelled") for x in states):
-                done = [x for x in states if x == "done"]
-                if not done and all(x == "cancelled" for x in states):
+            if states and all(x in TERMINAL_STATES for x in states):
+                # ★skipped（条件不满足 / 前面失败 / 取消）不算失败，别把 run 变成 partial
+                active = [x for x in states if x != "skipped"]
+                done = [x for x in active if x == "done"]
+                if not active:
+                    run["status"] = "cancelled" if any(x == "cancelled" for x in states) else "done"
+                elif not done and all(x == "cancelled" for x in active):
                     run["status"] = "cancelled"
                 elif not done:
                     run["status"] = "failed"
-                elif len(done) == len(states):
+                elif len(done) == len(active):
                     run["status"] = "done"
                 else:
                     run["status"] = "partial"
@@ -689,12 +901,194 @@ def _run_member(run: dict, member: dict, prompt_override: str = "") -> None:
             _update_run(run)
 
 
-def _start_threads(run: dict) -> None:
-    for m in run.get("members") or []:
+def _stage_body(run: dict, stage: dict, prev_text: str = "") -> str:
+    """★P4：给某个阶段拼用户消息 —— **上一阶段产出** + 本次任务 + 阶段身份。
+
+    抽成纯函数（好测）：第 2 阶段起，成员能看到上一阶段所有人写了什么；
+    没有上一阶段产出时就是「阶段 1/3 + 任务」。
+    """
+    stages = [s for s in (run.get("stages") or []) if isinstance(s, dict)]
+    idx = next((i for i, s in enumerate(stages)
+                if str(s.get("id")) == str(stage.get("id"))), 0) + 1
+    parts = []
+    if len(stages) > 1:
+        parts.append("【第 %d/%d 阶段：%s】" % (idx, len(stages), stage.get("name") or ""))
+    if str(prev_text or "").strip():
+        parts.append("【上一阶段产出】\n" + str(prev_text).strip())
+    parts.append("【本次任务】\n" + str(run.get("task") or "").strip())
+    return "\n\n".join(parts)
+
+
+def _stage_digest(stage: dict, members, prev_text: str = "") -> str:
+    """把这一阶段各成员的产出压成一段，供下一阶段参考（截断，别把上下文撑爆）。"""
+    per = 4000
+    lines = ["## 阶段：%s" % (stage.get("name") or "")]
+    for m in members:
+        who = "%s%s" % (m.get("roleLabel") and (m.get("roleLabel") + " · ") or "",
+                        m.get("name") or m.get("id") or "")
+        out = str(m.get("output") or "").strip()
+        err = str(m.get("error") or "").strip()
+        if out:
+            lines.append("### %s\n%s" % (who, out[:per]))
+        elif err:
+            lines.append("### %s（失败：%s）" % (who, err[:300]))
+        else:
+            lines.append("### %s（没有输出）" % who)
+    text = "\n\n".join(lines).strip()
+    # 总长也封顶（多成员 × 多阶段一起滚雪球就没边了）
+    return text[:12000] if text else str(prev_text or "")
+
+
+def _skip_stage(run: dict, stage: dict, reason: str) -> None:
+    """跳过某个阶段（条件不满足 / 前面的阶段失败 / 任务被取消）。"""
+    with _LOCK:
+        stage["status"] = "skipped"
+        stage["note"] = str(reason or "")[:200]
+        stage["ended"] = _now()
+        for m in (run.get("members") or []):
+            if str(m.get("stage")) == str(stage.get("id")) and \
+                    m.get("status") in ("wait", "running"):
+                m["status"] = "skipped"
+                m["error"] = str(reason or "")[:300]
+                m["ended"] = _now()
+        _save(run)
+
+
+def _start_stage_members(run: dict, members, body: str) -> None:
+    rid = run["id"]
+    for m in members:
         with _LOCK:
-            _CANCEL[(run["id"], m["id"])] = threading.Event()
-        threading.Thread(target=_run_member, args=(run, m), daemon=True,
-                         name="orch-%s-%s" % (run["id"], m["id"])).start()
+            ev = threading.Event()
+            if run.get("status") == "cancelled":
+                ev.set()          # 关掉窗口：刚决定取消、还没建 event 的那一下
+            _CANCEL[(rid, m["id"])] = ev
+        threading.Thread(target=_run_member, args=(run, m, body), daemon=True,
+                         name="orch-%s-%s" % (rid, m["id"])).start()
+
+
+def _stage_loop(run: dict) -> None:
+    """★P4：**阶段串行、阶段内并行**。
+
+    - 一个阶段的所有成员跑完（含重试）才进下一阶段；
+    - `when=onSuccess/onFailure` 看**上一阶段**有没有失败，决定这一阶段跑不跑；
+    - `onFail=stop`：这一阶段有失败 → 后面全部 skipped；`continue`：继续；
+    - `retries`：阶段内失败的成员**重跑**（新会话），最多 2 次。
+    ⚠ 仍然是「一个任务派给 N 个成员」，只是现在可以分成几段先后做。
+    """
+    rid = run["id"]
+    stage_list = [s for s in (run.get("stages") or []) if isinstance(s, dict)]
+    prev_text = ""
+    prev_failed = False
+    try:
+        for idx, st in enumerate(stage_list):
+            with _LOCK:
+                cancelled = run.get("status") == "cancelled"
+            if cancelled:
+                _skip_stage(run, st, "任务已取消")
+                prev_failed = True
+                continue
+            if idx > 0 and st.get("when") == "onSuccess" and prev_failed:
+                _skip_stage(run, st, "上一阶段有失败 → 条件不满足（onSuccess）")
+                continue
+            if idx > 0 and st.get("when") == "onFailure" and not prev_failed:
+                _skip_stage(run, st, "上一阶段全部成功 → 条件不满足（onFailure）")
+                continue
+            members = [m for m in (run.get("members") or [])
+                       if str(m.get("stage")) == str(st.get("id"))]
+            with _LOCK:
+                st["status"] = "running"
+                st["started"] = _now()
+                for m in members:
+                    if m.get("kind") == "arbitration":
+                        continue
+                    m["status"] = "wait"
+                    m["error"] = ""
+                _save(run)
+            if not members:
+                with _LOCK:
+                    st["status"] = "done"
+                    st["ended"] = _now()
+                    _save(run)
+                acp_log("[orchestrator] %s/%s 空阶段 → 直接完成" % (rid, st.get("id")))
+                continue
+            body = _stage_body(run, st, prev_text)
+            attempt = 0
+            retries = int(st.get("retries") or 0)
+            while True:
+                _start_stage_members(run, members, body)
+                while True:
+                    with _LOCK:
+                        states = [m.get("status") for m in members]
+                        cancelled = run.get("status") == "cancelled"
+                    if cancelled or all(x in TERMINAL_STATES for x in states):
+                        break
+                    time.sleep(0.15)
+                if cancelled:
+                    break
+                bad = [m for m in members
+                       if m.get("status") in ("failed", "timeout", "cancelled")]
+                if bad and attempt < retries:
+                    attempt += 1
+                    with _LOCK:
+                        for m in bad:
+                            m["retryCount"] = int(m.get("retryCount") or 0) + 1
+                            m["status"] = "wait"
+                            m["error"] = ""
+                            m["output"] = ""
+                        _save(run)
+                    acp_log("[orchestrator] %s/%s 第 %d 次重试（%d 个成员失败）"
+                            % (rid, st.get("id"), attempt, len(bad)))
+                    continue
+                break
+            with _LOCK:
+                states = [m.get("status") for m in members]
+                if all(x == "done" for x in states):
+                    st["status"] = "done"
+                elif all(x in ("cancelled", "skipped") for x in states):
+                    st["status"] = "cancelled" if any(x == "cancelled" for x in states) else "skipped"
+                elif any(x == "done" for x in states):
+                    st["status"] = "partial"
+                else:
+                    st["status"] = "failed"
+                st["ended"] = _now()
+                _save(run)
+            failed_now = st["status"] in ("failed", "partial", "cancelled")
+            if st["status"] != "skipped":
+                prev_failed = failed_now
+            prev_text = _stage_digest(st, members, prev_text)
+            acp_log("[orchestrator] %s 阶段 %s（%s）：%s"
+                    % (rid, st.get("id"), st.get("name"), st["status"]))
+            if failed_now and st.get("onFail") == "stop":
+                for s2 in stage_list[idx + 1:]:
+                    _skip_stage(run, s2, "上一阶段失败（onFail=stop）")
+                break
+    except Exception as exc:  # noqa: BLE001
+        run["error"] = "阶段调度失败：%s: %s" % (type(exc).__name__, exc)
+        acp_log("[orchestrator] %s 阶段调度失败：%s" % (rid, exc))
+    finally:
+        with _LOCK:
+            if run.get("status") == "cancelled":
+                # 取消是用户意图：剩下的阶段/成员标 skipped（别再启动）
+                for st in stage_list:
+                    if st.get("status") in ("wait", "running"):
+                        st["status"] = "skipped"
+                        st["note"] = "任务已取消"
+                        st["ended"] = _now()
+                for m in (run.get("members") or []):
+                    # 只处理「还没启动」的；正在跑的由 _run_member 自己收成 cancelled
+                    if m.get("status") == "wait":
+                        m["status"] = "skipped"
+                        m["error"] = "任务已取消"
+                        m["ended"] = _now()
+                _save(run)
+            else:
+                _update_run(run)
+
+
+def _start_threads(run: dict) -> None:
+    """兼容旧调用：现在起的是**阶段调度线程**（阶段串行、阶段内并行）。"""
+    threading.Thread(target=_stage_loop, args=(run,), daemon=True,
+                     name="orch-stages-%s" % run["id"]).start()
 
 
 # ---------------- 对外 API ----------------
@@ -761,15 +1155,19 @@ def start_run(task: str, cwd: str = "", members=None, title: str = "",
         ms.append({"id": "m%d" % (i + 1), "name": name, "role": role,
                    "roleLabel": (ROLES.get(role) or {}).get("label") or "",
                    "engine": engine, "permLevel": norm_perm_level(raw.get("permLevel")),
+                   "stage": str(raw.get("stage") or ""), "retryCount": 0,
                    "status": "wait", "output": "", "error": "",
                    "created": _now(), "started": 0, "ended": 0,
                    "tokens": {}, "context": None, "activities": [],
                    "kind": "member", "sessionID": "", "cancelled": False})
+    # ★P4：阶段串行（阶段内并行）。老工作流没有 stages → 一个默认阶段，行为与以前一致。
+    stages, ms = norm_stages((wf or {}).get("stages"), ms)
     run = {"id": rid, "task": task, "title": str(title or task)[:80],
            "cwd": str(cwd or "").strip(), "status": "running",
            "workflowId": str((wf or {}).get("id") or ""),
            "workflowName": str((wf or {}).get("name") or ""),
            "created": _now(), "updated": _now(), "members": ms,
+           "stages": [dict(s, status="wait", started=0, ended=0, note="") for s in stages],
            "permissions": [], "arbitration": None, "error": ""}
     with _LOCK:
         _RUNS[rid] = run
@@ -781,8 +1179,8 @@ def start_run(task: str, cwd: str = "", members=None, title: str = "",
             _wf_touch_run(str(wf.get("id")), rid)
         except Exception:  # noqa: BLE001
             pass
-    acp_log("[orchestrator] 开始任务 %s：%d 个成员%s"
-            % (rid, len(ms), ("（工作流 %s）" % wf.get("name")) if wf else ""))
+    acp_log("[orchestrator] 开始任务 %s：%d 个成员 / %d 个阶段%s"
+            % (rid, len(ms), len(stages), ("（工作流 %s）" % wf.get("name")) if wf else ""))
     return public_run(run)
 
 
@@ -806,6 +1204,17 @@ def cancel_run(run_id: str, member_id: str = "") -> dict:
     with _LOCK:
         if not member_id:
             run["status"] = "cancelled"
+            # ★取消全部：还没开始的阶段/成员立刻标 skipped（不用等调度线程收尾）
+            for st in (run.get("stages") or []):
+                if st.get("status") == "wait":
+                    st["status"] = "skipped"
+                    st["note"] = "任务已取消"
+                    st["ended"] = _now()
+            for m in (run.get("members") or []):
+                if m.get("status") == "wait":
+                    m["status"] = "skipped"
+                    m["error"] = "任务已取消"
+                    m["ended"] = _now()
         _save(run)
     return public_run(run)
 

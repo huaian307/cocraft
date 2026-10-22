@@ -2850,6 +2850,8 @@ class Handler(BaseHTTPRequestHandler):
         POST /orchestrate/workflows/save   {id?, name, cwd, taskTemplate?, members[], layout?}
         POST /orchestrate/workflows/delete {id}
         POST /orchestrate/workflows/duplicate {id, name?}
+        POST /orchestrate/workflows/archive {id, archived?}   ★归档/取消归档（不删除）
+        POST /orchestrate/workflows/from-run {id, name?}      ★旧 run 另存为工作流（按成员去重）
         GET  /orchestrate/run?id=          单个任务（含成员结果 / 待批 / 仲裁）
         GET  /orchestrate/pending?run=     待批权限
         POST /orchestrate/start            {task, cwd?, members:[{engine,name,role}]}
@@ -2899,6 +2901,16 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and sub == "workflows/duplicate":
                 wf = orch.duplicate_workflow(body.get("id"), body.get("name") or "")
                 self._send_json(200, {"ok": True, "workflow": wf})
+                return
+            if method == "POST" and sub == "workflows/archive":
+                arch = body.get("archived")
+                wf = orch.archive_workflow(body.get("id"), True if arch is None else bool(arch))
+                self._send_json(200, {"ok": True, "workflow": wf})
+                return
+            if method == "POST" and sub == "workflows/from-run":
+                wf = orch.workflow_from_run(body.get("id"), body.get("name") or "")
+                self._send_json(200, {"ok": True, "workflow": wf,
+                                      "existing": bool(wf.get("existing"))})
                 return
             if method == "POST" and sub == "start":
                 run = orch.start_run(body.get("task"), body.get("cwd") or "",

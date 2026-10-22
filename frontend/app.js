@@ -2130,6 +2130,11 @@ async function autoNameSession(text) {
 
 async function send() {
   const input = $("input");
+  // ★工作台打开时：底部这一行是「任务输入条」（Enter / 送出 / ▶ 都走工作流，不发聊天）
+  if (collabIsOpen()) {
+    await collabQuickRun();
+    return;
+  }
   const typed = input.value.trim();
   const files = outgoingFiles();
   if ((!typed && !files.length) || !state.current) return;
@@ -5318,6 +5323,11 @@ function ccRenderAI() {
       + `<select class="cc-ai-role" data-role-for="${esc(a.id)}" title="角色：只注入它自己的提示词（别人看不到）">`
       + ccRoleOptionsHtml(a.role || "") + `</select>`
       + `</div>`
+      + `<div class="cc-ai-opts">`
+      + `<span class="cc-ai-lbl">权限上限</span>${ccAiPermSelect(a)}`
+      + `<span class="cc-ai-eff" title="${esc("来源：" + (a.effectivePermLevelFrom || "跟随面板"))}">`
+      + `生效：${esc(permLevelLabel(a.effectivePermLevel || a.panelPermLevel || "ask"))}</span>`
+      + `</div>`
       + `</div>`
       + (a.warn ? `<div class="cc-ai-warn" title="权限：${esc(a.warn)}">⚠ ${esc(a.warn)}</div>` : "");
   }).join("");
@@ -5356,6 +5366,41 @@ async function ccAiAdd() {
     ccNote("已建 AI 成员：" + name + "（用 " + engine + " 当大脑"
       + (role ? "，角色 " + ccRoleLabel(role) : "") + "）");
   } catch (e) { ccNote("建 AI 成员失败：" + e.message, true); }
+}
+
+/** ★方向 3 收尾：每个群聊成员自己的权限上限（只会比面板更严）。 */
+const CC_AI_PERM = [
+  { id: "", label: "跟随面板" },
+  { id: "ask", label: "全部询问" },
+  { id: "read", label: "只读自动" },
+  { id: "edit", label: "读写自动" },
+  { id: "exec", label: "执行自动" },
+  { id: "all", label: "全部放行" },
+];
+
+function ccAiPermSelect(a) {
+  const cur = String(a.permLevel || "");
+  const eff = String(a.effectivePermLevel || "");
+  const tip = "这个成员自己的权限上限（只会比面板更严，不会更宽）；当前生效："
+    + permLevelLabel(eff || "ask");
+  return `<select class="cc-ai-perm" data-perm-for="${esc(a.id)}" title="${esc(tip)}">`
+    + CC_AI_PERM.map((x) => `<option value="${esc(x.id)}"`
+      + `${x.id === cur ? " selected" : ""}>${esc(x.label)}</option>`).join("")
+    + `</select>`;
+}
+
+async function ccAiPerm(id, level) {
+  const a = ccAgentById(id);
+  const who = (a && a.name) || id;
+  try {
+    const r = await ccAgentFetch("/update", { method: "POST",
+      body: { id: id, permLevel: String(level || "") } });
+    if (r && r.agents) CC.ai = r.agents;
+    ccRenderAI();
+    ccNote(`「${who}」的权限上限：` + (level ? permLevelLabel(level) : "跟随面板"));
+  } catch (e) {
+    ccNote("设权限上限失败：" + e.message, true);
+  }
 }
 
 /** 每行的「大脑」下拉：列出可用的 ACP agent，当前绑定的即使不可用也保留。 */
@@ -5693,6 +5738,8 @@ function initCocraft() {
     const sel = e.target.closest && e.target.closest(".cc-ai-eng");
     const row = e.target.closest && e.target.closest(".cc-ai");
     if (sel && row) { ccAiEngine(row.dataset.id, sel.value); return; }
+    const ps = e.target.closest && e.target.closest("[data-perm-for]");
+    if (ps && row) { ccAiPerm(row.dataset.id, ps.value); return; }
     const rs = e.target.closest && e.target.closest(".cc-ai-role");
     if (rs && row) { ccAiRole(row.dataset.id, rs.value); }
   });
@@ -12669,6 +12716,8 @@ const COLLAB = {
   // ★工作流（0.2.11）：可复用配置 + 画布
   view: "wf",                 // "wf" | "run"
   workflows: [], wfErr: "", wfId: "", wfBusy: false, wfSeq: 0,
+  wfArchOpen: false,          // ★左栏「已归档」折叠区（P3）
+  splitHinted: {},            // ★「这个工作流还是单阶段」提示只弹一次（按工作流 id）
   runWfFilter: "",            // 运行历史只看某个工作流
   canvas: { zoom: 1, pan: { x: 20, y: 14 }, nodes: {}, sel: "", drag: null, panning: null,
             saveTimer: 0 },
@@ -12676,7 +12725,7 @@ const COLLAB = {
 
 const COLLAB_ST = {
   wait: "等待中", running: "运行中", done: "完成", failed: "失败",
-  timeout: "超时", cancelled: "已取消",
+  timeout: "超时", cancelled: "已取消", skipped: "已跳过",
   partial: "部分完成",
 };
 const COLLAB_DEC = {
@@ -12727,6 +12776,66 @@ function collabIsOpen() {
   return !!bs && bs.classList.contains("collab-open");
 }
 
+/* ---------------- ★整窗 + 底部输入区（小本子）当任务框 ---------------- */
+
+let COLLAB_COMPOSER_DEF = null;
+let COLLAB_QUICK_HOME = null;      // 任务输入条在原工作流视图里的位置（收工时搬回去）
+
+/** 记住小本子的原始占位/按钮文案（第一次打开工作台时记一次）。 */
+function collabComposerInit() {
+  if (COLLAB_COMPOSER_DEF) return;
+  const input = $("input");
+  const btn = $("btn-send");
+  const label = document.querySelector("#composer .composer-label");
+  COLLAB_COMPOSER_DEF = {
+    ph: input ? String(input.getAttribute("placeholder") || "") : "",
+    send: btn ? String(btn.textContent || "送出") : "送出",
+    sendTitle: btn ? String(btn.title || "") : "",
+    label: label ? String(label.textContent || "") : "",
+  };
+}
+
+/** 工作台开着时：整窗底部给 #composer 让位（设计像素 = 实际高度 / 界面缩放）。 */
+function collabSyncFullscreen() {
+  if (!collabIsOpen()) return;
+  const c = $("composer");
+  const z = (typeof uiZoom === "function" ? uiZoom() : 1) || 1;
+  const h = c ? c.getBoundingClientRect().height : 0;
+  document.documentElement.style.setProperty(
+    "--collab-bottom", Math.max(0, Math.round(h / z)) + "px");
+}
+
+/** 小本子进入 / 退出「工作台任务框」模式：**把任务输入条整条搬进去**。 */
+function collabComposerSync() {
+  collabComposerInit();
+  const on = collabIsOpen();
+  document.documentElement.classList.toggle("collab-open", on);
+  const comp = $("composer");
+  const label = document.querySelector("#composer .composer-label");
+  const quick = $("collab-quick");
+  const wrap = document.querySelector("#composer .composer-wrap");
+  if (!on) {
+    if (comp) comp.classList.remove("collab-input");
+    // 搬回工作流视图原来的位置（下次打开还能再搬）
+    if (quick && COLLAB_QUICK_HOME && quick.parentNode !== COLLAB_QUICK_HOME.parent) {
+      try {
+        COLLAB_QUICK_HOME.parent.insertBefore(quick, COLLAB_QUICK_HOME.next);
+      } catch { /* 原位置没了就留在原地，不崩 */ }
+    }
+    if (label && COLLAB_COMPOSER_DEF) label.textContent = COLLAB_COMPOSER_DEF.label;
+    return;
+  }
+  // ★搬到小本子的位置：标签 + 任务输入 + ▶ 运行 就是底部这一行
+  if (quick && wrap && quick.parentNode !== wrap) wrap.appendChild(quick);
+  if (comp) comp.classList.add("collab-input");
+  if (label) {
+    const hasWf = !!collabWf();
+    label.textContent = COLLAB.view === "wf" && hasWf ? "协作 · 这次要做什么"
+      : (hasWf ? "协作 · 运行详情" : "协作 · 先新建一个工作流");
+  }
+  collabSyncFullscreen();
+}
+
 /** 关掉权限抽屉并清空（切回画布 / 离开工作台时用；否则宽抽屉会盖在画布上）。 */
 function collabPermReset() {
   COLLAB.permOpen = false;
@@ -12760,10 +12869,14 @@ async function collabOpen(open) {
     collabLoadRuns(!(COLLAB.workflows || []).length);
     collabStartPoll();
     collabStartRunsPoll();
+    collabComposerSync();
+    const q = $("collab-quick-task");
+    if (q) setTimeout(() => q.focus(), 60);
   } else {
     collabStopPoll();
     collabStopRunsPoll();
     collabPermReset();
+    collabComposerSync();
   }
 }
 
@@ -12865,6 +12978,75 @@ async function collabLoadRuns(autoOpen) {
 /* ---------------- ★工作流（可复用配置 + 画布） ---------------- */
 
 const CV_NODE = { w: 196, h: 92, taskW: 200, gapY: 108 };
+// 默认排布：阶段在左、成员在**右侧竖排**（一行一个阶段）
+const CV_STAGE = { w: 210, h: 78, gapX: 300, dx: 6, memberY: 140, gapY: 100,
+                   memberX: 250, rowGap: 42 };
+const COLLAB_TIP_KEY = "cocraft.collab.canvasTip";   // ★画布首用提示只弹一次
+
+/** 阶段清单（老工作流没有 stages → 一个默认阶段，和以前一样是扇出）。 */
+function collabWfStages(wf) {
+  const list = (wf && Array.isArray(wf.stages) ? wf.stages : [])
+    .filter((s) => s && s.id);
+  if (list.length) return list;
+  return [{ id: "s1", name: "全部成员", when: "always", onFail: "stop", retries: 0 }];
+}
+function collabStageById(wf, id) {
+  return collabWfStages(wf).find((s) => String(s.id) === String(id)) || null;
+}
+function collabStageWhenText(v) {
+  return v === "onSuccess" ? "仅上一阶段成功"
+    : v === "onFailure" ? "仅上一阶段失败" : "总是执行";
+}
+function collabStageStageText(s) {
+  const bits = [collabStageWhenText(s && s.when)];
+  bits.push((s && s.onFail) === "continue" ? "失败继续" : "失败即停");
+  if (Number(s && s.retries)) bits.push("重试 " + Number(s.retries));
+  return bits.join(" · ");
+}
+
+/** 这个工作流是不是「旧的单阶段 + 审查者和别人混在一起」？（按钮会高亮提示） */
+function collabSplitNeeded(wf) {
+  const stages = collabWfStages(wf);
+  if (stages.length !== 1) return false;
+  const ms = (wf && wf.members) || [];
+  const rev = ms.filter((m) => String(m.role || "") === "reviewer").length;
+  return rev > 0 && rev < ms.length;
+}
+
+/** ★按角色拆成两个阶段：实现/测试/调研（s1）→ 审查（s2），并重置画布排布。 */
+function collabSplitStagesByRole() {
+  const wf = collabWf();
+  if (!wf) return;
+  const ms = wf.members || [];
+  if (ms.length < 2) { setBanner("至少两个成员才需要拆阶段"); return; }
+  const revs = ms.filter((m) => String(m.role || "") === "reviewer");
+  const others = ms.filter((m) => String(m.role || "") !== "reviewer");
+  if (!revs.length) {
+    setBanner("没有「审查者」角色的成员 —— 先在成员检查器里把角色改成审查者");
+    return;
+  }
+  if (!others.length) { setBanner("全是审查者，没有可放在前一阶段的成员"); return; }
+  const okv = !window.confirm
+    || window.confirm("按角色拆成两个阶段？\n\n"
+      + `阶段 1（实现 / 测试 / 调研）：${others.map((m) => m.name || m.id).join("、")}\n`
+      + `阶段 2（审查）：${revs.map((m) => m.name || m.id).join("、")}\n\n`
+      + "会重置画布排布（成员坐标）。");
+  if (!okv) return;
+  wf.stages = [
+    { id: "s1", name: "实现", when: "always", onFail: "stop", retries: 0 },
+    { id: "s2", name: "审查", when: "always", onFail: "stop", retries: 0 },
+  ];
+  others.forEach((m) => { m.stage = "s1"; });
+  revs.forEach((m) => { m.stage = "s2"; });
+  wf.layout = { zoom: 1, nodes: {} };
+  COLLAB.canvas.sel = "";
+  collabSaveWfSoon();
+  collabRenderCanvas();
+  collabRenderInspector();
+  collabRenderWfList();
+  collabRenderWf();
+  setBanner(`已分阶段：${others.length} 人先做 → ${revs.length} 人审查`, { ms: 6000 });
+}
 
 function collabWfById(id) {
   return (COLLAB.workflows || []).find((w) => String(w.id) === String(id)) || null;
@@ -12884,23 +13066,53 @@ function collabWfRun(wf) {
   return null;
 }
 
-/** 画布布局：缺失的节点自动给一个位置；清理已经不存在的成员。 */
+/** 画布布局：任务 → 阶段（横排）→ 阶段内成员（竖排）；缺失的节点自动给位置，清理已删除的。 */
 function collabWfLayout(wf) {
   const L = (wf && wf.layout) || {};
   const nodes = Object.assign({}, L.nodes || {});
   const ms = (wf && wf.members) || [];
+  const stages = collabWfStages(wf);
   const ids = new Set(["task"]);
+  stages.forEach((s) => ids.add(String(s.id)));
   ms.forEach((m) => ids.add(String(m.id)));
   Object.keys(nodes).forEach((k) => { if (!ids.has(k)) delete nodes[k]; });
+  // ★默认排布：**阶段在左、成员在右侧竖排**（一行一个阶段）。
+  //   已有坐标一律保留；缺阶段的按它成员的现有位置放到**左侧**（老布局不推倒重来）。
+  let cursor = 30;
+  stages.forEach((s) => {
+    const sid = String(s.id);
+    const mem = ms.filter((m) => String(m.stage || stages[0].id) === sid);
+    if (!nodes[sid]) {
+      const ps = mem.map((m) => nodes[String(m.id)]).filter(Boolean);
+      if (ps.length) {
+        const minX = Math.min.apply(null, ps.map((p) => p.x));
+        const minY = Math.min.apply(null, ps.map((p) => p.y));
+        nodes[sid] = { x: Math.max(8, minX - (CV_STAGE.w + 46)), y: minY };
+      } else {
+        nodes[sid] = { x: 340, y: cursor };
+      }
+    }
+    const sp = nodes[sid];
+    const rowH = Math.max(CV_STAGE.h + 46, mem.length * CV_NODE.gapY + 24);
+    mem.forEach((m, j) => {
+      const id = String(m.id);
+      if (!nodes[id]) {
+        nodes[id] = { x: sp.x + CV_STAGE.memberX, y: sp.y + 24 + j * CV_NODE.gapY };
+      }
+    });
+    cursor = Math.max(cursor, sp.y) + rowH + CV_STAGE.rowGap;
+  });
   if (!nodes.task) {
-    const n = Math.max(1, ms.length);
-    nodes.task = { x: 40, y: Math.round(28 + ((n - 1) * CV_NODE.gapY) / 2 - 4) };
+    const s1 = nodes[String(stages[0].id)] || { x: 340, y: 30 };
+    nodes.task = { x: 40, y: s1.y };
   }
-  let y = 28;
-  ms.forEach((m) => {
+  // 脏数据兜底：没归到任何阶段的成员放到第一个阶段右侧
+  ms.forEach((m, j) => {
     const id = String(m.id);
-    if (!nodes[id]) nodes[id] = { x: m.role === "reviewer" ? 620 : 360, y: y };
-    y += CV_NODE.gapY;
+    if (!nodes[id]) {
+      const sp = nodes[String(stages[0].id)] || { x: 340, y: 30 };
+      nodes[id] = { x: sp.x + CV_STAGE.memberX, y: sp.y + 24 + j * CV_NODE.gapY };
+    }
   });
   let zoom = Number(L.zoom) || 1;
   zoom = Math.max(0.6, Math.min(1.6, zoom));
@@ -12923,7 +13135,9 @@ async function collabLoadWorkflows(autoSelect) {
   }
   if (COLLAB.wfId && !collabWfById(COLLAB.wfId)) { COLLAB.wfId = ""; COLLAB.runWfFilter = ""; }
   if (autoSelect && !COLLAB.wfId && (COLLAB.workflows || []).length) {
-    const first = COLLAB.workflows[0];
+    // ★归档的默认不选中（除非整个列表都归档了 —— 那就还选第一条，别让界面空着）
+    const first = (COLLAB.workflows || []).find((w) => !w.archived)
+      || (COLLAB.workflows || [])[0];
     COLLAB.wfId = String(first.id);
     COLLAB.runWfFilter = String(first.id);
     COLLAB.view = "wf";
@@ -12958,20 +13172,22 @@ function collabSelectWf(id, opts) {
   setTimeout(collabFitCanvas, 100);
 }
 
-function collabRenderWfList() {
-  const box = $("collab-wf-list");
-  const cnt = $("collab-wf-count");
-  if (!box) return;
-  const list = COLLAB.workflows || [];
-  if (cnt) cnt.textContent = list.length ? (list.length + " 个") : "";
-  if (COLLAB.wfErr) {
-    box.innerHTML = `<div class="collab-empty"><span>${esc(COLLAB.wfErr)}</span></div>`;
-    return;
-  }
-  if (!list.length) {
-    box.innerHTML = `<div class="collab-empty"><span>还没有工作流 —— 点左栏「工作流 ＋」建一个（成员 / 目录 / 默认任务都可复用）。</span></div>`;
-    return;
-  }
+/** 左栏一行工作流（带 ▶ 一键跑）。 */
+function collabWfRowHtml(w) {
+  const n = (w.members || []).length;
+  const last = collabWfLastRun(w);
+  const st = last ? (COLLAB_ST[String(last.status || "")] || String(last.status || "")) : "未跑过";
+  return `<div class="collab-wf-row${String(w.id) === String(COLLAB.wfId) ? " on" : ""}"`
+    + ` data-wf="${esc(w.id)}" title="${esc((w.name || "") + (w.cwd ? "\n" + w.cwd : ""))}">`
+    + `<span class="collab-dot ${last ? esc(String(last.status || "")) : ""}"></span>`
+    + `<span class="collab-wf-t"><b>${esc(w.name || "未命名工作流")}</b>`
+    + `<i>${esc(n + " 成员 · 跑过 " + (w.runCount || 0) + " 次 · " + st)}</i></span>`
+    + `<button type="button" class="wrun" data-wf-run="${esc(w.id)}" title="用默认任务一键跑">▶</button>`
+    + `</div>`;
+}
+
+/** 按项目（cwd）分组渲染一组工作流。 */
+function collabWfGroupsHtml(list) {
   const groups = [];
   const by = {};
   list.forEach((w) => {
@@ -12984,19 +13200,40 @@ function collabRenderWfList() {
     }
     by[key].items.push(w);
   });
-  box.innerHTML = groups.map((g) => `<div class="collab-wf-group" title="${esc(g.dir)}">${esc(g.name)}</div>`
-    + g.items.map((w) => {
-      const n = (w.members || []).length;
-      const last = collabWfLastRun(w);
-      const st = last ? (COLLAB_ST[String(last.status || "")] || String(last.status || "")) : "未跑过";
-      return `<div class="collab-wf-row${String(w.id) === String(COLLAB.wfId) ? " on" : ""}"`
-        + ` data-wf="${esc(w.id)}" title="${esc((w.name || "") + (g.dir ? "\n" + g.dir : ""))}">`
-        + `<span class="collab-dot ${last ? esc(String(last.status || "")) : ""}"></span>`
-        + `<span class="collab-wf-t"><b>${esc(w.name || "未命名工作流")}</b>`
-        + `<i>${esc(n + " 成员 · 跑过 " + (w.runCount || 0) + " 次 · " + st)}</i></span>`
-        + `<button type="button" class="wrun" data-wf-run="${esc(w.id)}" title="用默认任务一键跑">▶</button>`
-        + `</div>`;
-    }).join("")).join("");
+  return groups.map((g) => `<div class="collab-wf-group" title="${esc(g.dir)}">${esc(g.name)}</div>`
+    + g.items.map(collabWfRowHtml).join("")).join("");
+}
+
+function collabRenderWfList() {
+  const box = $("collab-wf-list");
+  const cnt = $("collab-wf-count");
+  if (!box) return;
+  const list = COLLAB.workflows || [];
+  const archived = list.filter((w) => !!w.archived);
+  if (cnt) {
+    cnt.textContent = list.length
+      ? (list.length + " 个" + (archived.length ? "（归档 " + archived.length + "）" : ""))
+      : "";
+  }
+  if (COLLAB.wfErr) {
+    box.innerHTML = `<div class="collab-empty"><span>${esc(COLLAB.wfErr)}</span></div>`;
+    return;
+  }
+  if (!list.length) {
+    box.innerHTML = `<div class="collab-empty"><span>还没有工作流 —— 点左栏「工作流 ＋」建一个（成员 / 目录 / 默认任务都可复用）。</span></div>`;
+    return;
+  }
+  // ★归档的收进折叠区（P3）：默认收起，点一下展开；**不删除**，随时能点回来
+  let html = collabWfGroupsHtml(list.filter((w) => !w.archived));
+  if (archived.length) {
+    html += `<button type="button" class="collab-wf-arch${COLLAB.wfArchOpen ? " open" : ""}"`
+      + ` data-wf-arch-toggle="1" title="归档只是收起来：成员 / 布局 / 运行历史都还在">`
+      + `已归档 ${archived.length} 个 ${COLLAB.wfArchOpen ? "▾" : "▸"}</button>`;
+    if (COLLAB.wfArchOpen) {
+      html += `<div class="collab-wf-archbox">${collabWfGroupsHtml(archived)}</div>`;
+    }
+  }
+  box.innerHTML = html;
 }
 
 function collabRenderWf() {
@@ -13011,7 +13248,8 @@ function collabRenderWf() {
   const meta = $("collab-wf-meta");
   if (meta) {
     const last = collabWfLastRun(wf);
-    const bits = [cnt + " 成员", "跑过 " + (wf.runCount || 0) + " 次"];
+    const bits = [cnt + " 成员", collabWfStages(wf).length + " 阶段",
+                  "跑过 " + (wf.runCount || 0) + " 次"];
     if (wf.cwd) bits.push(wf.cwd);
     if (last) bits.push("上次 " + (COLLAB_ST[String(last.status || "")] || last.status));
     meta.textContent = bits.join(" · ");
@@ -13024,8 +13262,44 @@ function collabRenderWf() {
     note.textContent = COLLAB.catErr ? COLLAB.catErr
       : (!collabAvailAgents().length ? "没有可用的 ACP agent（先去设置里加一个）" : "");
   }
+  const arc = $("collab-wf-archive");
+  if (arc) {
+    arc.textContent = wf.archived ? "取消归档" : "归档";
+    arc.title = wf.archived ? "放回左栏工作流列表"
+      : "归档：收进左栏「已归档」，不删除（成员 / 布局 / 运行历史都保留）";
+    arc.classList.toggle("on", !!wf.archived);
+  }
+  const splitBtn = $("collab-wf-split");
+  if (splitBtn) {
+    const need = collabSplitNeeded(wf);
+    splitBtn.classList.toggle("attention", need);
+    splitBtn.title = need
+      ? "这个工作流还是单阶段：审查者会和实现者并行 —— 点一下按角色拆成 实现 → 审查"
+      : "按角色拆成阶段：实现 / 测试 → 审查";
+    // 只在**选中这个工作流后**提示一次，别每次重绘都弹
+    if (need && !COLLAB.splitHinted[String(wf.id)]) {
+      COLLAB.splitHinted[String(wf.id)] = 1;
+      setBanner("这个工作流还是单阶段：审查者会和实现者并行 —— 点顶部「分阶段」按角色拆开", { ms: 9000 });
+    }
+  }
+  collabSyncTip();
   collabRenderCanvas();
   collabRenderInspector();
+}
+
+/** ★画布首用提示（P3）：只在第一次进画布时显示；点「知道了」后记 localStorage。 */
+function collabTipSeen() {
+  try { return localStorage.getItem(COLLAB_TIP_KEY) === "1"; } catch { return false; }
+}
+function collabSyncTip() {
+  const tip = $("collab-cv-tip");
+  if (!tip) return;
+  tip.hidden = collabTipSeen();
+}
+function collabCloseTip() {
+  const tip = $("collab-cv-tip");
+  if (tip) tip.hidden = true;
+  try { localStorage.setItem(COLLAB_TIP_KEY, "1"); } catch { /* 隐私模式 */ }
 }
 
 /** 主区三选一：工作流 / 运行 / 空态。 */
@@ -13034,6 +13308,7 @@ function collabRenderMain() {
   const runBox = $("collab-run");
   const wfBox = $("collab-wf");
   if (!empty || !runBox || !wfBox) return;
+  if (collabIsOpen()) collabComposerSync();      // 底部任务框的文案跟着视图变
   if (COLLAB.view === "run" && COLLAB.run) {
     empty.hidden = true; wfBox.hidden = true; runBox.hidden = false;
     return;
@@ -13041,6 +13316,11 @@ function collabRenderMain() {
   if (COLLAB.view === "wf" && collabWf()) {
     empty.hidden = true; runBox.hidden = true; wfBox.hidden = false;
     return;
+  }
+  // 空态被「打不开这条任务」覆盖过 → 还原成三步引导（按钮是委托的，还原后仍能点）
+  if (COLLAB.emptyHtml && empty.dataset.kind === "err") {
+    empty.innerHTML = COLLAB.emptyHtml;
+    delete empty.dataset.kind;
   }
   empty.hidden = false; wfBox.hidden = true; runBox.hidden = true;
 }
@@ -13053,9 +13333,17 @@ async function collabSaveWfNow() {
     name: wf.name || "未命名工作流",
     cwd: wf.cwd || "",
     taskTemplate: wf.taskTemplate || "",
+    stages: collabWfStages(wf).map((s) => ({
+      id: s.id, name: s.name || "", when: s.when || "always",
+      onFail: s.onFail || "stop", retries: Number(s.retries) || 0,
+    })),
     members: (wf.members || []).map((m, i) => ({
       id: m.id || ("m" + (i + 1)), role: m.role || "",
       name: m.name || "", engine: m.engine || "",
+      // ★别漏 permLevel：拖节点 / 改名字都会走自动保存，漏了就会把节点权限抹回「跟随面板」
+      permLevel: m.permLevel || "",
+      // ★阶段（P4）：阶段之间串行、阶段内并行
+      stage: m.stage || "s1",
     })),
     layout: { zoom: COLLAB.canvas.zoom, nodes: COLLAB.canvas.nodes },
   };
@@ -13084,13 +13372,18 @@ async function collabNewWorkflow() {
   const agents = collabAvailAgents();
   if (!agents.length) { setBanner("没有可用的 ACP agent —— 先去设置里加一个"); return; }
   const eng = String(agents[0].id);
+  const eng2 = String((agents[1] && agents[1].id) || eng);
   const wf = {
     name: "新工作流", cwd: (typeof currentDir === "function" ? currentDir() : "") || "",
     taskTemplate: "",
+    // ★默认就是「阶段 1 实现 → 阶段 2 审查」：能直接跑，也能改成并行
+    stages: [
+      { id: "s1", name: "实现", when: "always", onFail: "stop", retries: 0 },
+      { id: "s2", name: "审查", when: "always", onFail: "stop", retries: 0 },
+    ],
     members: [
-      { id: "m1", role: "implementer", name: "impl", engine: eng },
-      { id: "m2", role: "reviewer", name: "rev",
-        engine: String((agents[1] && agents[1].id) || eng) },
+      { id: "m1", role: "implementer", name: "impl", engine: eng, stage: "s1" },
+      { id: "m2", role: "reviewer", name: "rev", engine: eng2, stage: "s2" },
     ],
     layout: { zoom: 1, nodes: {} },
   };
@@ -13144,6 +13437,52 @@ async function collabDeleteWf() {
   }
 }
 
+/** ★归档 / 取消归档（P3）：不删除任何东西，只收进左栏折叠区。 */
+async function collabArchiveWf() {
+  const wf = collabWf();
+  if (!wf) return;
+  const to = !wf.archived;
+  try {
+    const r = await api("/orchestrate/workflows/archive", {
+      method: "POST", body: JSON.stringify({ id: wf.id, archived: to }),
+    });
+    const saved = (r && r.workflow) || null;
+    if (saved && saved.id) {
+      const i = (COLLAB.workflows || []).findIndex((w) => String(w.id) === String(saved.id));
+      if (i >= 0) COLLAB.workflows[i] = saved; else COLLAB.workflows.unshift(saved);
+    } else {
+      wf.archived = to;
+    }
+    if (to) COLLAB.wfArchOpen = true;            // 刚归档 → 展开，让人看得见它去哪了
+    collabRenderWfList();
+    collabRenderWf();
+    collabRenderRuns();
+    setBanner(to ? "已归档（收进左栏「已归档」，不删除）" : "已取消归档");
+  } catch (e) {
+    setBanner("归档失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+/** ★旧 run「另存为工作流」（P3）：按成员组合去重；存完直接切到画布。 */
+async function collabSaveRunAsWf() {
+  const run = COLLAB.run;
+  if (!run || !run.id) { setBanner("先打开一条运行记录"); return; }
+  try {
+    const r = await api("/orchestrate/workflows/from-run", {
+      method: "POST", body: JSON.stringify({ id: run.id }),
+    });
+    const wf = (r && r.workflow) || null;
+    if (!wf || !wf.id) throw new Error("后端没有返回工作流");
+    await collabLoadWorkflows(false);
+    await collabLoadRuns(false);
+    if (r && r.existing) setBanner(`这套成员组合已经有工作流「${wf.name}」—— 直接用它`, { ms: 6000 });
+    else setBanner(`已存为工作流「${wf.name}」—— 之后不用再选成员`, { ms: 6000 });
+    collabSelectWf(wf.id);
+  } catch (e) {
+    setBanner("另存为工作流失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
 async function collabPickWfCwd() {
   const wf = collabWf();
   if (!wf) return;
@@ -13174,8 +13513,11 @@ function collabAddMember() {
     if (num >= n) n = num + 1;
   });
   const id = "m" + n;
+  const stages = collabWfStages(wf);
+  const selStage = collabStageById(wf, COLLAB.canvas.sel);
+  const stageId = String((selStage && selStage.id) || stages[stages.length - 1].id);
   wf.members = wf.members || [];
-  wf.members.push({ id: id, role: "implementer", name: "m" + n, engine: eng });
+  wf.members.push({ id: id, role: "implementer", name: "m" + n, engine: eng, stage: stageId });
   const lay = collabWfLayout(wf);
   wf.layout = { zoom: COLLAB.canvas.zoom, nodes: lay.nodes };
   COLLAB.canvas.nodes = lay.nodes;
@@ -13199,6 +13541,59 @@ function collabDeleteMember(id) {
   collabRenderWfList();
 }
 
+/* ---- ★阶段（P4）：加 / 删 ---- */
+
+function collabAddStage() {
+  const wf = collabWf();
+  if (!wf) return;
+  const stages = collabWfStages(wf);
+  if (stages.length >= 8) { setBanner("最多 8 个阶段"); return; }
+  let n = 1;
+  stages.forEach((s) => {
+    const num = Number(String(s.id || "").replace(/^s/, ""));
+    if (num >= n) n = num + 1;
+  });
+  const id = "s" + n;
+  wf.stages = stages.concat([{
+    id: id, name: "阶段 " + (stages.length + 1), when: "always", onFail: "stop", retries: 0,
+  }]);
+  wf.layout = { zoom: COLLAB.canvas.zoom, nodes: COLLAB.canvas.nodes };
+  COLLAB.canvas.sel = id;
+  collabSaveWfSoon();
+  collabRenderCanvas();
+  collabRenderInspector();
+  collabRenderWfList();
+  collabRenderWf();
+  setBanner(`已加「阶段 ${stages.length + 1}」—— 在成员检查器里把成员选到这个阶段`);
+}
+
+function collabDeleteStage(id) {
+  const wf = collabWf();
+  if (!wf) return;
+  const stages = collabWfStages(wf);
+  if (stages.length <= 1) { setBanner("至少要留一个阶段"); return; }
+  const idx = stages.findIndex((s) => String(s.id) === String(id));
+  if (idx < 0) return;
+  const target = stages[idx > 0 ? idx - 1 : idx + 1];
+  (wf.members || []).forEach((m) => {
+    if (String(m.stage || stages[0].id) === String(id)) {
+      m.stage = String(target.id);
+      if (wf.layout && wf.layout.nodes) delete wf.layout.nodes[m.id];
+      delete COLLAB.canvas.nodes[m.id];
+    }
+  });
+  wf.stages = stages.filter((s) => String(s.id) !== String(id));
+  if (wf.layout && wf.layout.nodes) delete wf.layout.nodes[id];
+  delete COLLAB.canvas.nodes[id];
+  if (COLLAB.canvas.sel === String(id)) COLLAB.canvas.sel = "";
+  collabSaveWfSoon();
+  collabRenderCanvas();
+  collabRenderInspector();
+  collabRenderWfList();
+  collabRenderWf();
+  setBanner(`已删除阶段，成员移到「${target.name || target.id}」`);
+}
+
 /* ---- 画布渲染 ---- */
 
 function collabNodePos(lay, id, dx, dy) {
@@ -13210,17 +13605,26 @@ function collabRefreshCanvasStatus() {
   if (COLLAB.view !== "wf") return;
   const wf = collabWf();
   if (!wf) return;
-  const run = collabWfRun(wf) || collabWfLastRun(wf);
+  // ⚠ 只有「当前打开发完整运行」才有成员/阶段明细；左栏历史是**摘要**（members 是数字）
+  const run = collabWfRun(wf);
+  const stages = collabWfStages(wf);
+  const stageById = {}, memberById = {};
+  (run && Array.isArray(run.stages) ? run.stages : []).forEach((s) => {
+    stageById[String(s.id)] = s;
+  });
+  (run && Array.isArray(run.members) ? run.members : []).forEach((m) => {
+    memberById[String(m.id)] = m;
+  });
+  const stageIds = new Set(stages.map((s) => String(s.id)));
   const nodes = document.querySelectorAll("#collab-cv-nodes [data-node]");
   nodes.forEach((el) => {
     const id = String(el.dataset.node || "");
     if (id === "task") return;
-    const i = (wf.members || []).findIndex((m) => String(m.id) === id);
-    if (i < 0) return;
-    const rm = (run && (run.members || [])[i]) || null;
-    const st = rm ? String(rm.status || "") : "";
+    const st = stageIds.has(id)
+      ? String((stageById[id] || {}).status || "")
+      : String((memberById[id] || {}).status || "");
     let stat = el.querySelector(".cv-n-stat");
-    if (!st) { if (stat) stat.remove(); return; }
+    if (!st) { if (stat && !stageIds.has(id)) stat.remove(); return; }
     if (!stat) {
       stat = document.createElement("span");
       el.appendChild(stat);
@@ -13240,24 +13644,56 @@ function collabRenderCanvas() {
   if (inner) {
     inner.style.transform = `translate(${COLLAB.canvas.pan.x}px, ${COLLAB.canvas.pan.y}px) scale(${COLLAB.canvas.zoom})`;
   }
-  const run = collabWfRun(wf) || collabWfLastRun(wf);
-  const task = collabNodePos(lay, "task", 40, 130);
+  const run = collabWfRun(wf);
+  const stages = collabWfStages(wf);
+  const stageRun = {}, memberRun = {};
+  (run && Array.isArray(run.stages) ? run.stages : []).forEach((s) => {
+    stageRun[String(s.id)] = s;
+  });
+  (run && Array.isArray(run.members) ? run.members : []).forEach((m) => {
+    memberRun[String(m.id)] = m;
+  });
+  const task = collabNodePos(lay, "task", 40, 40);
   const nodes = [`<div class="cv-node cv-task${COLLAB.canvas.sel === "task" ? " sel" : ""}"`
     + ` data-node="task" style="left:${task.x}px;top:${task.y}px">`
     + `<span class="cv-tag">任务</span><b>${esc(wf.name || "工作流")}</b>`
     + `<span class="cv-n-eng" title="${esc(wf.taskTemplate || "")}">${esc(wf.taskTemplate || "（运行时临时输入）")}</span>`
     + `</div>`];
+  // ★阶段节点（P4）：横排；阶段之间串行，阶段内成员并行
+  stages.forEach((s, i) => {
+    const p = collabNodePos(lay, String(s.id), 340 + i * CV_STAGE.gapX, 30);
+    const rs = stageRun[String(s.id)] || null;
+    const st = rs ? String(rs.status || "") : "";
+    const zh = st ? (COLLAB_ST[st] || st) : "";
+    const n = (wf.members || []).filter((m) => String(m.stage || stages[0].id) === String(s.id)).length;
+    nodes.push(`<div class="cv-node cv-stage${COLLAB.canvas.sel === String(s.id) ? " sel" : ""}"`
+      + ` data-node="${esc(s.id)}" style="left:${p.x}px;top:${p.y}px">`
+      + `<button type="button" class="cv-x" data-cv-del-stage="${esc(s.id)}"`
+      + ` title="删除阶段（成员会移到相邻阶段）">×</button>`
+      + `<span class="cv-tag">阶段 ${i + 1}</span>`
+      + `<b>${esc(s.name || ("阶段 " + (i + 1)))}</b>`
+      + `<span class="cv-n-eng" title="${esc(collabStageStageText(s))}">`
+      + `${esc(n + " 成员 · " + collabStageStageText(s))}</span>`
+      + (zh ? `<span class="cv-n-stat ${esc(st)}">${esc(zh)}</span>` : "")
+      + `</div>`);
+  });
   (wf.members || []).forEach((m, i) => {
-    const p = collabNodePos(lay, String(m.id), m.role === "reviewer" ? 620 : 360, 28 + i * CV_NODE.gapY);
-    const rm = (run && (run.members || [])[i]) || null;
+    const stageId = String(m.stage || stages[0].id);
+    const sp = collabNodePos(lay, stageId, 340, 30);
+    const idx = (wf.members || []).filter((x) => String(x.stage || stages[0].id) === stageId)
+      .findIndex((x) => String(x.id) === String(m.id));
+    const p = collabNodePos(lay, String(m.id), sp.x + CV_STAGE.memberX,
+      sp.y + 24 + Math.max(0, idx) * CV_NODE.gapY);
+    const rm = memberRun[String(m.id)] || null;
     const st = rm ? String(rm.status || "") : "";
     const zh = st ? (COLLAB_ST[st] || st) : "";
+    const stageName = (stages.find((s) => String(s.id) === stageId) || {}).name || "";
     nodes.push(`<div class="cv-node cv-member${COLLAB.canvas.sel === String(m.id) ? " sel" : ""}"`
       + ` data-node="${esc(m.id)}" style="left:${p.x}px;top:${p.y}px">`
       + `<button type="button" class="cv-x" data-cv-del="${esc(m.id)}" title="删掉这个成员">×</button>`
       + `<span class="cv-role">${esc(collabRoleLabel(m.role) || "成员")}</span>`
       + `<b>${esc(m.name || m.id)}</b>`
-      + `<span class="cv-n-eng">${esc(m.engine || "（未选大脑）")}</span>`
+      + `<span class="cv-n-eng" title="阶段：${esc(stageName)}">${esc(m.engine || "（未选大脑）")}</span>`
       + (zh ? `<span class="cv-n-stat ${esc(st)}">${esc(zh)}</span>` : "")
       + `</div>`);
   });
@@ -13265,32 +13701,66 @@ function collabRenderCanvas() {
   collabPaintEdges();
 }
 
+/** 两张卡片之间的连线：**按相对方位选最近的边**（上/下/左/右），
+ *  不再假设「成员一定在阶段正下方」—— 用户把节点拖到哪都能连得明白。 */
+function cvEdgePath(a, aw, ah, b, bw, bh) {
+  const acx = a.x + aw / 2, acy = a.y + ah / 2;
+  const bcx = b.x + bw / 2, bcy = b.y + bh / 2;
+  const dx = bcx - acx, dy = bcy - acy;
+  let x1, y1, x2, y2, k;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    // 左右为主
+    if (dx >= 0) { x1 = a.x + aw; y1 = acy; x2 = b.x; y2 = bcy; }
+    else { x1 = a.x; y1 = acy; x2 = b.x + bw; y2 = bcy; }
+    k = Math.max(28, Math.min(80, Math.abs(x2 - x1) / 2));
+    return `M${x1} ${y1} C${x1 + (dx >= 0 ? k : -k)} ${y1}, `
+      + `${x2 - (dx >= 0 ? k : -k)} ${y2}, ${x2} ${y2}`;
+  }
+  // 上下为主
+  if (dy >= 0) { x1 = acx; y1 = a.y + ah; x2 = bcx; y2 = b.y; }
+  else { x1 = acx; y1 = a.y; x2 = bcx; y2 = b.y + bh; }
+  k = Math.max(28, Math.min(80, Math.abs(y2 - y1) / 2));
+  return `M${x1} ${y1} C${x1} ${y1 + (dy >= 0 ? k : -k)}, `
+    + `${x2} ${y2 - (dy >= 0 ? k : -k)}, ${x2} ${y2}`;
+}
+
 function collabPaintEdges() {
   const svg = $("collab-cv-edges");
   const wf = collabWf();
   if (!svg || !wf) return;
   const nodes = COLLAB.canvas.nodes || {};
-  const ms = (wf.members || []).map((m) => ({ id: String(m.id), role: m.role }));
-  const task = nodes.task || { x: 40, y: 130 };
-  const tR = task.x + CV_NODE.taskW, tC = task.y + CV_NODE.h / 2;
+  const stages = collabWfStages(wf);
   const parts = [];
-  ms.forEach((m) => {
-    const p = nodes[m.id];
-    if (!p) return;
-    const x2 = p.x, y2 = p.y + CV_NODE.h / 2;
-    parts.push(`<path d="M${tR} ${tC} C${tR + 80} ${tC}, ${x2 - 80} ${y2}, ${x2} ${y2}"/>`);
-  });
-  const rev = ms.find((m) => m.role === "reviewer");
-  if (rev && nodes[rev.id]) {
-    const rp = nodes[rev.id];
-    const ax = rp.x, ay = rp.y + CV_NODE.h / 2;
-    ms.filter((m) => m.role !== "reviewer").forEach((m) => {
-      const p = nodes[m.id];
-      if (!p) return;
-      const x1 = p.x + CV_NODE.w, y1 = p.y + CV_NODE.h / 2;
-      parts.push(`<path class="dash" d="M${x1} ${y1} C${x1 + 60} ${y1}, ${ax - 60} ${ay}, ${ax} ${ay}"/>`);
-    });
+  const box = (id, w, h) => {
+    const p = nodes[id];
+    return p ? { x: p.x, y: p.y } : null;
+  };
+  // 任务 → 阶段 1
+  const task = box("task");
+  const first = stages[0] && box(String(stages[0].id));
+  if (task && first) {
+    parts.push(`<path class="flow" d="${cvEdgePath(task, CV_NODE.taskW, CV_NODE.h,
+      first, CV_STAGE.w, CV_STAGE.h)}"/>`);
   }
+  stages.forEach((s, i) => {
+    const aId = String(s.id);
+    const a = box(aId);
+    if (!a) return;
+    // 阶段 i → 阶段 i+1（串行主链）
+    const nx = stages[i + 1] && box(String(stages[i + 1].id));
+    if (nx) {
+      parts.push(`<path class="flow" d="${cvEdgePath(a, CV_STAGE.w, CV_STAGE.h,
+        nx, CV_STAGE.w, CV_STAGE.h)}"/>`);
+    }
+    // 阶段 → 它的成员（扇出）：各自按方位连最近边
+    const mem = (wf.members || []).filter((m) => String(m.stage || stages[0].id) === aId);
+    mem.forEach((m) => {
+      const p = box(String(m.id));
+      if (!p) return;
+      parts.push(`<path class="fan" d="${cvEdgePath(a, CV_STAGE.w, CV_STAGE.h,
+        p, CV_NODE.w, CV_NODE.h)}"/>`);
+    });
+  });
   svg.innerHTML = parts.join("");
 }
 
@@ -13309,12 +13779,15 @@ function collabFitCanvas() {
   const nodes = COLLAB.canvas.nodes || {};
   const keys = Object.keys(nodes);
   if (!keys.length) return;
+  const wfFit = collabWf();
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   keys.forEach((k) => {
     const p = nodes[k];
-    const w = k === "task" ? CV_NODE.taskW : CV_NODE.w;
+    const isStage = !!collabStageById(wfFit, k);
+    const w = k === "task" ? CV_NODE.taskW : (isStage ? CV_STAGE.w : CV_NODE.w);
+    const h = isStage ? CV_STAGE.h : CV_NODE.h;
     minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x + w); maxY = Math.max(maxY, p.y + CV_NODE.h);
+    maxX = Math.max(maxX, p.x + w); maxY = Math.max(maxY, p.y + h);
   });
   const pad = 36;
   const z = Math.max(0.6, Math.min(1.4, Math.min(
@@ -13365,6 +13838,27 @@ function collabRenderInspector() {
       + `<div class="insp-msg">改完自动保存；点画布空白处收起。</div>`;
     return;
   }
+  // ★阶段（P4）：名字 / 执行条件 / 失败策略 / 重试
+  const stages = collabWfStages(wf);
+  const stage = collabStageById(wf, sel);  if (stage) {
+    const idx = stages.findIndex((s) => String(s.id) === String(stage.id));
+    const n = (wf.members || []).filter((m) => String(m.stage || stages[0].id) === String(stage.id)).length;
+    const whenOpts = [["always", "总是执行"], ["onSuccess", "仅上一阶段成功"],
+                      ["onFailure", "仅上一阶段失败"]]
+      .map(([v, t]) => `<option value="${v}"${String(stage.when || "always") === v ? " selected" : ""}>${t}</option>`).join("");
+    const failOpts = [["stop", "失败即停"], ["continue", "失败继续"]]
+      .map(([v, t]) => `<option value="${v}"${String(stage.onFail || "stop") === v ? " selected" : ""}>${t}</option>`).join("");
+    const retryOpts = [0, 1, 2].map((v) => `<option value="${v}"${Number(stage.retries || 0) === v ? " selected" : ""}>${v} 次</option>`).join("");
+    box.hidden = false;
+    box.innerHTML = `<b>阶段 ${idx + 1}</b>`
+      + `<label><span>名字</span><input data-insp-stage-name maxlength="24" value="${esc(stage.name || "")}" autocomplete="off"></label>`
+      + `<label><span>条件</span><select data-insp-stage-when${idx === 0 ? " disabled" : ""} title="看**上一阶段**的结果">${whenOpts}</select></label>`
+      + `<label><span>失败</span><select data-insp-stage-onfail>${failOpts}</select></label>`
+      + `<label><span>重试</span><select data-insp-stage-retries>${retryOpts}</select></label>`
+      + `<div class="insp-msg">${n} 个成员 · 阶段内并行、阶段之间串行。`
+      + `${idx === 0 ? "第 1 阶段总是执行（条件不适用）。" : "失败策略决定后面的阶段跑不跑。"}</div>`;
+    return;
+  }
   const m = (wf.members || []).find((x) => String(x.id) === String(sel));
   if (!m) { box.hidden = true; box.innerHTML = ""; return; }
   const roleOpts = `<option value="">（无角色）</option>`
@@ -13375,13 +13869,22 @@ function collabRenderInspector() {
   const levels = collabPermLevels();
   const permOpts = levels.map((x) => `<option value="${esc(x.id || "")}"${String(x.id || "") === String(m.permLevel || "") ? " selected" : ""}`
     + ` title="${esc(x.note || "")}">${esc(x.label || x.id || "跟随面板")}</option>`).join("");
+  const stageOpts = stages.map((s, i) => `<option value="${esc(s.id)}"`
+    + `${String(s.id) === String(m.stage || stages[0].id) ? " selected" : ""}>`
+    + `阶段 ${i + 1} · ${esc(s.name || "")}</option>`).join("");
+  const lastRun = collabWfLastRun(wf);
   box.hidden = false;
   box.innerHTML = `<b>成员</b>`
+    + `<label><span>阶段</span><select data-insp-stage title="阶段之间串行：上一阶段跑完才轮到下一阶段">${stageOpts}</select></label>`
     + `<label><span>角色</span><select data-insp-role>${roleOpts}</select></label>`
     + `<label><span>名字</span><input data-insp-name maxlength="24" value="${esc(m.name || "")}" autocomplete="off"></label>`
     + `<label><span>大脑</span><select data-insp-engine>${engOpts}</select></label>`
     + `<label><span>权限</span><select data-insp-perm title="只对这一个成员生效">${permOpts}</select></label>`
-    + `<div class="insp-msg">「信任」= 非破坏性不再逐条问；破坏性仍要确认。改完自动保存。</div>`;
+    + (lastRun
+      ? `<button type="button" class="insp-link" data-insp-open-run="${esc(m.id)}"`
+        + ` title="打开这个工作流最近一次运行，并定位到这个成员">在运行结果里看 →</button>`
+      : "")
+    + `<div class="insp-msg">阶段之间串行、阶段内并行。「信任」= 非破坏性不再逐条问；破坏性仍要确认。</div>`;
 }
 
 function collabInspectorChanged(e) {
@@ -13390,7 +13893,36 @@ function collabInspectorChanged(e) {
   const t = e.target;
   const sel = COLLAB.canvas.sel;
   const m = (wf.members || []).find((x) => String(x.id) === String(sel));
+  const stage = collabStageById(wf, sel);
   let hit = false;
+  if (stage) {
+    if (t.matches("[data-insp-stage-name]")) {
+      stage.name = String(t.value || "").trim() || stage.name; hit = true;
+    } else if (t.matches("[data-insp-stage-when]")) {
+      stage.when = String(t.value || "always"); hit = true;
+    } else if (t.matches("[data-insp-stage-onfail]")) {
+      stage.onFail = (String(t.value) === "continue") ? "continue" : "stop"; hit = true;
+    } else if (t.matches("[data-insp-stage-retries]")) {
+      stage.retries = Math.max(0, Math.min(2, Number(t.value) || 0)); hit = true;
+    }
+    if (!hit) return;
+    collabSaveWfSoon();
+    collabRenderCanvas();
+    collabRenderInspector();
+    collabRenderWfList();
+    if (t.matches("[data-insp-stage-name]")) collabRenderWf();
+    return;
+  }
+  if (m && t.matches("[data-insp-stage]")) {
+    m.stage = String(t.value || "s1");
+    // 换阶段后位置要重新算：把这个成员的自定义坐标清掉（只清它一个）
+    if (wf.layout && wf.layout.nodes) delete wf.layout.nodes[m.id];
+    delete COLLAB.canvas.nodes[m.id];
+    collabSaveWfSoon();
+    collabRenderCanvas();
+    collabRenderInspector();
+    return;
+  }
   if (m && t.matches("[data-insp-role]")) { m.role = t.value; hit = true; }
   else if (m && t.matches("[data-insp-name]")) { m.name = String(t.value || "").trim() || m.id; hit = true; }
   else if (m && t.matches("[data-insp-engine]")) { m.engine = t.value; hit = true; }
@@ -13445,6 +13977,7 @@ async function collabQuickRun(wfId) {
 function collabCanvasPointerDown(e) {
   const cv = $("collab-canvas");
   if (!cv || e.button !== 0) return;
+  if (e.target.closest(".cv-tip")) return;      // ★首用提示上的按钮：别当成平移/拖节点
   const nodeEl = e.target.closest("[data-node]");
   if (nodeEl && !e.target.closest("button,input,textarea,select")) {
     e.preventDefault();
@@ -13452,6 +13985,16 @@ function collabCanvasPointerDown(e) {
     const p = (COLLAB.canvas.nodes || {})[id];
     if (!p) return;
     const start = { x: e.clientX, y: e.clientY, ox: p.x, oy: p.y };
+    // ★拖动阶段 = 连它下面的成员一起拖（否则连线会被拉成长条）
+    const wfNow = collabWf();
+    const isStage = !!collabStageById(wfNow, id);
+    const kidStart = isStage
+      ? (wfNow.members || []).filter((m) => String(m.stage || "s1") === String(id))
+        .map((m) => {
+          const kp = (COLLAB.canvas.nodes || {})[String(m.id)] || { x: 0, y: 0 };
+          return { id: String(m.id), x: kp.x, y: kp.y };
+        })
+      : [];
     nodeEl.classList.add("dragging");
     let moved = false;
     const move = (ev) => {
@@ -13462,6 +14005,17 @@ function collabCanvasPointerDown(e) {
       p.y = start.oy + dy;
       nodeEl.style.left = p.x + "px";
       nodeEl.style.top = p.y + "px";
+      kidStart.forEach((k) => {
+        const kp = (COLLAB.canvas.nodes || {})[k.id];
+        if (!kp) return;
+        kp.x = k.x + dx;
+        kp.y = k.y + dy;
+        const kel = document.querySelector(`#collab-cv-nodes [data-node="${k.id}"]`);
+        if (kel) {
+          kel.style.left = kp.x + "px";
+          kel.style.top = kp.y + "px";
+        }
+      });
       collabPaintEdges();
     };
     const up = () => {
@@ -13514,6 +14068,7 @@ function collabCanvasWheel(e) {
 }
 
 function collabCanvasDblClick(e) {
+  if (e.target.closest(".cv-tip")) return;      // 首用提示里双击别当成「加成员」
   const nodeEl = e.target.closest("[data-node]");
   if (!nodeEl) { collabAddMember(); return; }
   COLLAB.canvas.sel = nodeEl.dataset.node;
@@ -13522,10 +14077,21 @@ function collabCanvasDblClick(e) {
 }
 
 function collabCanvasClick(e) {
+  if (e.target.closest("[data-cv-tip-close]")) {
+    e.stopPropagation();
+    collabCloseTip();
+    return;
+  }
   const del = e.target.closest("[data-cv-del]");
   if (del) {
     e.stopPropagation();
     collabDeleteMember(del.dataset.cvDel);
+    return;
+  }
+  const delStage = e.target.closest("[data-cv-del-stage]");
+  if (delStage) {
+    e.stopPropagation();
+    collabDeleteStage(delStage.dataset.cvDelStage);
     return;
   }
   if (COLLAB.canvas.justDragged) return;
@@ -13534,6 +14100,18 @@ function collabCanvasClick(e) {
   COLLAB.canvas.sel = nodeEl.dataset.node;
   collabRenderCanvas();
   collabRenderInspector();
+}
+
+/** ★从画布检查器跳到「这个成员在最近一次运行里的结果列」。 */
+async function collabOpenMemberResult(mid) {
+  const wf = collabWf();
+  if (!wf) return;
+  const last = collabWfRun(wf) || collabWfLastRun(wf);
+  if (!last || !last.id) { setBanner("这个工作流还没有运行记录"); return; }
+  await collabOpenRun(last.id);
+  COLLAB.memSel = String(mid || "");
+  COLLAB.memAll = false;
+  if (COLLAB.run) collabRenderCols(COLLAB.run);
 }
 
 async function collabOpenRun(id, keepPoll) {
@@ -13688,6 +14266,7 @@ function collabRenderRun() {
       if (COLLAB.catErr) why = COLLAB.catErr;
       else if (COLLAB.runErr) why = COLLAB.runErr;
       else if (COLLAB.runsErr) why = COLLAB.runsErr;
+      empty.dataset.kind = "err";
       empty.innerHTML = `<b>${COLLAB.catErr || !COLLAB.runId ? "本地协作" : "打不开这条任务"}</b>`
         + `<span>${esc(why)}</span>`;
     }
@@ -13715,6 +14294,16 @@ function collabRenderRun() {
     const bits = [];
     if (run.workflowName) {
       bits.push(`工作流 <b class="collab-proj-name">${esc(run.workflowName)}</b>`);
+    }
+    // ★阶段进度（P4）：几段跑完了 / 当前在哪一段
+    const rstages = run.stages || [];
+    if (rstages.length) {
+      const fin = rstages.filter((s) => ["done", "partial", "failed", "skipped",
+        "cancelled"].includes(String(s.status || ""))).length;
+      const cur = rstages.find((s) => s.status === "running")
+        || rstages.find((s) => s.status === "wait");
+      bits.push(`阶段 ${fin}/${rstages.length}`
+        + (cur ? ` · 当前「${esc(cur.name || "")}」` : ""));
     }
     const pj = collabProjectOf(run);
     if (run.cwd) {
@@ -13760,6 +14349,10 @@ function collabRenderActions(run) {
   if (run.workflowId) {
     parts.push(`<button type="button" data-collab-back-wf="${esc(run.workflowId)}"`
       + ` title="回到这个工作流的画布（可改成员/再跑）">← 工作流</button>`);
+  } else {
+    // ★旧 run（P3）：把当次成员组合存成可复用工作流（按成员去重，重复点不会造一堆）
+    parts.push(`<button type="button" data-collab-save-wf="1"`
+      + ` title="把这条运行的成员 / 目录 / 任务存成工作流，之后不用再选成员">存为工作流</button>`);
   }
   if (st === "running") {
     parts.push(`<button type="button" class="danger" data-collab-cancel="" title="中断所有成员（已产出的内容保留）">取消全部</button>`);
@@ -13931,6 +14524,8 @@ function collabColHtml(m) {
   const running = st === "wait" || st === "running";
   const tok = m.tokens || {};
   const ctx = m.context || null;
+  const stageName = ((COLLAB.run && (COLLAB.run.stages || []).find(
+    (s) => String(s.id) === String(m.stage)) || {}).name) || "";
   const foot = [];
   if (tok.input != null || tok.output != null) {
     foot.push(`tokens ${tok.input != null ? fmtTok(tok.input) + " 入" : ""}${tok.output != null ? " / " + fmtTok(tok.output) + " 出" : ""}`);
@@ -13949,6 +14544,7 @@ function collabColHtml(m) {
     : "";
   return `<div class="collab-col${m.kind === "arbitration" ? " arb" : ""}" data-mid="${esc(m.id)}">`
     + `<div class="collab-col-head">`
+    + (stageName ? `<i class="collab-stage-tag" title="阶段（阶段之间串行）">${esc(stageName)}</i>` : "")
     + (m.roleLabel ? `<i class="collab-role">${esc(m.roleLabel)}</i>` : "")
     + `<b>${esc(m.name || m.id)}</b><span class="collab-engine">${esc(m.engine || "")}</span>`
     + `<span class="collab-st ${esc(st)}">${esc(collabStText(st))}</span>`
@@ -13982,6 +14578,8 @@ function collabRenderCols(run) {
   }
   const multi = ms.length > 1;
   const showAll = !!COLLAB.memAll;
+  const stageMap = {};
+  (run.stages || []).forEach((s) => { stageMap[String(s.id)] = s; });
   const strip = $("collab-mem");
   if (strip) {
     strip.hidden = !multi;
@@ -13989,9 +14587,11 @@ function collabRenderCols(run) {
       strip.innerHTML = ms.map((m) => {
         const st = String(m.status || "wait");
         const on = showAll ? "" : (String(m.id) === sel ? " on" : "");
+        const stName = (stageMap[String(m.stage)] || {}).name || "";
         return `<button type="button" class="collab-mem-chip${on}" data-collab-mem="${esc(m.id)}"`
-          + ` title="${esc((m.roleLabel ? m.roleLabel + " · " : "") + (m.engine || "") + " · 权限：" + collabPermLabel(m.permLevel))}">`
+          + ` title="${esc((stName ? "阶段：" + stName + " · " : "") + (m.roleLabel ? m.roleLabel + " · " : "") + (m.engine || "") + " · 权限：" + collabPermLabel(m.permLevel))}">`
           + `<i class="dot ${esc(st)}"></i>`
+          + (stName ? `<i class="collab-mem-stage">${esc(stName)}</i>` : "")
           + (m.roleLabel ? `<em>${esc(m.roleLabel)}</em>` : "")
           + `<b>${esc(m.name || m.id)}</b>`
           + `<span>${esc(collabStText(st))}</span>`
@@ -14219,9 +14819,30 @@ async function collabRerun() {  const run = COLLAB.run;
 
 /* ---------------- 事件接线 ---------------- */
 
+/** 焦点在输入控件里？——Delete / 快捷键不能抢打字。 */
+function collabTypingTarget(e) {
+  const t = e && e.target;
+  if (!t) return false;
+  const tag = String(t.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || !!t.isContentEditable;
+}
+
 function initCollab() {
   const btn = $("btn-collab");
   if (btn) btn.addEventListener("click", () => collabOpen(!collabIsOpen()));
+  // ★整窗 / 底部任务框：记下任务输入条原来的位置，并监听小本子高度变化
+  collabComposerInit();
+  const quickHome = $("collab-quick");
+  if (quickHome) {
+    COLLAB_QUICK_HOME = { parent: quickHome.parentNode, next: quickHome.nextSibling };
+  }
+  try {
+    const comp = $("composer");
+    if (comp && typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(() => { if (collabIsOpen()) collabSyncFullscreen(); })
+        .observe(comp);
+    }
+  } catch { /* ignore */ }
   const close = $("collab-close");
   if (close) close.addEventListener("click", collabClose);
   const refresh = $("collab-refresh");
@@ -14235,15 +14856,28 @@ function initCollab() {
   });
   const nw = $("collab-new-wf");
   if (nw) nw.addEventListener("click", collabNewWorkflow);
+  // ★空状态三步引导（P3）：按钮用**事件委托** —— 空态会被错误提示覆盖/还原，直接绑按钮会失效
+  const emptyBox = $("collab-empty");
+  if (emptyBox) {
+    COLLAB.emptyHtml = emptyBox.innerHTML;
+    emptyBox.addEventListener("click", (e) => {
+      if (e.target.closest("[data-collab-empty-new]")) collabNewWorkflow();
+    });
+  }
   const runsAll = $("collab-runs-all");
   if (runsAll) runsAll.addEventListener("click", () => {
     COLLAB.runWfFilter = "";
     collabRenderRuns();
   });
 
-  // ★左栏：工作流（点选中；▶ 用默认任务一键跑）
+  // ★左栏：工作流（点选中；▶ 用默认任务一键跑；「已归档」可折叠）
   const wfList = $("collab-wf-list");
   if (wfList) wfList.addEventListener("click", (e) => {
+    if (e.target.closest("[data-wf-arch-toggle]")) {
+      COLLAB.wfArchOpen = !COLLAB.wfArchOpen;
+      collabRenderWfList();
+      return;
+    }
     const runBtn = e.target.closest("[data-wf-run]");
     if (runBtn) { e.stopPropagation(); collabQuickRun(runBtn.dataset.wfRun); return; }
     const row = e.target.closest("[data-wf]");
@@ -14266,6 +14900,10 @@ function initCollab() {
   if (wfCwd) wfCwd.addEventListener("click", collabPickWfCwd);
   const wfAdd = $("collab-wf-add");
   if (wfAdd) wfAdd.addEventListener("click", collabAddMember);
+  const wfAddStage = $("collab-wf-add-stage");
+  if (wfAddStage) wfAddStage.addEventListener("click", collabAddStage);
+  const wfSplit = $("collab-wf-split");
+  if (wfSplit) wfSplit.addEventListener("click", collabSplitStagesByRole);
   const wfLayout = $("collab-wf-layout");
   if (wfLayout) wfLayout.addEventListener("click", () => {
     const wf = collabWf();
@@ -14279,6 +14917,8 @@ function initCollab() {
   });
   const wfDup = $("collab-wf-dup");
   if (wfDup) wfDup.addEventListener("click", collabDuplicateWf);
+  const wfArc = $("collab-wf-archive");
+  if (wfArc) wfArc.addEventListener("click", collabArchiveWf);
   const wfDel = $("collab-wf-del");
   if (wfDel) wfDel.addEventListener("click", collabDeleteWf);
   const quickRun = $("collab-quick-run");
@@ -14300,10 +14940,17 @@ function initCollab() {
     cv.addEventListener("click", collabCanvasClick);
   }
   const insp = $("collab-inspector");
-  if (insp) insp.addEventListener("change", collabInspectorChanged);
+  if (insp) {
+    insp.addEventListener("change", collabInspectorChanged);
+    insp.addEventListener("click", (e) => {
+      const openRun = e.target.closest("[data-insp-open-run]");
+      if (openRun) collabOpenMemberResult(openRun.dataset.inspOpenRun);
+    });
+  }
 
-  // 窗口尺寸变化 → 画布重新适应（节流）
+  // 窗口尺寸变化 → 画布重新适应（节流）+ 整窗底部重新让位
   window.addEventListener("resize", () => {
+    if (collabIsOpen()) collabSyncFullscreen();
     if (!COLLAB.open || COLLAB.view !== "wf") return;
     if (COLLAB.canvas.resizeTimer) clearTimeout(COLLAB.canvas.resizeTimer);
     COLLAB.canvas.resizeTimer = setTimeout(collabFitCanvas, 250);
@@ -14342,6 +14989,8 @@ function initCollab() {
     }
     const backWf = e.target.closest("[data-collab-back-wf]");
     if (backWf) { collabSelectWf(backWf.dataset.collabBackWf); return; }
+    const saveWf = e.target.closest("[data-collab-save-wf]");
+    if (saveWf) { collabSaveRunAsWf(); return; }
     const cancel = e.target.closest("[data-collab-cancel]");
     if (cancel) { collabCancel(cancel.dataset.collabCancel || ""); return; }
     const perm = e.target.closest("[data-perm-go]");
@@ -14379,10 +15028,32 @@ function initCollab() {
   });
 
 
+  // ★键盘（P3）：Esc 先收检查器 / 权限抽屉，再退工作台；Ctrl+Enter 开跑；Delete 删选中成员
   window.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape") return;
-    if (collabIsOpen() && COLLAB.permOpen) { collabPermToggle(false); return; }
-    if (collabIsOpen()) collabClose();
+    if (!collabIsOpen()) return;
+    if (e.key === "Escape") {
+      if (COLLAB.permOpen) { collabPermToggle(false); return; }
+      if (COLLAB.canvas.sel) {
+        COLLAB.canvas.sel = "";
+        collabRenderCanvas();
+        collabRenderInspector();
+        return;
+      }
+      collabClose();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      if (COLLAB.view === "wf" && collabWf()) { e.preventDefault(); collabQuickRun(); }
+      return;
+    }
+    if (e.key === "Delete" && COLLAB.view === "wf" && !collabTypingTarget(e)) {
+      const sel = String(COLLAB.canvas.sel || "");
+      if (sel && sel !== "task") {
+        e.preventDefault();
+        if (collabStageById(collabWf(), sel)) collabDeleteStage(sel);
+        else collabDeleteMember(sel);
+      }
+    }
   });
 }
 
