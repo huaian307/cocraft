@@ -773,6 +773,15 @@ CHECKS = [
     ("安装包", "★安装器：轮询进度 /agent/install/status", r'"/agent/install/status"'),
     ("安装包", "★装完自动刷新 agentlist", r"await loadAcpAgents\(\);"),
     ("安装包", "★关掉弹窗就停止轮询（装还是会继续）", r"AINST\.stop\(\)"),
+    # ---- ★node 模式 agent 的自主更新（0.2.21）----
+    ("安装包", "★更新：查「有没有新版」调 /agent/latest", r'api\("/agent/latest"'),
+    ("安装包", "★更新：点「更新」→ POST /agent/update", r'api\("/agent/update",\s*\{\s*method:\s*"POST"'),
+    ("安装包", "★更新：显示已装版本（anew-i-ver）", r'class="anew-i-ver"'),
+    ("安装包", "★更新：只有真有新版才出按钮（不摆空按钮）", r"it\.hasUpdate && it\.latest"),
+    ("安装包", "★更新：「检查更新」强制刷新（不用等缓存）", r"\?force=1"),
+    ("安装包", "★更新：检查完在说明行写「有 N 个可以更新」", r"function agentCheckUpdates"),
+    ("安装包", "★更新：确认框写清「会重下 / 可能中断会话」", r"正在跑的会话可能被中断"),
+    ("安装包", "★更新：装完 / 更新完都刷新 agentlist", r"await loadAcpAgents\(\);"),
     # ---- ★结果仲裁（2026-10-17）----
     ("主动编排", "★仲裁：只找**本群、角色=审查者**的成员", r"function ccArbReviewers"),
     ("主动编排", "★仲裁 = 给审查者发一条带**输出格式要求**的消息", r"【仲裁】请评审上面这次派活的方案"),
@@ -1057,6 +1066,7 @@ HTML_CHECKS = [
     # ---- ★面板内安装 agent（2026-10-17）----
     ("安装包", "★面板内安装：agent 目录", r'id="anew-install"'),
     ("安装包", "★面板内安装：可装清单容器", r'id="anew-i-list"'),
+    ("安装包", "★面板内安装：「检查更新」按钮", r'id="anew-i-check"'),
     # ---- ★一键建组 ----
     ("主动编排", "★一键建组：入口按钮", r'id="cc-team-open"'),
     ("主动编排", "★一键建组：面板 + 预设下拉 + 建组按钮", r'id="cc-team-preset"'),
@@ -1245,6 +1255,10 @@ CSS_CHECKS = [
     ("安装包", "★安装器面板（金色描边）", r"\.anew-install \{"),
     ("安装包", "★每行一个可装项（长说明省略号）", r"\.anew-i-note \{[^}]*text-overflow: ellipsis"),
     ("安装包", "★安装日志可滚动（不撑破弹窗）", r"\.anew-i-pre \{[^}]*overflow: auto"),
+    # ---- ★node 模式 agent 的自主更新（0.2.21）----
+    ("安装包", "★「更新」按钮（金色，和卸载区分开）", r"\.anew-i-b\.up \{"),
+    ("安装包", "★「最新 vX」标记（有新版才显示）", r"\.anew-i-tag\.new \{"),
+    ("安装包", "★「检查更新」小按钮（沉在右侧）", r"\.anew-i-chk \{[^}]*margin-left: auto"),    ("安装包", "★已装版本号（等宽小字）", r"\.anew-i-ver \{"),
     # ---- ★信任面板（方向 3 第一块）----
     ("信任", "★面板容器（按界面缩放补偿 vw）", r"\.trust-box \{[^}]*calc\(94vw / var\(--ui-z"),
     ("信任", "★等级行（当前档高亮）", r"\.trust-lv\.on \{"),
@@ -1882,6 +1896,18 @@ PY_CHECKS = [
     ("安装包", "★路由 /agent/catalog", r'path == "/agent/catalog"'),
     ("安装包", "★路由 /agent/install", r'path == "/agent/install"'),
     ("安装包", "★路由 /agent/uninstall", r'path == "/agent/uninstall"'),
+    # ---- ★node 模式 agent 的自主更新：后端（0.2.21）----
+    ("安装包", "★版本：读已装版本（node_modules 的 package.json）", r"def installed_version"),
+    ("安装包", "★版本：问 registry 最新版（直连 → 国内镜像）", r"def _latest_version"),
+    ("安装包", "★版本：结果缓存 10 分钟（别一开弹窗就联网）", r"VER_TTL = 600"),
+    ("安装包", "★版本：并行问 + 总截止时间（不把界面吊死）", r"deadline = time\.time\(\) \+ VER_TIMEOUT"),
+    ("安装包", "★版本：semver 比较（预发布低于同号正式版）", r"def _vkey"),
+    ("安装包", "★更新：npm 装最新（本地目录包不拼 @latest）", r"def _update_target"),
+    ("安装包", "★更新：先收掉占用文件的 ACP 子进程", r"def _release_agent"),
+    ("安装包", "★更新：npm 报占用 → 清该目录残留进程再试", r"def _kill_under"),
+    ("安装包", "★更新：已有注册项就更新命令（不重复注册）", r"def _register"),
+    ("安装包", "★路由 /agent/latest（?force=1 强制刷新）", r'path == "/agent/latest"'),
+    ("安装包", "★路由 /agent/update（异步，进度看 status）", r'path == "/agent/update"'),
     ("主动编排", "★一键建组：预设表（dev / review / research）", r"TEAM_PRESETS = \{"),
     ("主动编排", "★一键建组：纯函数 team_plan（好测）", r"def team_plan\("),
     ("主动编排", "★一键建组：重名自动加后缀", r"def _uniq_name\("),
@@ -2086,7 +2112,7 @@ def main() -> int:
               "run_suite.py", "orchestrator_test.py", "collab_ui_test.py", "msg_nav_test.py",
               "agent_safety_test.py", "context_estimate_test.py",
               "cross_engine_model_test.py", "perm_audit_test.py", "inbox_queue_test.py",
-              "workflow_canvas_ui_test.py",
+              "workflow_canvas_ui_test.py", "agent_install_test.py", "agent_update_ui_test.py",
               "acp_events_test.py", "acp_api_test.py", "acp_engine_ui_test.py",
               "watch_mode_test.py", "md_render_test.py", "selftest.py",
               "cocraft_agents_check.py", "cocraft_ws_check.py")

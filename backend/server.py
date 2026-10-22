@@ -1470,6 +1470,26 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(400, {"ok": False, "error": str(exc)})
                     return
                 self._send_json(200, res)
+            elif path == "/agent/latest":
+                # ★ 检查「装了的 agent 有没有新版」（网络；结果缓存 10 分钟。?force=1 强制刷新）
+                q = parse_qs(urlsplit(self.path).query)
+                force = str((q.get("force") or [""])[0]).lower() in ("1", "true", "yes")
+                self._send_json(200, {"ok": True,
+                                      "data": agent_install.versions(force=force)})
+            elif path == "/agent/update":
+                # ★ 把已装的 npm agent 更新到最新（异步：立刻回，进度看 /agent/install/status）
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                b = self._read_json_body() or {}
+                try:
+                    res = agent_install.update(str(b.get("id") or ""),
+                                               pkg=str(b.get("pkg") or ""),
+                                               registry=str(b.get("registry") or ""))
+                except (ValueError, RuntimeError) as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(200, res)
             elif path == "/agent/uninstall":
                 if method != "POST":
                     self._send_json(405, {"error": "POST only"})

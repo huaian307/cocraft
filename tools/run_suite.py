@@ -60,6 +60,7 @@ TESTS = [
     "agent_perm_cap_test",
     "collab_ui_test",
     "agent_install_test",
+    "agent_update_ui_test",
     "acp_events_test",
     "acp_api_test",
     "watch_mode_test",

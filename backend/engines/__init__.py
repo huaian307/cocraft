@@ -150,3 +150,14 @@ def get_engine(engine_id: str = None):
 
 def active_engine():
     return get_engine()
+
+
+def existing_engine(engine_id: str):
+    """**已经创建过**的引擎实例（没有就回 None）。
+
+    为什么要它：有些"顺手收一下子进程"的调用（例如面板内更新 agent 前释放文件占用）不该
+    为了这件事凭空造一个引擎（造 ACP 引擎会拉起/持有会话与子进程状态）。只有本来就在用的
+    实例才值得去动它。
+    """
+    with _instances_lock:
+        return _instances.get(str(engine_id or ""))

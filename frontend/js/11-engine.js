@@ -1458,6 +1458,47 @@ async function loadInstallCatalog() {
   }
   renderInstallCatalog();
   renderInstallLog();
+  loadAgentVersions();            // ★ 顺带问一下「有没有新版」（网络，慢也没关系：先显示已装）
+}
+
+/** 问 registry：装了的这些 agent 最新版是多少（后端缓存 10 分钟；force=1 强制刷新）。 */
+async function loadAgentVersions(force) {
+  try {
+    const r = unwrap(await api("/agent/latest" + (force ? "?force=1" : ""))) || {};
+    const items = r.items || [];
+    const by = {};
+    items.forEach((it) => { by[it.id] = it; });
+    AINST.items = AINST.items.map((it) => {
+      const v = by[it.id];
+      if (!v) return it;
+      return Object.assign({}, it, {
+        installed: !!v.installed || it.installed,
+        version: v.version || it.version || "",
+        latest: v.latest || "",
+        hasUpdate: !!v.hasUpdate,
+        pkg: v.pkg || it.pkg || "",
+      });
+    });
+    // 目录里有、但「可装目录」里没列出来的（自定义 npm 包）也补进来，让它们同样能更新
+    items.forEach((v) => {
+      if (!AINST.items.some((x) => x.id === v.id)) AINST.items.push(v);
+    });
+    renderInstallCatalog();
+  } catch (e) {
+    /* 查不到新版不影响安装 / 卸载 */ }
+}
+
+/** 「检查更新」按钮：强制刷新（不等 10 分钟缓存），并把结果写在说明那一行。 */
+async function agentCheckUpdates() {
+  const note = $("anew-i-note"), btn = $("anew-i-check");
+  if (btn) btn.disabled = true;
+  if (note) note.textContent = "正在问 registry 有没有新版…";
+  await loadAgentVersions(true);
+  if (btn) btn.disabled = false;
+  if (note) {
+    const n = (AINST.items || []).filter((x) => x.installed && x.hasUpdate).length;
+    note.textContent = n ? `有 ${n} 个 agent 可以更新` : "已是最新（10 分钟内不再问）";
+  }
 }
 
 function renderInstallCatalog() {
@@ -1469,11 +1510,19 @@ function renderInstallCatalog() {
   }
   const busy = !!(AINST.job && AINST.job.busy);
   box.innerHTML = AINST.items.map((it) => {
+    const hasNew = !!(it.hasUpdate && it.latest);
     const tag = it.installed
       ? `<span class="anew-i-tag ok">已装</span>`
+        + (it.version ? `<span class="anew-i-ver" title="已装版本">v${esc(it.version)}</span>` : "")
+        + (hasNew
+          ? `<span class="anew-i-tag new" title="registry 上的最新版本">最新 v${esc(it.latest)}</span>`
+          : (it.latest ? `<span class="anew-i-tag" title="${esc(it.latest)}">已是最新</span>` : ""))
       : (it.ready ? "" : `<span class="anew-i-tag bad">缺 Node</span>`);
+    const off = `<button type="button" class="anew-i-b" data-ainst-off="${esc(it.id)}" title="从注册表移除并删掉装的文件">卸载</button>`;
     const btn = it.installed
-      ? `<button type="button" class="anew-i-b" data-ainst-off="${esc(it.id)}" title="从注册表移除并删掉装的文件">卸载</button>`
+      ? (hasNew
+        ? `<button type="button" class="anew-i-b up" data-ainst-up="${esc(it.id)}" title="npm 装最新版（${esc(it.pkg || it.id)}@latest）"${busy ? " disabled" : ""}>更新</button>`
+        : "") + off
       : `<button type="button" class="anew-i-b" data-ainst-go="${esc(it.id)}"${(busy || !it.ready) ? " disabled" : ""}>安装</button>`;
     return `<div class="anew-i-row">`
       + `<b>${esc(it.label)}</b>${tag}`
@@ -1489,8 +1538,12 @@ function renderInstallLog() {
   const j = AINST.job;
   if (!j || (!j.busy && !j.phase)) { box.hidden = true; box.innerHTML = ""; return; }
   const lines = (j.log || []).slice(-8);
-  const head = j.busy ? `正在安装 · ${esc(j.id)}（${esc(j.phase || "…")}）`
-    : (j.ok ? `装好了：${esc(j.agent || j.id)}` : `安装失败（${esc(j.error || j.phase || "")}）`);
+  const upd = j.kind === "update";
+  const head = j.busy
+    ? `正在${upd ? "更新" : "安装"} · ${esc(j.id)}（${esc(j.phase || "…")}）`
+    : (j.ok
+      ? `${upd ? "更新完成" : "装好了"}：${esc(j.agent || j.id)}${j.version ? " · v" + esc(j.version) : ""}`
+      : `${upd ? "更新" : "安装"}失败（${esc(j.error || j.phase || "")}）`);
   box.innerHTML = `<div class="anew-i-lh${j.ok ? " ok" : (j.busy ? "" : " bad")}">${head}</div>`
     + `<pre class="anew-i-pre">${esc(lines.join("\n") || "…")}</pre>`;
   box.hidden = false;
@@ -1509,9 +1562,11 @@ function AINST_poll() {
       await loadInstallCatalog();
       if (j.ok) {
         await loadAcpAgents();
-        setBanner(`已安装并注册：${j.agent || j.id}（可以在「选择 Agent」里切过去）`);
+        setBanner(j.kind === "update"
+          ? `已更新：${j.agent || j.id}${j.version ? "（v" + j.version + "）" : ""}`
+          : `已安装并注册：${j.agent || j.id}（可以在「选择 Agent」里切过去）`);
       } else if (j.error) {
-        setBanner("安装失败：" + j.error, { sticky: true });
+        setBanner((j.kind === "update" ? "更新失败：" : "安装失败：") + j.error, { sticky: true });
       }
     } catch (e) {
       AINST.stop();
@@ -1541,6 +1596,21 @@ async function agentUninstall(id) {
     await loadAcpAgents();
   } catch (e) {
     setBanner("卸载失败：" + (e && e.message ? e.message : e), { sticky: true });
+  }
+}
+
+/** ★把已装的 npm agent 更新到最新（后端异步：立刻回，进度轮询 /agent/install/status）。 */
+async function agentUpdate(id) {
+  if (!confirm("更新这个 agent 到最新版？\n\n会重新下载 npm 包；它正在跑的会话可能被中断"
+    + "（更新前面板会先收掉占用文件的子进程）。")) return;
+  try {
+    await api("/agent/update", { method: "POST", body: JSON.stringify({ id: id }) });
+    AINST.job = { busy: true, id: id, phase: "准备更新", kind: "update", log: [] };
+    renderInstallCatalog();
+    renderInstallLog();
+    AINST_poll();
+  } catch (e) {
+    setBanner("更新失败：" + (e && e.message ? e.message : e), { sticky: true });
   }
 }
 
@@ -2019,12 +2089,14 @@ function initSettings() {
     if (row && !row.dataset.noop) addCandidate(row.dataset.i);
   });
   $("anew-reload").addEventListener("click", loadCandidates);
-  $("anew-folder").addEventListener("click", addFromFolder);
+  $("anew-i-check").addEventListener("click", agentCheckUpdates);  $("anew-folder").addEventListener("click", addFromFolder);
   $("anew-addall").addEventListener("click", addAllCandidates);
-  // ★面板内安装 agent：点「安装」/「卸载」
+  // ★面板内安装 agent：点「安装」/「更新」/「卸载」
   $("anew-i-list").addEventListener("click", (e) => {
     const go = e.target.closest && e.target.closest("[data-ainst-go]");
     if (go && !go.disabled) { agentInstall(go.dataset.ainstGo); return; }
+    const up = e.target.closest && e.target.closest("[data-ainst-up]");
+    if (up && !up.disabled) { agentUpdate(up.dataset.ainstUp); return; }
     const off = e.target.closest && e.target.closest("[data-ainst-off]");
     if (off) agentUninstall(off.dataset.ainstOff);
   });

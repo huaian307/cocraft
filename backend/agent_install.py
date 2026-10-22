@@ -25,12 +25,18 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.request
+
+import netsafe
 
 from engines.acp import agents
 
 INSTALL_ROOT = os.path.join(agents.ROOT_DIR, "agents", "npm")
 MIRROR = "https://registry.npmmirror.com"
 NPM_TIMEOUT = 900.0                      # 最后一次 npm 可能很大（codex 400 MB+）
+VER_TTL = 600.0                          # 「最新版」检查结果缓存 10 分钟（别一开弹窗就联网）
+VER_TIMEOUT = 6.0                        # 单个 registry 的超时（两个源都挂时最坏 ~12s）
+REGISTRIES = ("https://registry.npmjs.org", MIRROR)
 
 # 目录：**只放"确认过能装、装完能跑"的**。id 也是安装目录名。
 CATALOG = [
@@ -50,7 +56,11 @@ _PKG_RE = re.compile(r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$", re.I)
 
 _LOCK = threading.RLock()
 _JOB = {"running": False, "id": "", "phase": "", "log": [], "error": "",
-        "started": 0.0, "finished": 0.0, "ok": False, "command": [], "agent": ""}
+        "started": 0.0, "finished": 0.0, "ok": False, "command": [], "agent": "",
+        "kind": "install", "version": "", "toVersion": ""}
+
+# 「最新版」检查结果（内存缓存；catalog() / entry_for() 会读它，前端就能直接显示"有新版"）
+_VER = {"ts": 0.0, "items": []}
 
 
 # ---------------------------------------------------------------- 小工具
@@ -89,8 +99,108 @@ def status() -> dict:
     return out
 
 
-def entry_for(spec: dict) -> dict:
-    """目录里某一项的「现在能不能装 / 装过没有」。"""
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:                           # noqa: BLE001
+        return {}
+
+
+def _pkg_of_dest(dest: str) -> str:
+    """这个安装目录是装哪个 npm 包？（从占位 package.json 的 dependencies 里认）"""
+    deps = _read_json(os.path.join(dest, "package.json")).get("dependencies") or {}
+    if not isinstance(deps, dict) or not deps:
+        return ""
+    # 优先认普通包名（`file:` 那种是本地目录依赖，测试/开发时才用）
+    for name, ver in deps.items():
+        if not str(ver or "").lower().startswith("file:"):
+            return str(name)
+    return str(next(iter(deps.keys())))
+
+
+def installed_version(spec: dict) -> str:
+    """本地已装的版本（读 `node_modules/<pkg>/package.json`；没有就回空）。"""
+    aid = str((spec or {}).get("id") or "")
+    if not aid:
+        return ""
+    dest = os.path.join(INSTALL_ROOT, aid)
+    if not os.path.isdir(dest):
+        return ""
+    pkg = str((spec or {}).get("pkg") or "") or _pkg_of_dest(dest)
+    if not pkg:
+        return ""
+    pj = _read_json(os.path.join(dest, "node_modules", *pkg.split("/"), "package.json"))
+    return str(pj.get("version") or "").strip()
+
+
+def _vkey(s: str) -> tuple:
+    """把版本号压成可比较的键（`1.2.3` / `v1.2.3` / `1.2.3-beta.1`）。
+
+    ⚠ 只做"够用"的比较：核心三段数字逐段比；**带预发布标签的低于同号正式版**；
+    其它花活（build metadata 等）忽略 —— 这里只用来判断"要不要提示更新"。
+    """
+    s = str(s or "").strip().lstrip("vV")
+    if not s:
+        return ()
+    core, _, pre = s.partition("-")
+    nums = []
+    for part in core.split("."):
+        m = re.match(r"\d+", part)
+        nums.append(int(m.group()) if m else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return (tuple(nums[:3]), 0 if pre else 1, pre)
+
+
+def has_update(cur: str, latest: str) -> bool:
+    a, b = _vkey(cur), _vkey(latest)
+    if not a or not b:
+        return False
+    return b > a
+
+
+def _latest_version(pkg: str, timeout: float = VER_TIMEOUT, fetch=None) -> str:
+    """问 registry 要这个包的最新版本（直连失败换国内镜像）。拿不到就回空，**不抛**。"""
+    fetch = fetch or _fetch_registry
+    for base in REGISTRIES:
+        url = base.rstrip("/") + "/" + str(pkg).replace("/", "%2F") + "/latest"
+        try:
+            d = fetch(url, timeout)
+            v = str((d or {}).get("version") or "").strip()
+            if v:
+                return v
+        except Exception:                       # noqa: BLE001
+            continue
+    return ""
+
+
+def _fetch_registry(url: str, timeout: float) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/json",
+                                              "User-Agent": "cocraft-agent-update"})
+    with netsafe.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace")) or {}
+
+
+def _specs() -> list:
+    """可管理项 = 目录里预置的 + 磁盘上已经装了的（自定义包也让它能更新）。"""
+    out = [dict(s) for s in CATALOG]
+    seen = {str(s.get("id")) for s in out}
+    if os.path.isdir(INSTALL_ROOT):
+        for name in sorted(os.listdir(INSTALL_ROOT)):
+            dest = os.path.join(INSTALL_ROOT, name)
+            if name in seen or not os.path.isdir(dest):
+                continue
+            if not os.path.isfile(os.path.join(dest, "package.json")):
+                continue
+            out.append({"id": name, "label": name, "pkg": _pkg_of_dest(dest),
+                        "provider": "", "note": "自定义 npm 包"})
+    return out
+
+
+def entry_for(spec: dict, _cache: bool = True) -> dict:
+    """目录里某一项的「现在能不能装 / 装过没有 / 什么版本 / 有没有新版」。"""
     aid = str(spec.get("id") or "")
     dest = os.path.join(INSTALL_ROOT, aid)
     node, npm = node_and_npm()
@@ -102,16 +212,65 @@ def entry_for(spec: dict) -> dict:
         if dest and dest.lower() in cmd.lower():
             hit = str(a.get("id"))
             break
-    return {"id": aid, "label": spec.get("label") or aid, "pkg": spec.get("pkg") or "",
-            "provider": spec.get("provider") or "", "note": spec.get("note") or "",
-            "installed": bool(hit) or os.path.isdir(dest),
-            "registered": hit, "dir": dest,
-            "ready": bool(node and npm), "reason": "" if (node and npm)
-            else "这台机器没有 Node（随包 node 或系统 node）——先装带 node 的安装包"}
+    out = {"id": aid, "label": spec.get("label") or aid, "pkg": spec.get("pkg") or "",
+           "provider": spec.get("provider") or "", "note": spec.get("note") or "",
+           "installed": bool(hit) or os.path.isdir(dest),
+           "registered": hit, "dir": dest,
+           "version": installed_version(spec) if os.path.isdir(dest) else "",
+           "latest": "", "hasUpdate": False,
+           "ready": bool(node and npm), "reason": "" if (node and npm)
+           else "这台机器没有 Node（随包 node 或系统 node）——先装带 node 的安装包"}
+    if _cache:
+        with _LOCK:
+            c = next((x for x in _VER["items"] if str(x.get("id")) == aid), None)
+        if c:
+            out["latest"] = str(c.get("latest") or "")
+            out["hasUpdate"] = bool(c.get("hasUpdate"))
+    return out
 
 
 def catalog() -> list:
-    return [entry_for(s) for s in CATALOG]
+    return [entry_for(s) for s in _specs()]
+
+
+def versions(force: bool = False) -> dict:
+    """检查「装了的有没有新版」（**网络**；结果缓存 VER_TTL）。
+
+    只对**已装**的项去问 registry（没装的没必要占带宽），每个包**并行**问，
+    整体最多等 ~12s（两个源各自超时 6s）。任何一项失败只记空，不影响别的。
+    """
+    now = time.time()
+    with _LOCK:
+        if not force and _VER["items"] and (now - _VER["ts"]) < VER_TTL:
+            return {"items": [dict(x) for x in _VER["items"]], "cached": True, "ts": _VER["ts"]}
+
+    items = [entry_for(s, _cache=False) for s in _specs()]
+
+    def work(it: dict) -> None:
+        pkg = str(it.get("pkg") or "") or _pkg_of_dest(os.path.join(INSTALL_ROOT, str(it.get("id"))))
+        it["pkg"] = pkg
+        if not it.get("installed") or not pkg:
+            it["latest"], it["hasUpdate"] = "", False
+            return
+        it["latest"] = _latest_version(pkg)
+        it["hasUpdate"] = has_update(it.get("version"), it.get("latest"))
+
+    ths = [threading.Thread(target=work, args=(it,), daemon=True) for it in items]
+    for t in ths:
+        t.start()
+    deadline = time.time() + VER_TIMEOUT * len(REGISTRIES) + 2
+    for t in ths:
+        t.join(max(0.0, deadline - time.time()))
+    with _LOCK:
+        _VER["ts"] = time.time()
+        _VER["items"] = items
+    return {"items": items, "cached": False, "ts": _VER["ts"]}
+
+
+def _forget_versions() -> None:
+    with _LOCK:
+        _VER["items"] = []
+        _VER["ts"] = 0.0
 
 
 def _dest(aid: str) -> str:
@@ -257,10 +416,62 @@ def install(spec_id: str, pkg: str = "", registry: str = "") -> dict:
         if not node or not npm:
             raise RuntimeError("没找到 Node / npm（随包 node 里自带 npm）—— 先装带 node 的安装包")
         _set(running=True, id=str(spec["id"]), phase="准备", log=[], error="", ok=False,
-             started=time.time(), finished=0.0, command=[], agent="")
+             started=time.time(), finished=0.0, command=[], agent="",
+             kind="install", version="", toVersion="")
     th = threading.Thread(target=_worker, args=(spec, pkg_name, node, npm, registry), daemon=True)
     th.start()
     return {"ok": True, "id": spec["id"], "dest": os.path.join(INSTALL_ROOT, spec["id"])}
+
+
+def _inst_name(pkg_name: str) -> str:
+    """`pkg_name` 可能是本地目录（测试 / `file:` 依赖）→ 要用它 package.json 里的**包名**。"""
+    name = pkg_name
+    if os.path.isdir(pkg_name):
+        name = str(_read_json(os.path.join(pkg_name, "package.json")).get("name") or "")
+        name = name or os.path.basename(os.path.normpath(pkg_name))
+    return name
+
+
+def _entry_for_dest(dest: str, pkg_name: str, node: str) -> list:
+    """装完之后：从 `package.json` 的 `bin` 认出启动命令。"""
+    inst_name = _inst_name(pkg_name)
+    base = os.path.join(dest, "node_modules", *inst_name.split("/"))
+    pj = _read_json(os.path.join(base, "package.json"))
+    return _bin_to_command(base, pj, node)
+
+
+def _cmd_error(cmd: list, dest: str) -> str:
+    """入口检查：认不出 / 跑到安装目录外面（本地目录依赖是 symlink）都算失败。"""
+    if not cmd:
+        return "装好了，但认不出可执行入口（package.json 的 bin / dist/index.js 都没有）"
+    dest_l = os.path.normcase(os.path.normpath(dest)) + os.sep
+    if not all(os.path.normcase(os.path.normpath(x)).startswith(dest_l) for x in (cmd[1:] or cmd)):
+        return "入口不在安装目录里（可能是本地目录依赖的链接）：%r" % (cmd,)
+    return ""
+
+
+def _register(spec: dict, cmd: list, dest: str, env: dict) -> dict:
+    """注册到 agentlist：**已有就更新命令/环境**，没有才新增。"""
+    reg = agents.load_registry()
+    hit = ""
+    for a in (reg.get("agents") or []):
+        if dest.lower() in " ".join(str(x) for x in (a.get("command") or [])).lower():
+            hit = str(a.get("id"))
+            break
+    if hit:
+        patch = {"command": cmd}
+        if env:
+            cur = next((a.get("env") or {} for a in (reg.get("agents") or [])
+                        if str(a.get("id")) == hit), {})
+            merged = dict(cur)
+            merged.update(env)
+            patch["env"] = merged
+        a = agents.update_agent(hit, patch) or {}
+        _job_log("[i] 注册表里的 %s 已指向新入口" % hit)
+        return a
+    return agents.add_agent(str(spec.get("label") or spec.get("id") or ""), cmd, cwd="", env=env,
+                            note=str(spec.get("note") or ""),
+                            provider=str(spec.get("provider") or "")) or {}
 
 
 def _worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str) -> None:
@@ -280,34 +491,11 @@ def _worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str) -> No
             return
         # 找入口
         _set(phase="识别入口")
-        # ⚠ `pkg_name` 是**本地目录**时（`file:` 依赖 / 测试用），不能拿它拼 node_modules 路径 ——
-        #   要用那个目录 package.json 里的**包名**（否则会算到源目录去，注册表里就指向临时文件夹）。
-        inst_name = pkg_name
-        if os.path.isdir(pkg_name):
-            try:
-                with open(os.path.join(pkg_name, "package.json"), "r", encoding="utf-8") as fh:
-                    inst_name = str((json.load(fh) or {}).get("name") or "")
-            except Exception:                   # noqa: BLE001
-                inst_name = ""
-            inst_name = inst_name or os.path.basename(os.path.normpath(pkg_name))
-        base = os.path.join(dest, "node_modules", *inst_name.split("/"))
-        pj = {}
-        try:
-            with open(os.path.join(base, "package.json"), "r", encoding="utf-8") as fh:
-                pj = json.load(fh) or {}
-        except Exception:                       # noqa: BLE001
-            pj = {}
-        cmd = _bin_to_command(base, pj, node)
-        if not cmd:
+        cmd = _entry_for_dest(dest, pkg_name, node)
+        err = _cmd_error(cmd, dest)
+        if err:
             _set(running=False, phase="失败",
-                 error="装好了，但认不出可执行入口（package.json 的 bin / dist/index.js 都没有）：%s" % base,
-                 finished=time.time())
-            return
-        # ★ 再兜一道：入口必须**在安装目录里**（本地目录依赖时 npm 会做 symlink，别把源目录写进注册表）
-        dest_l = os.path.normcase(os.path.normpath(dest)) + os.sep
-        if not all(os.path.normcase(os.path.normpath(x)).startswith(dest_l) for x in cmd[1:] or cmd):
-            _set(running=False, phase="失败",
-                 error="入口不在安装目录里（可能是本地目录依赖的链接）：%r" % (cmd,),
+                 error="%s：%s" % (err, os.path.join(dest, "node_modules", _inst_name(pkg_name))),
                  finished=time.time())
             return
         env = {}
@@ -315,11 +503,161 @@ def _worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str) -> No
             _set(phase="写 CODEX_HOME 模板")
             env["CODEX_HOME"] = _write_codex_template(dest)
         _set(phase="注册到 agentlist")
-        a = agents.add_agent(str(spec.get("label") or aid), cmd, cwd="", env=env,
-                             note=str(spec.get("note") or ""), provider=str(spec.get("provider") or ""))
+        a = _register(spec, cmd, dest, env)
+        _forget_versions()
         _set(running=False, phase="完成", ok=True, finished=time.time(),
-             command=cmd, agent=str((a or {}).get("id") or ""))
+             command=cmd, agent=str((a or {}).get("id") or ""),
+             version=installed_version(spec), toVersion=installed_version(spec))
         _job_log("[OK] 已注册：%s" % ((a or {}).get("id") or "?"))
+    except Exception as exc:                    # noqa: BLE001
+        _set(running=False, phase="失败", error="%s: %s" % (type(exc).__name__, exc),
+             finished=time.time())
+
+
+# ---------------------------------------------------------------- 更新（★ node 模式 agent 的自主更新）
+
+_BUSY_RE = re.compile(r"EBUSY|EPERM|EPERM|resource busy|being used|occupied|"
+                      r"operation not permitted|拒绝访问|另一个程序|占用", re.I)
+
+
+def _busy_tail(tail: str) -> bool:
+    return bool(_BUSY_RE.search(str(tail or "")))
+
+
+def _registered_ids(dest: str) -> list:
+    reg = agents.load_registry()
+    d = str(dest or "").lower()
+    return [str(a.get("id")) for a in (reg.get("agents") or [])
+            if d and d in " ".join(str(x) for x in (a.get("command") or [])).lower()]
+
+
+def _release_agent(dest: str, force: bool = False) -> None:
+    """更新前把占用该目录的 ACP 子进程收掉（Windows 上文件被占时 npm 会 EBUSY）。
+
+    **只动"本来就在用"的引擎实例**（`existing_engine`），不凭空造一个；
+    `force=True` 时连其它 agent 的子进程一起收（兜底：适配器可能换了 id 认不着）。
+    """
+    try:
+        from engines import existing_engine
+        eng = existing_engine("acp")
+    except Exception:                           # noqa: BLE001
+        return
+    if eng is None:
+        return
+    try:
+        if force:
+            eng.shutdown()
+            _job_log("[i] 已收起全部 ACP 子进程（释放文件占用）")
+            return
+        ids = _registered_ids(dest)
+        for aid in ids:
+            eng.shutdown_agent(aid)
+        if ids:
+            _job_log("[i] 已收起占用该 agent 的子进程：%s" % ", ".join(ids))
+    except Exception:                           # noqa: BLE001
+        pass
+
+
+def _kill_under(dest: str) -> None:
+    """兜底：杀掉 **exe 路径在这个安装目录下**的残留进程（node 适配器会另起 codex.exe 之类）。
+
+    只在 npm 报"文件被占用"时才走这一步；拿不到 PowerShell 就跳过（不阻断更新）。
+    """
+    if not dest or not os.path.isdir(dest):
+        return
+    d = dest.replace("'", "''")
+    ps = ("$d='%s'; Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like ($d + '\\*') } "
+          "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" % d)
+    try:
+        subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        _job_log("[i] 已清理该目录下的残留进程")
+    except Exception:                           # noqa: BLE001
+        pass
+
+
+def update(spec_id: str, pkg: str = "", registry: str = "") -> dict:
+    """把**已经装上**的 npm agent 更新到最新（异步，立刻返回）。
+
+    为什么要单独一条：`npm install <pkg>` 只在安装那一刻取最新；之后面板从来不问新版，
+    用户也没有入口（以前只能卸载再装）。这里补上：**查版本（versions）→ 一键更新（update）**。
+    """
+    aid = str(spec_id or "")
+    dest = _dest(aid)
+    if not os.path.isdir(dest):
+        raise RuntimeError("这个 agent 还没装：%s（先「安装」）" % aid)
+    spec = next((dict(s) for s in CATALOG if str(s.get("id")) == aid), None)
+    if spec is None:
+        spec = {"id": aid, "label": aid, "pkg": "", "provider": "", "note": "自定义 npm 包"}
+    if pkg:
+        spec["pkg"] = pkg
+    pkg_name = str(spec.get("pkg") or "").strip() or _pkg_of_dest(dest)
+    if not pkg_name:
+        raise RuntimeError("不知道这个目录对应哪个 npm 包（package.json 里没有 dependencies）")
+    if not _PKG_RE.match(pkg_name) and not os.path.isdir(pkg_name):
+        raise ValueError("不像一个 npm 包名：%s" % pkg_name)
+    node, npm = node_and_npm()
+    if not node or not npm:
+        raise RuntimeError("没找到 Node / npm（随包 node 里自带 npm）—— 先装带 node 的安装包")
+    with _LOCK:
+        if _JOB["running"]:
+            raise RuntimeError("已经有一个安装/更新任务在跑：%s" % (_JOB["id"] or "?"))
+        _set(running=True, id=aid, phase="准备更新", log=[], error="", ok=False,
+             started=time.time(), finished=0.0, command=[], agent="", kind="update",
+             version=installed_version(spec), toVersion="")
+    threading.Thread(target=_update_worker, args=(spec, pkg_name, node, npm, registry),
+                     daemon=True).start()
+    return {"ok": True, "id": aid, "dest": dest, "kind": "update",
+            "version": installed_version(spec)}
+
+
+def _update_target(pkg_name: str) -> str:
+    """更新时要装的 npm 目标：本地目录包不能拼 `@latest`（测试 / `file:` 依赖）。"""
+    p = str(pkg_name or "")
+    return p if os.path.isdir(p) else "%s@latest" % p
+
+
+def _update_worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str) -> None:
+    aid = str(spec["id"])
+    dest = _dest(aid)
+    target = _update_target(pkg_name)
+    try:
+        cur = installed_version(spec)
+        _job_log("[i] %s：%s → %s" % (aid, cur or "?", target))
+        _release_agent(dest)
+        _set(phase="下载安装（npm）")
+        rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, target], registry)
+        if rc != 0 and _busy_tail(tail):
+            _job_log("[i] npm 报文件被占用 → 再收一次进程（含该目录下的残留）后重试")
+            _release_agent(dest, force=True)
+            _kill_under(dest)
+            rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, target], registry)
+        if rc != 0 and not registry:
+            _job_log("[i] 直连 registry 失败（rc=%d）→ 换镜像 registry.npmmirror.com 再试" % rc)
+            _set(phase="下载安装（国内镜像）")
+            rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, target], MIRROR)
+        if rc != 0:
+            _set(running=False, phase="失败",
+                 error="npm 更新失败（rc=%d）：%s" % (rc, tail[-800:]), finished=time.time())
+            return
+        _set(phase="识别入口")
+        cmd = _entry_for_dest(dest, pkg_name, node)
+        err = _cmd_error(cmd, dest)
+        if err:
+            _set(running=False, phase="失败", error=err, finished=time.time())
+            return
+        env = {}
+        if spec.get("codex_home"):
+            _set(phase="写 CODEX_HOME 模板")
+            env["CODEX_HOME"] = _write_codex_template(dest)
+        _set(phase="注册到 agentlist")
+        a = _register(spec, cmd, dest, env)
+        newv = installed_version(spec)
+        _forget_versions()
+        _set(running=False, phase="完成", ok=True, finished=time.time(), command=cmd,
+             agent=str((a or {}).get("id") or ""), version=newv, toVersion=newv)
+        _job_log("[OK] 已更新到 %s（%s）" % (newv or "?", (a or {}).get("id") or "?"))
     except Exception as exc:                    # noqa: BLE001
         _set(running=False, phase="失败", error="%s: %s" % (type(exc).__name__, exc),
              finished=time.time())
@@ -349,5 +687,6 @@ def uninstall(spec_id: str, delete_files: bool = True) -> dict:
             raise ValueError("这个 agent 正在使用中（或删不掉）——先在设置里切到别的 agent 再卸载")
     if delete_files and os.path.isdir(dest):
         shutil.rmtree(dest, ignore_errors=True)
+    _forget_versions()
     return {"ok": True, "id": aid, "agent": hit, "removed": not os.path.isdir(dest),
             "label": (entry or {}).get("label") or aid}
