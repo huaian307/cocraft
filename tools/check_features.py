@@ -19,6 +19,32 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # (分组, 说明, 正则) —— 正则必须能在 app.js 里命中
 CHECKS = [
+    # ---- ★前端优化 P0（0.2.20）：统一轮询管理器 + 可见性暂停 + 错误捕获 ----
+    ("前端优化", "★统一轮询管理器 POLL 存在", r"const POLL = \{"),
+    ("前端优化", "★POLL.interval 注册轮询（替代裸 setInterval）", r"interval\(name, ms, fn, opts\)"),
+    ("前端优化", "★页面隐藏暂停轮询（visibilitychange 门控）", r'addEventListener\("visibilitychange", \(\) => POLL\._sync'),
+    ("前端优化", "★隐藏时跳过回调（heartbeat 除外）", r"if \(this\.hidden && !rec\.heartbeat\) return"),
+    ("前端优化", "★重新可见时立即补跑一次（数据不过期）", r"for \(const rec of this\._timers\.values\(\)\)"),
+    ("前端优化", "★心跳走 POLL 且 heartbeat:true（守护进程依赖，不停）", r'POLL\.interval\("heartbeat", 4000, beat, \{ heartbeat: true \}\)'),
+    ("前端优化", "★全局错误捕获 reportError", r"function reportError\(err, ctx\)"),
+    ("前端优化", "★错误写进 window.__lastError（供诊断包读取）", r"window\.__lastError = \{ msg, stack"),
+    ("前端优化", "★未捕获异常 → 横幅（window error 事件）", r'addEventListener\("error", \(ev\) =>'),
+    ("前端优化", "★未处理 Promise 拒绝 → 横幅", r'addEventListener\("unhandledrejection", \(ev\) =>'),
+    # ---- ★前端优化 P2（0.2.20）：消息增量渲染 ----
+    ("前端优化", "★消息增量渲染：记录已渲染 id 列表", r"let staticIds = \[\]"),
+    ("前端优化", "★消息增量渲染：纯追加时 append 不重建历史", r'insertAdjacentHTML\("beforeend", newHtml\)'),
+    # ---- ★前端优化 P3（0.2.20）：弹层栈 OVERLAY（Esc 只关栈顶 + 焦点归还）----
+    ("前端优化", "★弹层栈 OVERLAY 存在", r"const OVERLAY = \{"),
+    ("前端优化", "★Esc 只关最上面（closeTop）", r"closeTop\(\) \{"),
+    ("前端优化", "★Esc 捕获阶段抢在其它监听前（stopPropagation）", r"if \(OVERLAY\.closeTop\(\)\) \{ e\.stopPropagation\(\)"),
+    ("前端优化", "★关闭后焦点回到触发元素", r"t\.opener && typeof t\.opener\.focus"),
+    ("前端优化", "★弹层注册到 OVERLAY（trace/trust/cfg 等）", r'OVERLAY\.push\("cfg", cfgClose\)'),
+    # ---- ★前端优化 P5（0.2.20）：性能埋点 + 诊断快照 ----
+    ("前端优化", "★性能埋点 PERF（只在 debug=1 时输出）", r"const PERF = \{"),
+    ("前端优化", "★boot 打点（start / firstPaint / end）", r'PERF\.mark\("boot:end"\)'),
+    ("前端优化", "★首条消息打点", r'PERF\.mark\("msg:first"\)'),
+    ("前端优化", "★工作流首次渲染打点", r'PERF\.mark\("wf:first"\)'),
+    ("前端优化", "★前端诊断快照 window.__diagnostics", r"window\.__diagnostics = \(\) =>"),
     # ---- 后端接口（少一个就意味着某块功能没接上）----
     ("接口", "会话列表", r"/api/session\?limit=\d+&order=desc"),
     ("接口", "历史消息", r"/message\?limit="),
@@ -443,7 +469,7 @@ CHECKS = [
     ("群聊", "★权限申请小弹窗：渲染（解析动作/类型/路径/秒数）", r"function ccPermRender"),
     ("群聊", "★权限申请小弹窗：点按钮 = 在群里发 `@agent 可以`", r"function ccPermAnswer"),
     ("群聊", "★权限申请小弹窗：在 ccRenderMsgs 里刷新", r"ccPermRender\(\);"),
-    ("群聊", "★权限申请小弹窗：每秒刷倒计时（到点自动收）", r"setInterval\(\(\) => ccPermRender\(\), 1000\)"),
+    ("群聊", "★权限申请小弹窗：每秒刷倒计时（到点自动收）", r'POLL\.interval\("cc-perm", 1000, \(\) => ccPermRender\(\)\)'),
     ("群聊", "★权限申请：抽屉没开时用顶部横幅提醒", r"有权限申请待批准"),
     ("群聊", "★权限申请：已允许/已拒绝/超时 → 视为已结算，不再显示", r"已允许\|已拒绝\|权限申请超时"),
     ("群聊", "★权限弹窗：只认真正的申请文案（别被 AI 解释文字误弹）", r"CC_PERM_ASK_RE"),
@@ -779,7 +805,7 @@ CHECKS = [
     ("本地协作", "★全页工作台：顶栏入口 + 打开/关闭", r"function initCollab"),
     ("本地协作", "★运行历史 GET /orchestrate/runs", r'"/orchestrate/runs"'),
     ("本地协作", "★新建任务 POST /orchestrate/start", r'"/orchestrate/start"'),
-    ("本地协作", "★轮询详情（1.5s，完成即停）", r"setInterval\(collabTick, 1500\)"),
+    ("本地协作", "★轮询详情（1.5s，完成即停）", r'POLL\.interval\("collab-tick", 1500, collabTick\)'),
     ("本地协作", "★运行详情：默认只看选中成员 + 「并排」开关（不再一次性铺开所有节点）",
      r"COLLAB\.memAll|data-collab-mem"),
     ("本地协作", "★成员选择条点一下就切那个节点", r"data-collab-mem"),
@@ -1950,13 +1976,31 @@ def _hit(pattern: str, text: str) -> bool:
 
 
 def main() -> int:
-    app = io.open(os.path.join(HERE, "frontend", "app.js"), encoding="utf-8").read()
+    # 前端 JS = js/*.js（按文件名顺序）+ app.js（剩余主文件，含 boot）。
+    # P1 拆文件后功能分散到多个文件，check_features 必须都扫到。
+    _parts = []
+    _jsdir = os.path.join(HERE, "frontend", "js")
+    if os.path.isdir(_jsdir):
+        for _fn in sorted(os.listdir(_jsdir)):
+            if _fn.endswith(".js"):
+                _parts.append(io.open(os.path.join(_jsdir, _fn), encoding="utf-8").read())
+    _parts.append(io.open(os.path.join(HERE, "frontend", "app.js"), encoding="utf-8").read())
+    app = "\n".join(_parts)
     # 去掉注释，避免"注释里写了但代码没了"的假通过
     js = re.sub(r"/\*.*?\*/", " ", app, flags=re.S)
     js = re.sub(r"(?<!:)//[^\n]*", " ", js)
     html = io.open(os.path.join(HERE, "frontend", "index.html"), encoding="utf-8").read()
-    css = re.sub(r"/\*.*?\*/", " ",
-                 io.open(os.path.join(HERE, "frontend", "style.css"), encoding="utf-8").read(), flags=re.S)
+    # CSS = style/*.css（P4 拆出的 8 段，按文件名顺序）+ style.css（兼容旧布局）
+    _css_parts = []
+    _cssdir = os.path.join(HERE, "frontend", "style")
+    if os.path.isdir(_cssdir):
+        for _fn in sorted(os.listdir(_cssdir)):
+            if _fn.endswith(".css"):
+                _css_parts.append(io.open(os.path.join(_cssdir, _fn), encoding="utf-8").read())
+    _legacy_css = os.path.join(HERE, "frontend", "style.css")
+    if os.path.isfile(_legacy_css):
+        _css_parts.append(io.open(_legacy_css, encoding="utf-8").read())
+    css = re.sub(r"/\*.*?\*/", " ", "\n".join(_css_parts), flags=re.S)
 
     # ACP 后端也纳入体检（以前只看前端，后端改坏了没有任何网）
     py = []

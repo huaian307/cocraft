@@ -1,0 +1,319 @@
+/* 03-music.css —— 落樱 / 弹窗 / 播放条 / QQ音乐 / 音乐主页（P4 从 style.css 按物理顺序拆出的第 3 段；拼接后与原文件一致） */
+
+/* ---------- 落樱 + 落水涟漪 ---------- */
+
+#petals { position: fixed; inset: 0; pointer-events: none; z-index: 2; overflow: hidden; }
+
+/* 一片花瓣与它激起的涟漪同属一个 unit；
+   计时与漂移由 unit 下发，保证"落水"与"溅起"严格同步 */
+#petals .petal-unit { position: absolute; top: 0; left: 0; width: 0; height: 0; }
+
+#petals .petal {
+  position: absolute; top: 0; left: 0;
+  background: var(--sakura); opacity: 0;
+  border-radius: 12px 1px 12px 1px;   /* 花瓣形 */
+  animation: fall var(--dur, 14s) linear var(--delay, 0s) infinite;
+}
+@keyframes fall {
+  0%   { transform: translate3d(0, calc(-8vh / var(--ui-z)), 0) rotate(0deg);       opacity: 0; }
+  8%   { opacity: .7; }
+  85%  { opacity: .6; }
+  92%  { opacity: 0; }                                            /* 没入水面 */
+  100% { transform: translate3d(var(--drift, 40px), calc(106vh / var(--ui-z)), 0) rotate(420deg); opacity: 0; }
+}
+
+/* 涟漪用色：樱粉掺一点绯红，浅色背景下也看得清 */
+#petals { --ripple: color-mix(in srgb, var(--sakura) 45%, var(--hi)); }
+
+/* 落在水面上溅起的水花：外圈 + 同心内圈 + 溅起的水点 */
+#petals .ripple {
+  position: absolute; top: calc(98vh / var(--ui-z)); left: 0;                        /* 水面位置 */
+  border: 1.5px solid var(--ripple); border-radius: 50%; opacity: 0;
+  animation: splash var(--dur, 14s) linear var(--delay, 0s) infinite;
+}
+#petals .ripple.r2 { border-width: 1px; animation-name: splash2; }
+
+@keyframes splash {
+  0%, 88% { opacity: 0;    transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-50%) scale(.3); }
+  92%     { opacity: .95;  transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-50%) scale(1); }
+  100%    { opacity: 0;    transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-50%) scale(3); }
+}
+@keyframes splash2 {
+  0%, 91% { opacity: 0;    transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-50%) scale(.2); }
+  95%     { opacity: .7;   transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-50%) scale(1.15); }
+  100%    { opacity: 0;    transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-50%) scale(3.6); }
+}
+
+#petals .spike {
+  position: absolute; top: calc(98vh / var(--ui-z)); left: 0;
+  background: var(--ripple); border-radius: 50%; opacity: 0;
+  animation: spike var(--dur, 14s) linear var(--delay, 0s) infinite;
+}
+@keyframes spike {
+  0%, 89% { opacity: 0;    transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(0) scale(1); }
+  91%     { opacity: .9;   transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-10px) scale(1.15); }
+  96%     { opacity: 0;    transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-18px) scale(.6); }
+  100%    { opacity: 0;    transform: translateX(-50%) translateX(var(--drift, 0px)) translateY(-18px) scale(.6); }
+}
+
+/* 底部一层反光，让涟漪有"落在水上"的依据 */
+#petals::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: calc(8vh / var(--ui-z));
+  background: linear-gradient(to top, color-mix(in srgb, var(--sakura) 18%, transparent), transparent);
+  pointer-events: none;
+}
+
+body.no-petals #petals { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  #petals { display: none; }
+}
+
+/* ---------- 滚动条 ---------- */
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ink-faint) 35%, transparent);
+  border-radius: 6px; border: 3px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--hi) 55%, transparent); background-clip: content-box; }
+
+/* ---------- 侧栏收起 / 展开 + 歌词栏 ---------- */
+
+#app { transition: grid-template-columns .18s ease, padding-right .22s ease, padding-bottom .22s ease; }
+
+/* 群聊抽屉：**分屏**（把面板内容整体推开），而不是盖在上面。
+   抽屉是 fixed 在右边；给 #app 让出同样宽度的 padding，内容就整体缩小而不是被遮住。 */
+html.cc-open #app { padding-right: clamp(300px, var(--cc-pad, var(--cc-w, 520px)), calc(96vw / var(--ui-z))); }
+html.cc-resizing #app { transition: none; }          /* 拖动调宽时别走过渡，跟手 */
+
+html[data-sidebar="closed"] { --col-side: 0px; }
+html[data-sidebar="closed"] #sidebar { display: none; }
+
+/* 收起 = 纯听歌模式：连对话消息也一起隐藏，只留歌词 + 输入框上方的频谱条 + 输入框 */
+html[data-sidebar="closed"] #chat-stage { display: none; }
+html[data-sidebar="closed"] .spec-side { display: none; }
+
+/* 收起时不再显示播放条 —— 音频条挪到输入框上方单独那条（.vis-bar），所以这里压过 .player.on */
+html[data-sidebar="closed"] .player { display: none; }
+
+/* 消息区（原本吃满空间的 flex:1）一隐藏，剩下的元素会一起浮到顶部 —— 用 auto 边距压到底部。
+   ⚠ 只给「收起时最靠上的那个可见块」加 auto：加多了会平分空隙、把内容挤散。 */
+html[data-sidebar="closed"] .vis-bar { margin-top: auto; }
+
+/* 收起时就显示歌词浮层（没有歌词时里面会显示一行提示，免得一片空白） */
+html.collapsed-focus .lyrics-overlay { display: flex; }
+
+/* ---------- QQ音乐播放条（QQ音乐在跑 / 有歌 / 手动打开时才出现）---------- */
+
+.player {
+  position: relative; z-index: 3; overflow: hidden; display: none;
+  border-top: 1px solid var(--line); background: var(--paper-2);
+}
+.player.on { display: block; }
+.p-bg {                                  /* 背景：从之前挑的图里选一张 */
+  position: absolute; inset: 0; pointer-events: none;
+  background: url("/assets/night.jpg") center 30% / cover no-repeat;
+  opacity: .32;
+}
+/* 用户自定义了音乐条背景 → 抬高一点，别被纸色蒙层压得看不见 */
+.player.has-pbg .p-bg { opacity: .62; }
+.player::after {                         /* 压一层纸色，保证文字可读 */
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--paper-2) 90%, transparent) 0%,
+    color-mix(in srgb, var(--paper-2) 60%, transparent) 45%,
+    color-mix(in srgb, var(--paper-2) 90%, transparent) 100%);
+}
+
+.p-row {
+  position: relative; z-index: 1;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 18px; font-size: 12.5px;
+}
+
+/* 随音乐跳动的音频条 */
+.p-vis { display: flex; align-items: flex-end; gap: 2px; height: 20px; width: auto; min-width: 26px; flex: none; }
+.p-vis span {
+  width: 3.5px; border-radius: 1px; background: var(--hi); height: 38%;
+  opacity: .85;
+  animation: visBounce .9s ease-in-out infinite alternate;
+  animation-play-state: paused;                  /* 暂停时静止，但仍然看得见 */
+}
+.p-vis span:nth-child(2) { animation-duration: .58s; animation-delay: -.12s; }
+.p-vis span:nth-child(3) { animation-duration: 1.02s; animation-delay: -.3s; }
+.p-vis span:nth-child(4) { animation-duration: .7s; animation-delay: -.2s; }
+.p-vis span:nth-child(5) { animation-duration: .88s; animation-delay: -.42s; }
+.player.playing .p-vis span { animation-play-state: running; }
+@keyframes visBounce { from { height: 22%; } to { height: 100%; } }
+
+/* 真频谱模式：高度由 JS 直接给，关掉合成动画（否则动画会盖掉内联高度） */
+.player.real .p-vis span { animation: none; }
+
+.p-info { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.p-info b { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.p-info i { font-style: normal; color: var(--ink-faint);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* 展开会话时的歌词：占「歌名」那一格，太长就横向滚动（收起侧栏时改用画面中央浮层） */
+.p-lyric { display: none; flex: 1; min-width: 0; overflow: hidden; position: relative; }
+html.lyrics-on #p-title { display: none; }
+html.lyrics-on #p-lyric { display: block; }
+#p-lyric-inner {
+  display: inline-block; white-space: nowrap; color: var(--hi); font-weight: 500;
+  will-change: transform;
+}
+#p-lyric-inner .zh { color: var(--ink-faint); font-size: 11px; margin-left: 10px; }
+#p-lyric.scroll #p-lyric-inner { animation: lyrMarquee var(--lyr-dur, 12s) linear infinite; }
+@keyframes lyrMarquee {
+  0%, 12% { transform: translateX(0); }
+  88%, 100% { transform: translateX(var(--lyr-shift, -60%)); }
+}
+
+.p-ctrl { display: flex; gap: 6px; align-items: center; }
+#p-prev, #p-next, #p-toggle, #p-shuffle, #p-loop, #p-lyric-btn, #p-search-btn, #p-q-go, #p-home {
+  width: 30px; height: 30px; min-width: 30px; padding: 0;
+  display: grid; place-items: center; font-size: 14px; line-height: 1;
+}
+#p-shuffle, #p-loop, #p-lyric-btn { color: var(--ink-faint); }
+#p-shuffle.on, #p-loop.on, #p-lyric-btn.on {
+  color: var(--hi);
+  border-color: color-mix(in srgb, var(--hi) 55%, var(--line));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--hi) 22%, transparent) inset;
+}
+#p-toggle .tri {
+  width: 0; height: 0;
+  border-left: 9px solid currentColor;
+  border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+}
+#p-toggle .bars {
+  display: none; width: 10px; height: 11px;
+  border-left: 3px solid currentColor; border-right: 3px solid currentColor;
+}
+#p-toggle.playing .tri { display: none; }
+#p-toggle.playing .bars { display: block; }
+
+.p-vol { display: flex; align-items: center; gap: 6px; color: var(--ink-dim); cursor: pointer; }
+.p-vol-ico { font-size: 13px; }
+.p-vol input[type="range"] {
+  -webkit-appearance: none; appearance: none; outline: none;
+  width: 108px; height: 4px; border-radius: 2px; cursor: pointer;
+  background: color-mix(in srgb, var(--ink-faint) 35%, transparent);
+}
+.p-vol input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--hi); border: 1px solid var(--paper); cursor: pointer;
+}
+.p-vol-num { width: 26px; text-align: right; font-family: var(--mono); font-size: 11px; }
+
+/* ---------- 搜索行 + 结果列表 ---------- */
+
+.p-search { position: relative; z-index: 1; display: flex; gap: 8px; padding: 0 18px 8px; }
+.p-search[hidden] { display: none; }
+.p-search input {
+  flex: 1; min-width: 0; font: inherit; font-size: 12.5px; outline: none; color: var(--ink);
+  background: color-mix(in srgb, var(--paper) 90%, transparent);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px;
+}
+.p-search input:focus { border-color: var(--hi); }
+#p-q-go { width: auto; padding: 0 12px; font-size: 12.5px; }
+
+.p-results { position: relative; z-index: 1; max-height: 190px; overflow-y: auto; padding: 0 18px 10px; }
+.p-results[hidden] { display: none; }
+.p-results .it {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+  border-radius: var(--radius); cursor: pointer; font-size: 12.5px;
+}
+.p-results .it:hover { background: color-mix(in srgb, var(--hi) 10%, transparent); }
+.p-results .it.on { background: color-mix(in srgb, var(--hi) 14%, transparent); }
+.p-results .it.on b { color: var(--hi); }
+.p-results .it b { font-weight: 500; }
+.p-results .it i { font-style: normal; color: var(--ink-faint); font-size: 11.5px; }
+.p-results .it .it-cover {
+  width: 32px; height: 32px; flex: none; display: block; object-fit: cover;
+  border-radius: 4px; border: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--ink-faint) 12%, transparent);
+}
+.p-results .hint { padding: 6px 8px; color: var(--ink-faint); font-size: 11.5px; line-height: 1.7; }
+.p-results-h { display: flex; align-items: center; gap: 8px; }
+.p-results-h span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.p-results-h .p-x { flex: none; width: 22px; height: 22px; padding: 0; font-size: 13px; line-height: 1; }
+
+/* ---------- 音乐主页（布局仿平台，风格随面板）---------- */
+
+.mus-home {
+  display: none; flex: 1; min-height: 0; flex-direction: column;
+  position: relative; z-index: 1; background: var(--paper);
+}
+#body-stage.mus-open #chat-stage { display: none; }
+#body-stage.mus-open .mus-home { display: flex; }
+
+.mus-head {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--line-soft);
+}
+.mus-head .mk { width: 20px; height: 20px; flex: none; }
+.mus-head b { font-family: var(--serif); font-size: 16px; }
+.mus-head .mk-cap { color: var(--gold); font-size: 11px; letter-spacing: .12em; }
+.mus-plat { display: flex; gap: 6px; margin-left: 4px; }
+.mus-head input {
+  flex: 1; min-width: 0; font: inherit; font-size: 12.5px; outline: none; color: var(--ink);
+  background: var(--paper-2); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 6px 10px;
+}
+.mus-head input:focus { border-color: var(--hi); }
+#mus-go, #mus-close { flex: none; padding: 0 12px; height: 30px; }
+#mus-close { width: 30px; padding: 0; font-size: 15px; }
+
+.mus-body { flex: 1; min-height: 0; display: flex; }
+.mus-nav {
+  width: 132px; flex: none; padding: 10px 8px; display: flex; flex-direction: column; gap: 4px;
+  border-right: 1px solid var(--line-soft);
+}
+.mus-nav-i { text-align: left; padding: 8px 12px; font-size: 13px; }
+.mus-nav-i.on { background: var(--hi); border-color: var(--hi); color: #fff; font-weight: 600; }
+.mus-pl {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  border-radius: var(--radius); cursor: pointer; font-size: 12.5px;
+}
+.mus-pl:hover { background: color-mix(in srgb, var(--hi) 10%, transparent); }
+.mus-pl .pl-cover {
+  width: 40px; height: 40px; flex: none; display: block; object-fit: cover;
+  border-radius: 4px; border: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--ink-faint) 12%, transparent);
+}
+.mus-pl b { font-weight: 500; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mus-pl i { font-style: normal; color: var(--ink-faint); font-size: 11.5px; flex: none; }
+.ico-house { width: 15px; height: 15px; }
+
+.mus-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.mus-main-h {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--line-soft);
+  font-size: 12.5px; color: var(--ink-dim);
+}
+.mus-main-h b { font-family: var(--serif); font-size: 14px; color: var(--ink); }
+.mus-main-h button { margin-left: auto; flex: none; padding: 4px 12px; font-size: 12px; }
+.mus-songs { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px 14px; }
+.mus-song {
+  display: grid; grid-template-columns: 40px 34px 1.4fr 1fr 1fr 52px; gap: 10px; align-items: center;
+  padding: 7px 10px; border-radius: var(--radius); cursor: pointer; font-size: 12.5px;
+  /* P4：长列表离屏不渲染（音乐主页可能几百首）；预估高度避免滚动跳动 */
+  content-visibility: auto; contain-intrinsic-size: auto 48px;
+}
+.mus-song:hover { background: color-mix(in srgb, var(--hi) 10%, transparent); }
+.mus-song.on { background: color-mix(in srgb, var(--hi) 14%, transparent); }
+.mus-song.on .s-name { color: var(--hi); }
+.mus-song .s-cover {
+  width: 36px; height: 36px; display: block; object-fit: cover;
+  border-radius: 4px; border: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--ink-faint) 12%, transparent);
+}
+.mus-song .s-no { text-align: right; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.mus-song .s-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mus-song .s-artist, .mus-song .s-album {
+  color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mus-song .s-dur { text-align: right; font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.mus-empty { padding: 22px 18px; color: var(--ink-faint); font-size: 12.5px; line-height: 1.9; }

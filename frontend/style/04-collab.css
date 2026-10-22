@@ -1,0 +1,593 @@
+/* 04-collab.css —— 本地协作工作台（P4 从 style.css 按物理顺序拆出的第 4 段；拼接后与原文件一致） */
+
+/* ---------- 本地协作工作台（整窗；本机多 agent，不登录）---------- */
+/* ★整窗：盖住侧栏/顶栏/播放条，只给底部输入区（小本子）让位。
+   `--collab-bottom` 在打开时按 #composer 的实际高度算（见 collabSyncFullscreen）。 */
+.collab-home {
+  display: none; flex-direction: column; min-height: 0;
+  position: fixed; left: 0; right: 0; top: 0;
+  bottom: var(--collab-bottom, 0px);
+  z-index: 16; background: var(--paper);
+}
+#body-stage.collab-open #chat-stage,
+#body-stage.collab-open .mus-home { display: none; }
+#body-stage.collab-open .collab-home,
+html.collab-open .collab-home { display: flex; }
+
+/* ★任务输入条「搬到」小本子的位置：工作台打开时把 .collab-quick 移进 #composer，
+   原来的聊天输入（textarea / 附件 / 送出 / 权限技能行）先收起来。 */
+#composer.collab-input .composer-label { color: var(--gold); }
+html.collab-open #composer {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 17;
+}
+#composer.collab-input #input,
+#composer.collab-input #attach-row,
+#composer.collab-input .composer-foot,
+#composer.collab-input #btn-attach,
+#composer.collab-input #btn-send { display: none; }
+#composer.collab-input .collab-quick { display: flex; padding: 0; }
+#composer.collab-input .collab-quick input { height: 40px; font-size: 13.5px; }
+#composer.collab-input .collab-quick button { height: 40px; }
+#composer.collab-input #collab-quick-note { max-width: 34%; }
+#composer.collab-input #btn-attach,
+#composer.collab-input #ctx-chip { display: none; }
+#composer.collab-input #btn-send { background: var(--hi); border-color: var(--hi); }
+
+.collab-head {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--line-soft);
+}
+.collab-head .mk { width: 20px; height: 20px; flex: none; }
+.collab-head b { font-family: var(--serif); font-size: 16px; }
+.collab-head .mk-cap { color: var(--gold); font-size: 11px; letter-spacing: .12em; flex: none; }
+.collab-head #collab-sub {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px;
+}
+.collab-head button { flex: none; padding: 0 12px; height: 30px; }
+#collab-close { width: 30px; padding: 0; font-size: 15px; }
+.collab-sp { flex: 1; }
+
+.collab-body { flex: 1; min-height: 0; display: flex; }
+.collab-side {
+  width: 236px; flex: none; display: flex; flex-direction: column;
+  border-right: 1px solid var(--line-soft); min-height: 0;
+}
+.collab-side-h {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 9px 12px; border-bottom: 1px solid var(--line-soft); font-size: 12.5px;
+}
+.collab-side-h b { font-family: var(--serif); font-size: 13.5px; white-space: nowrap; }
+.collab-side-h span {
+  margin-left: auto; font-size: 11px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.collab-side-btn {
+  flex: none; height: 20px; padding: 0 7px; font-size: 10px; line-height: 1;
+  border-radius: 999px; cursor: pointer; color: var(--hi);
+  border: 1px solid color-mix(in srgb, var(--hi) 40%, transparent); background: transparent;
+}
+.collab-side-btn:hover { background: color-mix(in srgb, var(--hi) 12%, transparent); }
+
+/* ★工作流列表（项目 → 工作流） */
+.collab-wf-list {
+  flex: 0 1 auto; max-height: 42%; overflow-y: auto; padding: 4px 8px 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.collab-wf-group {
+  font-size: 10px; color: var(--ink-faint); font-family: var(--mono);
+  padding: 6px 4px 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.collab-wf-row {
+  display: flex; align-items: center; gap: 7px; padding: 6px 8px; border-radius: var(--radius);
+  border: 1px solid transparent; cursor: pointer; font-size: 12px;
+}
+.collab-wf-row:hover { background: color-mix(in srgb, var(--hi) 9%, transparent); }
+.collab-wf-row.on { background: color-mix(in srgb, var(--hi) 14%, transparent);
+  border-color: color-mix(in srgb, var(--hi) 34%, transparent); }
+.collab-wf-t { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.collab-wf-t b { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.collab-wf-t i { font-style: normal; font-size: 10px; color: var(--ink-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.collab-wf-row .wrun {
+  flex: none; width: 22px; height: 22px; padding: 0; font-size: 11px; line-height: 1;
+  border-radius: 50%; color: var(--hi); background: transparent;
+  border: 1px solid color-mix(in srgb, var(--hi) 45%, transparent); cursor: pointer;
+}
+.collab-wf-row .wrun:hover { background: color-mix(in srgb, var(--hi) 16%, transparent); }
+/* ★归档折叠区（P3）：只是收起来，不是删除 */
+.collab-wf-arch {
+  display: flex; align-items: center; gap: 6px; width: 100%; margin: 6px 0 2px;
+  padding: 5px 8px; font-size: 10.5px; text-align: left; cursor: pointer;
+  color: var(--ink-faint); background: transparent; border: 1px dashed var(--line-soft);
+  border-radius: var(--radius);
+}
+.collab-wf-arch:hover { color: var(--ink-dim); }
+.collab-wf-arch.open { color: var(--ink-dim); background: color-mix(in srgb, var(--ink-faint) 7%, transparent); }
+.collab-wf-archbox { opacity: .78; }
+#collab-wf-archive.on { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 45%, transparent); }
+#collab-wf-split.attention {
+  color: var(--gold);
+  border-color: color-mix(in srgb, var(--gold) 60%, transparent);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+
+/* ★工作流视图（头 / 快速运行 / 画布 / 检查器） */
+.collab-wf { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.collab-wf-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 12px 16px 8px; }
+#collab-wf-name { font-family: var(--serif); font-size: 16px; cursor: pointer; }
+#collab-wf-name:hover { color: var(--hi); }
+.collab-wf-head button { flex: none; height: 26px; padding: 0 9px; font-size: 11px; }
+.collab-wf-head .muted { font-size: 11px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-quick { flex: none; display: flex; align-items: center; gap: 8px; padding: 0 16px 10px; }
+.collab-quick input {
+  flex: 1; min-width: 0; height: 34px; padding: 0 10px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper-2);
+  color: var(--ink); font-size: 12.5px;
+}
+.collab-quick input:focus { border-color: color-mix(in srgb, var(--hi) 50%, transparent); outline: none; }
+.collab-quick button { flex: none; height: 34px; padding: 0 16px; }
+#collab-quick-note { font-size: 11px; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.collab-canvas {
+  position: relative; flex: 1; min-height: 280px; margin: 0 14px 14px;
+  border: 1px solid var(--line-soft); border-radius: var(--radius);
+  overflow: hidden; cursor: grab;
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--ink-faint) 20%, transparent) 1px, transparent 0) 0 0 / 22px 22px,
+    color-mix(in srgb, var(--paper) 58%, transparent);
+}
+.collab-canvas.panning { cursor: grabbing; }
+.cv-inner { position: absolute; left: 0; top: 0; width: 2200px; height: 1400px; transform-origin: 0 0; }
+.cv-edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.cv-edges path { fill: none; stroke: color-mix(in srgb, var(--gold) 60%, transparent); stroke-width: 1.6; }
+.cv-edges path.flow { stroke-width: 2.4; stroke: color-mix(in srgb, var(--gold) 78%, transparent); }
+.cv-edges path.fan { stroke-width: 1.1; opacity: .55; }
+.cv-edges path.dash { stroke-dasharray: 5 5; stroke: color-mix(in srgb, var(--ink-faint) 55%, transparent); }
+.cv-nodes { position: absolute; left: 0; top: 0; }
+.cv-node {
+  position: absolute; width: 196px; box-sizing: border-box; padding: 9px 10px;
+  border-radius: 10px; border: 1px solid var(--line); cursor: grab; user-select: none;
+  background: color-mix(in srgb, var(--paper) 94%, transparent);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .10);
+}
+.cv-node.dragging { cursor: grabbing; z-index: 6; }
+.cv-node.sel { border-color: color-mix(in srgb, var(--gold) 70%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--gold) 24%, transparent); }
+.cv-node.cv-task { width: 200px; border-color: color-mix(in srgb, var(--hi) 50%, transparent);
+  background: color-mix(in srgb, var(--hi) 14%, var(--paper)); }
+/* ★阶段节点（P4）：横向串起来；阶段内成员在它下面 */
+.cv-node.cv-stage {
+  width: 210px; border-color: color-mix(in srgb, var(--gold) 55%, transparent);
+  background: color-mix(in srgb, var(--gold) 11%, var(--paper));
+}
+.cv-node.cv-stage .cv-tag {
+  color: var(--gold); border-color: color-mix(in srgb, var(--gold) 55%, transparent);
+}
+.cv-tag {
+  display: inline-block; font-size: 9.5px; line-height: 15px; padding: 0 6px;
+  border-radius: 999px; color: var(--hi); margin-bottom: 4px;
+  border: 1px solid color-mix(in srgb, var(--hi) 45%, transparent);
+}
+.cv-node b { display: block; font-size: 12.5px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cv-n-eng { display: block; margin-top: 2px; font-family: var(--mono); font-size: 10px;
+  color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cv-n-stat { display: block; margin-top: 3px; font-size: 10px; color: var(--ink-faint); }
+.cv-n-stat.running { color: var(--gold); }
+.cv-n-stat.done { color: #39b46a; }
+.cv-n-stat.failed { color: var(--err); }
+.cv-n-stat.skipped { color: var(--ink-faint); }
+.cv-role { font-size: 10px; color: var(--gold); margin-right: 5px; }
+.cv-x {
+  position: absolute; right: 4px; top: 4px; width: 18px; height: 18px; padding: 0;
+  font-size: 12px; line-height: 1; border-radius: 50%; cursor: pointer;
+  color: var(--ink-faint); background: transparent; border: 1px solid transparent;
+}
+.cv-x:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.cv-hint {
+  position: absolute; right: 10px; bottom: 7px; font-size: 10px;
+  color: var(--ink-dim); pointer-events: none;
+  padding: 3px 8px; border-radius: 999px;
+  background: color-mix(in srgb, var(--paper) 72%, transparent);
+  border: 1px solid var(--line-soft); backdrop-filter: blur(6px);
+}
+/* ★画布首用提示（P3，只弹一次） */
+.cv-tip {
+  position: absolute; left: 12px; top: 12px; z-index: 8; max-width: 380px;
+  display: flex; flex-direction: column; gap: 6px; padding: 10px 12px;
+  font-size: 11.5px; line-height: 1.6; color: var(--ink-dim);
+  border: 1px solid color-mix(in srgb, var(--gold) 45%, transparent);
+  border-radius: 10px; background: color-mix(in srgb, var(--paper) 92%, transparent);
+  backdrop-filter: blur(8px); box-shadow: 0 8px 22px rgba(0, 0, 0, .14);
+  cursor: default;
+  pointer-events: none;          /* ★别挡住画布上的节点：只有按钮可点 */
+}
+.cv-tip button { pointer-events: auto; }
+.cv-tip[hidden] { display: none; }
+.cv-tip b { font-family: var(--serif); color: var(--ink); font-size: 13px; }
+.cv-tip button {
+  align-self: flex-end; height: 24px; padding: 0 10px; font-size: 11px;
+  border-radius: 999px; cursor: pointer; color: var(--hi);
+  border: 1px solid color-mix(in srgb, var(--hi) 45%, transparent); background: transparent;
+}
+.cv-tip button:hover { background: color-mix(in srgb, var(--hi) 12%, transparent); }
+.collab-inspector {
+  position: absolute; right: 18px; top: 92px; width: 236px; padding: 10px 11px;
+  border: 1px solid var(--line); border-radius: 10px; z-index: 9; font-size: 12px;
+  background: color-mix(in srgb, var(--paper) 94%, transparent);
+  backdrop-filter: blur(8px); box-shadow: 0 8px 24px rgba(0, 0, 0, .16);
+}
+.collab-inspector b { display: block; margin-bottom: 6px; font-family: var(--serif); font-size: 13px; }
+.collab-inspector label { display: flex; align-items: center; gap: 6px; margin: 5px 0; }
+.collab-inspector label span { flex: none; width: 34px; color: var(--ink-faint); font-size: 11px; }
+.collab-inspector input, .collab-inspector select {
+  flex: 1; min-width: 0; height: 26px; font-size: 11.5px;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--paper-2); color: var(--ink);
+}
+.collab-inspector textarea {
+  width: 100%; box-sizing: border-box; min-height: 56px; resize: vertical;
+  padding: 6px 7px; font-size: 11.5px; line-height: 1.5; font-family: inherit;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--paper-2); color: var(--ink);
+}
+.collab-inspector .insp-cap { margin: 7px 0 3px; color: var(--ink-faint); font-size: 11px; }
+.collab-inspector .insp-msg { margin-top: 6px; font-size: 10.5px; color: var(--ink-faint); }
+.collab-inspector .insp-link {
+  width: 100%; margin-top: 7px; height: 26px; padding: 0 8px;
+  font-size: 11.5px; cursor: pointer; border-radius: 6px;
+  color: var(--gold); background: color-mix(in srgb, var(--gold) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--gold) 45%, transparent);
+}
+.collab-inspector .insp-link:hover { background: color-mix(in srgb, var(--gold) 18%, transparent); }
+.collab-run-wf { flex: none; font-size: 10px; color: var(--gold); max-width: 34%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-runs { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 8px 12px; }
+
+/* ★按项目筛选（同一项目可能有多组 agent 工作流） */
+.collab-proj-filter {
+  flex: none; display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px;
+  border-bottom: 1px dashed var(--line-soft);
+}
+.collab-proj-filter:empty { display: none; }
+.collab-proj-chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  padding: 2px 8px; font-size: 10.5px; cursor: pointer; white-space: nowrap;
+  color: var(--ink-dim); background: transparent; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ink-faint) 30%, transparent);
+  overflow: hidden; text-overflow: ellipsis;
+}
+.collab-proj-chip i { font-style: normal; font-size: 9.5px; color: var(--ink-faint); }
+.collab-proj-chip:hover { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 45%, transparent); }
+.collab-proj-chip.on {
+  color: var(--gold); border-color: color-mix(in srgb, var(--gold) 55%, transparent);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+.collab-run-proj {
+  display: flex; align-items: center; gap: 4px; min-width: 0;
+  color: var(--gold); font-size: 10.5px;
+}
+.collab-run-tags { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.collab-run-proj svg { flex: none; }
+.collab-run-proj em {
+  font-style: normal; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.collab-proj-name { color: var(--gold); font-weight: 600; }
+.collab-proj-name.muted { color: var(--ink-faint); font-weight: 400; }
+.collab-proj-open {
+  padding: 0 7px; height: 20px; font-size: 10px; cursor: pointer; white-space: nowrap;
+  color: var(--hi); background: transparent; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--hi) 40%, transparent);
+}
+.collab-proj-open:hover { background: color-mix(in srgb, var(--hi) 12%, transparent); }
+.collab-run-row {
+  display: grid; grid-template-columns: 8px 1fr; gap: 8px; align-items: start;
+  padding: 8px 9px; border: 1px solid transparent; border-radius: var(--radius);
+  cursor: pointer; font-size: 12px;
+  /* P4：运行历史长列表离屏不渲染（左栏列表，不依赖 scrollHeight） */
+  content-visibility: auto; contain-intrinsic-size: auto 40px;
+}
+.collab-run-row:hover { background: color-mix(in srgb, var(--hi) 10%, transparent); }
+.collab-run-row.on { background: color-mix(in srgb, var(--hi) 15%, transparent); border-color: color-mix(in srgb, var(--hi) 34%, transparent); }
+.collab-dot {
+  width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; flex: none;
+  background: var(--ink-faint);
+}
+.collab-dot.running { background: var(--gold); box-shadow: 0 0 0 3px color-mix(in srgb, var(--gold) 22%, transparent); }
+.collab-dot.done { background: #39b46a; }
+.collab-dot.partial { background: var(--gold); }
+.collab-dot.failed { background: var(--err); }
+.collab-dot.cancelled { background: var(--ink-faint); }
+.collab-run-t { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.collab-run-t b { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.collab-run-t i { font-style: normal; color: var(--ink-faint); font-size: 10.5px; font-family: var(--mono); }
+.collab-run-row { grid-template-columns: 8px 1fr auto; }
+.collab-run-del {
+  width: 22px; height: 22px; padding: 0; font-size: 14px; line-height: 1;
+  border-radius: 4px; opacity: .58; color: var(--ink-faint); transition: opacity .12s ease;
+}
+.collab-run-row:hover .collab-run-del, .collab-run-row.on .collab-run-del { opacity: .8; }
+.collab-run-del:hover { opacity: 1; color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+#collab-count.busy { color: var(--gold); }
+
+.collab-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.collab-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 30px; text-align: center; color: var(--ink-faint); font-size: 12.5px; line-height: 1.9;
+}
+.collab-empty b { font-family: var(--serif); color: var(--ink); font-size: 16px; }
+.collab-empty span { max-width: 620px; }
+/* ★空状态三步引导（P3） */
+.collab-steps {
+  list-style: none; margin: 2px 0 4px; padding: 0; max-width: 640px; text-align: left;
+  display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; line-height: 1.75;
+}
+.collab-steps li { display: flex; align-items: flex-start; gap: 9px; }
+.collab-steps li > i {
+  flex: none; width: 20px; height: 20px; margin-top: 2px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-style: normal; font-size: 11px; color: var(--hi);
+  border: 1px solid color-mix(in srgb, var(--hi) 45%, transparent);
+}
+.collab-steps li > span { flex: 1; min-width: 0; color: var(--ink-dim); }
+.collab-steps strong { color: var(--ink); font-weight: 600; }
+.collab-empty-note { font-size: 11px; color: var(--ink-faint); }
+.collab-empty .primary { height: 32px; padding: 0 18px; }
+.collab-run { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* ⚠ `hidden` 必须压过 display:flex（否则空态和详情会同时占位 → 整页被顶下去） */
+.collab-empty[hidden], .collab-run[hidden],
+.collab-pending[hidden], .collab-diff[hidden] { display: none; }
+
+.collab-task { flex: none; padding: 12px 16px 11px; border-bottom: 1px solid var(--line-soft); }
+.collab-task-h { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.collab-task-h > b {
+  font-family: var(--serif); font-size: 16px; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.collab-task-meta { margin-top: 6px; font-size: 11.5px; font-family: var(--mono); color: var(--ink-faint); line-height: 1.7; }
+.collab-task-meta code { background: color-mix(in srgb, var(--ink-faint) 12%, transparent); padding: 0 4px; border-radius: 3px; }
+.collab-task-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 9px; }
+.collab-task-actions button, .collab-task-actions select { flex: none; height: 28px; padding: 0 10px; font-size: 12px; }
+.collab-task-actions .collab-arb-sel { min-width: 140px; }
+.collab-task-actions .collab-hint { font-size: 11.5px; color: var(--ink-faint); }
+
+.collab-st {
+  flex: none; font-style: normal; font-size: 10.5px; padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--ink-dim);
+  white-space: nowrap;
+}
+.collab-st.running { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 45%, transparent); background: color-mix(in srgb, var(--gold) 10%, transparent); }
+.collab-st.done { color: #39b46a; border-color: color-mix(in srgb, #39b46a 45%, transparent); }
+.collab-st.partial { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 45%, transparent); }
+.collab-st.failed { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.collab-st.cancelled, .collab-st.timeout { color: var(--ink-faint); }
+.collab-st.skipped { color: var(--ink-faint); border-color: var(--line); }
+
+#collab-pick { flex: none; display: flex; gap: 6px; align-items: center; }
+.collab-pick {
+  border: 1px solid color-mix(in srgb, var(--gold) 60%, transparent);
+  background: color-mix(in srgb, var(--gold) 14%, transparent);
+  color: var(--gold); border-radius: 999px; padding: 3px 10px; font-size: 11.5px; cursor: pointer;
+}
+.collab-pick:hover { background: color-mix(in srgb, var(--gold) 24%, transparent); }
+
+/* ★待批权限：右侧抽屉（位置宽，命令原文不用挤）+ 顶部窄条 */
+.collab-pend-bar {
+  flex: none; display: flex; align-items: center; gap: 9px;
+  margin: 0 16px 8px; padding: 7px 10px; font-size: 12.5px;
+  border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+.collab-pend-bar[hidden] { display: none; }
+.collab-pend-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: none;
+  background: #ff6f81; box-shadow: 0 0 0 3px color-mix(in srgb, #ff6f81 22%, transparent);
+}
+.collab-pend-first { color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.collab-pend-bar button { height: 26px; padding: 0 11px; font-size: 12px; }
+
+.collab-perm-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 18;
+  width: min(620px, 44vw); min-width: 380px;
+  display: flex; flex-direction: column;
+  border-left: 1px solid var(--line);
+  background: var(--paper);
+  backdrop-filter: blur(calc(var(--g-blur, 18px) + 10px));
+  box-shadow: -18px 0 40px -24px rgba(0, 0, 0, .55);
+  transform: translateX(103%); transition: transform .22s ease;
+}
+/* 玻璃皮肤下 --paper 是半透明的（能透出底下的字，读命令会累）→ 抽屉给一层近实底 */
+html.glass .collab-perm-drawer { background: rgba(14, 14, 18, .92); }
+.collab-perm-drawer[hidden] { display: none; }
+.collab-perm-drawer.open { transform: none; }
+.collab-perm-drawer-h {
+  flex: none; display: flex; align-items: center; gap: 9px;
+  padding: 11px 14px; border-bottom: 1px solid var(--line-soft);
+}
+.collab-perm-drawer-h b { font-family: var(--serif); font-size: 14.5px; }
+.collab-perm-drawer-b { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px 22px; }
+.collab-perm-sec { margin-bottom: 16px; }
+.collab-perm-sec-h { display: flex; align-items: baseline; gap: 8px; margin-bottom: 7px; font-size: 12.5px; }
+.collab-perm-sec-h b { font-family: var(--serif); font-size: 13.5px; }
+.collab-perm-mrow {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 7px 9px; margin-bottom: 6px; border-radius: var(--radius);
+  border: 1px solid var(--line-soft); background: color-mix(in srgb, var(--paper-2) 80%, transparent);
+}
+.collab-perm-mname { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 150px; }
+.collab-perm-mname b { font-size: 12.5px; font-weight: 600; }
+.collab-perm-mname span { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-perm-mrow select { flex: 0 1 210px; min-width: 150px; height: 28px; font-size: 12px; }
+.collab-perm-note {
+  margin-top: 4px; font-size: 11.5px; line-height: 1.5; color: var(--ink-dim);
+  padding: 7px 9px; border-radius: var(--radius);
+  background: color-mix(in srgb, var(--gold) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--gold) 24%, transparent);
+}
+.collab-perm-none { font-size: 12px; color: var(--ink-faint); padding: 6px 2px; }
+
+.collab-perm-i {
+  border: 1px solid color-mix(in srgb, var(--gold) 38%, transparent);
+  border-radius: var(--radius); padding: 9px 11px; margin-bottom: 8px;
+  background: color-mix(in srgb, var(--paper-2) 88%, transparent);
+}
+.collab-perm-i.danger { border-color: color-mix(in srgb, var(--err) 55%, transparent); background: color-mix(in srgb, var(--err) 8%, transparent); }
+.collab-perm-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; }
+.collab-perm-h b { font-weight: 600; }
+.collab-perm-h .collab-danger { color: #ff8a9a; font-size: 11px; font-weight: 700; }
+.collab-perm-h .collab-left { margin-left: auto; color: var(--ink-faint); font-size: 11px; font-family: var(--mono); }
+.collab-perm-cmd {
+  margin-top: 6px; padding: 6px 8px; border-radius: 4px; font-family: var(--mono); font-size: 11.5px;
+  white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow: auto;
+  background: color-mix(in srgb, var(--ink-faint) 13%, transparent); border: 1px solid var(--line-soft);
+}
+.collab-perm-paths { margin-top: 5px; font-size: 11.5px; color: var(--ink-dim); word-break: break-all; }
+.collab-perm-ft { display: flex; gap: 7px; margin-top: 8px; flex-wrap: wrap; }
+.collab-perm-ft button { height: 27px; padding: 0 11px; font-size: 12px; }
+.collab-perm-ft .ok { border-color: color-mix(in srgb, #39b46a 45%, transparent); color: #39b46a; }
+.collab-perm-ft .danger { border-color: color-mix(in srgb, var(--err) 45%, transparent); color: #ffb3bf; }
+
+/* ★运行详情：成员选择条（只看选中的一个；点「并排」看全部） */
+.collab-mem {
+  flex: none; display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  padding: 0 16px 8px;
+}
+.collab-mem[hidden] { display: none; }
+.collab-mem-chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px;
+  border-radius: 999px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--line); background: color-mix(in srgb, var(--paper-2) 72%, transparent);
+  color: var(--ink-dim);
+}
+.collab-mem-chip:hover { border-color: var(--gold); color: var(--ink); }
+.collab-mem-chip.on { border-color: var(--gold); background: color-mix(in srgb, var(--gold) 16%, transparent); color: var(--ink); }
+.collab-mem-chip.all { border-style: dashed; }
+.collab-mem-chip em { font-style: normal; font-size: 10.5px; color: var(--ink-faint); }
+.collab-mem-chip b { font-weight: 600; color: var(--ink); }
+.collab-mem-chip span { font-size: 10.5px; color: var(--ink-faint); }
+.collab-mem-chip .dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--ink-faint);
+}
+.collab-mem-chip .dot.running, .collab-mem-chip .dot.wait { background: #d9a441; }
+.collab-mem-chip .dot.done { background: #39b46a; }
+.collab-mem-chip .dot.failed, .collab-mem-chip .dot.timeout { background: #ff6f81; }
+.collab-mem-chip .dot.cancelled { background: var(--ink-faint); }
+.collab-perm-tag {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px; flex: none;
+  border: 1px solid var(--line-soft); color: var(--ink-faint);
+}
+.collab-cols.single .collab-col { flex: 1 1 100%; min-width: 0; }
+
+.collab-audit { margin-top: 2px; font-size: 11.5px; }
+.collab-audit summary { cursor: pointer; color: var(--ink-faint); }
+.collab-audit-row { display: flex; gap: 8px; padding: 4px 2px; border-top: 1px dashed var(--line-soft); align-items: baseline; }
+.collab-audit-row i { flex: none; font-style: normal; color: var(--ink-faint); }
+.collab-audit-row b { flex: none; font-weight: 500; }
+.collab-audit-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-audit-row em { flex: none; font-style: normal; margin-left: auto; color: var(--ink-faint); font-family: var(--mono); font-size: 10.5px; }
+
+/* 成员列：每人一列并排；各自滚动 */
+.collab-cols {
+  flex: 1; min-height: 0; display: flex; gap: 12px;
+  overflow: auto; padding: 12px 16px 18px; align-items: stretch;
+}
+.collab-col {
+  flex: 1 1 300px; min-width: 280px; display: flex; flex-direction: column;
+  border: 1px solid var(--line-soft); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--paper-2) 70%, transparent);
+  min-height: 0;
+}
+.collab-col.arb { border-color: color-mix(in srgb, var(--gold) 42%, transparent); }
+.collab-col.pick { border-color: var(--gold); box-shadow: 0 0 0 1px var(--gold), 0 8px 22px -14px var(--gold); }
+.collab-col-head {
+  flex: none; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 8px 10px; border-bottom: 1px solid var(--line-soft);
+}
+.collab-col-head b { font-size: 13px; font-weight: 600; }
+.collab-role {
+  font-style: normal; font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--gold);
+}
+/* ★P4：阶段小标（运行详情里每个成员属于哪一段） */
+.collab-stage-tag {
+  font-style: normal; font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--gold) 45%, transparent);
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+  color: var(--ink); white-space: nowrap;
+}
+.collab-mem-stage {
+  font-style: normal; font-size: 10px; color: var(--gold); white-space: nowrap;
+  padding: 0 5px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--gold) 35%, transparent);
+}
+.collab-engine { font-size: 10.5px; color: var(--ink-faint); font-family: var(--mono); }
+.collab-col-head .collab-st { margin-left: auto; }
+.collab-col-head .collab-cancel { flex: none; height: 22px; padding: 0 7px; font-size: 11px; }
+.collab-col-body { flex: 1; min-height: 120px; overflow: auto; padding: 9px 10px; font-size: 12.5px; line-height: 1.75; }
+.collab-col-body .md-p { margin: 0 0 8px; }
+.collab-col-body pre { margin: 6px 0; }
+/* 代码块右上角「复制」（借用消息里的样式，但列不是 .msg） */
+.collab-col-body .code-wrap { position: relative; }
+.collab-col-body .code-wrap > pre { margin: 9px 0; }
+.collab-col-body .code-wrap .copy-code {
+  position: absolute; top: 7px; right: 8px; z-index: 1; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 4px;
+  background: color-mix(in srgb, var(--paper) 92%, transparent);
+  color: var(--ink-faint); font-family: var(--serif);
+  font-size: 10.5px; padding: 1px 7px; line-height: 16px;
+  opacity: .45; transition: opacity .15s ease, color .15s ease, border-color .15s ease;
+}
+.collab-col-body .code-wrap:hover .copy-code { opacity: .9; }
+.collab-col-body .code-wrap .copy-code:hover { opacity: 1; color: var(--hi); }
+.collab-col-err { color: #ff8a9a; font-size: 12px; white-space: pre-wrap; }
+.collab-col-wait { color: var(--ink-faint); font-size: 12px; }
+.collab-acts { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--line-soft); }
+.collab-act { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ink-faint); min-width: 0; }
+.collab-act b { font-weight: 500; color: var(--ink-dim); }
+.collab-act span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-act em { margin-left: auto; font-style: normal; flex: none; }
+.collab-act.done em { color: #39b46a; }
+.collab-act.error em { color: var(--err); }
+.collab-col-foot {
+  flex: none; padding: 6px 10px; border-top: 1px solid var(--line-soft);
+  font-size: 10.5px; font-family: var(--mono); color: var(--ink-faint);
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.collab-diff {
+  flex: none; max-height: 34%; overflow: auto; padding: 10px 16px 14px;
+  border-top: 1px solid var(--line-soft);
+}
+.collab-diff-h { font-size: 12px; margin-bottom: 6px; }
+
+/* 一次性「新建任务」弹窗已移除（工作流是唯一入口）→ 对应的 .collab-new-box / #cn-task /
+   .collab-preset-row / .collab-row 等样式一并删掉，别留死选择器。 */
+.collab-orch-row { display: flex; gap: 8px; align-items: baseline; padding: 5px 2px; border-top: 1px dashed var(--line-soft); font-size: 11.5px; }
+.collab-orch-row b { flex: none; font-weight: 500; }
+.collab-orch-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.collab-orch-row button { flex: none; height: 22px; padding: 0 8px; font-size: 11px; margin-left: auto; }
+
+@media (max-width: 900px) {
+  .collab-side { width: 170px; }
+  .collab-cols { flex-direction: column; }
+  .collab-col { flex: none; min-width: 0; }
+  .collab-col-body { max-height: 46vh; }
+}
+
+
+@media (max-width: 820px) {
+  .mus-nav { width: 84px; }
+  .mus-song { grid-template-columns: 40px 30px 1.6fr 1fr 48px; }
+  .mus-song .s-album { display: none; }
+}
+
+/* ---------- 窄屏：侧栏改浮层，歌词栏不占列 ---------- */
+
+@media (max-width: 760px) {
+  #app { grid-template-columns: 1fr; }
+  #sidebar, #main { grid-column: 1; }
+  html[data-sidebar="open"] #sidebar {
+    display: flex; position: fixed; inset: 0 auto 0 0;
+    width: var(--sidebar); z-index: 8; box-shadow: var(--shadow);
+  }
+  .p-vol input[type="range"] { width: 56px; }
+}

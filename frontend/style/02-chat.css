@@ -1,0 +1,567 @@
+/* 02-chat.css —— 输入框 / 附件 / 打字机 / 顶栏 / 壁纸 / 音频（P4 从 style.css 按物理顺序拆出的第 2 段；拼接后与原文件一致） */
+
+/* ---------- 系统类提示（自动续写 / 目录切换等）---------- */
+
+.notice {
+  max-width: 880px; margin: 8px auto 18px;
+  display: flex; align-items: center; gap: 10px;
+  color: var(--ink-faint); font-size: 11.5px; letter-spacing: .06em;
+}
+.notice .line { flex: 1; height: 1px; background: var(--line-soft); }
+.notice .label { font-family: var(--serif); }
+
+/* ★上下文压缩（OpenCode 的 `compaction` 消息）与 shell 消息：小条 + 可折叠摘要 */
+.notice.compact .label { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.notice.compact .cp-sub { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.cp-err {
+  max-width: 880px; margin: -8px auto 18px; font-size: 12px; color: var(--err);
+  white-space: pre-wrap; word-break: break-word;
+}
+details.part.cp-sum { max-width: 880px; margin: -6px auto 18px; }
+details.part.cp-sum .body.cp-md {
+  white-space: normal; font-family: var(--sans); font-size: 12.5px; color: var(--ink-dim);
+}
+
+/* ---------- 附件 ---------- */
+
+.files { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px; }
+.file {
+  font-size: 11.5px; font-family: var(--mono);
+  border: 1px solid var(--line); border-radius: 2px;
+  padding: 1px 7px; color: var(--ink-dim); background: var(--paper-2);
+}
+
+/* ---------- 连接状态提示条 ---------- */
+
+.banner {
+  padding: 8px 18px; font-size: 12.5px; letter-spacing: .04em;
+  background: color-mix(in srgb, var(--gold) 16%, var(--paper-2));
+  color: var(--ink);
+  border-bottom: 1px solid color-mix(in srgb, var(--gold) 35%, transparent);
+  display: flex; align-items: center; gap: 8px;
+}
+.banner::before {
+  content: ""; width: 7px; height: 7px; flex: none; border-radius: 50%;
+  background: var(--gold); animation: breathe 1.4s ease-in-out infinite;
+}
+.banner[hidden] { display: none; }
+.banner.clickable { cursor: pointer; }
+.banner.clickable:hover { background: color-mix(in srgb, var(--gold) 26%, var(--paper-2)); }
+
+/* ---------- 附件（粘贴 / 拖拽 / 选择文件）---------- */
+
+.attach-row {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin: 0 0 8px;
+}
+.attach-row[hidden] { display: none; }
+
+.attach {
+  position: relative; display: flex; align-items: center; gap: 8px;
+  background: var(--paper); border: 1px solid var(--line);
+  border-radius: 4px; padding: 5px 26px 5px 5px; max-width: 240px;
+}
+.attach .thumb {
+  width: 34px; height: 34px; flex: none; border-radius: 3px;
+  object-fit: cover; background: var(--paper-3);
+  display: grid; place-items: center; font-size: 17px;
+}
+.attach .meta { min-width: 0; line-height: 1.35; }
+.attach .meta b {
+  display: block; font-weight: 500; font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.attach .meta i { font-style: normal; font-size: 10.5px; color: var(--ink-faint); }
+.attach .rm {
+  position: absolute; right: 3px; top: 3px; width: 18px; height: 18px;
+  padding: 0; line-height: 1; font-size: 13px; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--paper-2); color: var(--ink-dim);
+}
+.attach .rm:hover { color: var(--err); border-color: var(--err); }
+
+/* 图片预览（点击附件缩略图 / 消息里的图片） */
+.img-view {
+  position: fixed; inset: 0; z-index: 26;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--ink) 72%, transparent);
+  backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+}
+.img-view[hidden] { display: none; }
+.img-view img {
+  max-width: calc(92vw / var(--ui-z)); max-height: calc(88vh / var(--ui-z)); border-radius: 6px;
+  box-shadow: var(--shadow); background: var(--paper);
+}
+.img-view .img-x {
+  position: fixed; right: 18px; top: 14px; width: 34px; height: 34px;
+  font-size: 20px; line-height: 1;
+}
+.attach[data-mime^="image/"] { cursor: pointer; }
+
+/* 拖拽时铺满窗口的提示层 */
+.drop-veil {
+  position: fixed; inset: 0; z-index: 9;
+  display: grid; place-items: center;
+  background: color-mix(in srgb, var(--paper) 72%, transparent);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  border: 3px dashed var(--hi); border-radius: 6px;
+}
+.drop-veil[hidden] { display: none; }
+.drop-veil .veil-box {
+  font-family: var(--serif); font-size: 20px; letter-spacing: .1em;
+  color: var(--ink); text-align: center; line-height: 1.9;
+}
+.drop-veil .veil-box span { font-family: var(--sans); font-size: 12px; color: var(--ink-faint); letter-spacing: 0; }
+
+/* 消息里的图片附件 */
+.files .shot { display: inline-block; line-height: 0; }
+.files .shot img {
+  max-width: 220px; max-height: 220px; border-radius: 4px;
+  border: 1px solid var(--line); background: #fff;
+}
+
+/* ---------- 打字机 & 实时思考 ---------- */
+
+.caret {
+  display: inline-block; width: .48em; height: 1em; margin-left: 2px;
+  vertical-align: -2px; background: var(--hi);
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+.tag.thinking {
+  color: var(--hi);
+  border-color: color-mix(in srgb, var(--hi) 45%, transparent);
+  animation: breathe 1.6s ease-in-out infinite;
+}
+@keyframes breathe { 50% { opacity: .55; } }
+
+details.part.auto-open > summary { color: var(--hi); }
+/* 生成中的思考面板：不限制高度、不做内部滚动，随内容向下生长 */
+details.part .body.stream { max-height: none; overflow: visible; }
+
+/* 本地乐观回显、还没被服务端确认的消息 */
+.msg.pending { opacity: .72; }
+
+@media (prefers-reduced-motion: reduce) {
+  .caret, .tag.thinking { animation: none; }
+}
+
+/* ---------- 同人图素材 ---------- */
+
+/* 助手消息的圆形头像 */
+.msg .who .avatar {
+  width: 22px; height: 22px; border-radius: 50%; object-fit: cover;
+  border: 1px solid var(--line); background: #fff; flex: none;
+}
+
+/* 空状态：主插画 + 贴纸 */
+.empty .hero-card {
+  display: block; margin: 0 auto 18px; width: 62%; max-width: 236px;
+  border: 1px solid var(--line); border-radius: 6px; background: #fff;
+  box-shadow: var(--shadow);
+}
+.empty .stickers { display: flex; gap: 10px; justify-content: center; margin-top: 18px; }
+.empty .stickers img {
+  height: 84px; width: auto; border-radius: 4px; background: #fff;
+  border: 1px solid var(--line); box-shadow: var(--shadow);
+}
+.empty .stickers img:nth-child(1) { transform: rotate(-3.5deg); }
+.empty .stickers img:nth-child(2) { transform: rotate(2.5deg); }
+.empty .credit { margin-top: 16px; font-size: 10.5px; color: var(--ink-faint); }
+
+/* ---------- 昼主题：背景插画（你指定的壁纸）---------- */
+/* 想更明显 → 把下面三个 rgba 的透明度调小；想更淡就调大。当前值让插画约占 4~6 成。 */
+/* ---------- 静态背景：两层交叉淡入（换主题只动 opacity，不重新解码/光栅化） ---------- */
+#static-bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+#static-bg .sb {
+  position: absolute; inset: 0; opacity: 0; transition: opacity .5s ease;
+  background-position: center 16%; background-size: cover; background-repeat: no-repeat;
+}
+#static-bg .sb.on { opacity: 1; }
+#static-bg .sb[data-bg="hiru"] {
+  background-image:
+    linear-gradient(180deg, rgba(250,247,242,.34) 0%, rgba(250,247,242,.44) 55%, rgba(250,247,242,.58) 100%),
+    url("/assets/hiru-bg.jpg");
+}
+
+/* 背景有了插画，气泡之外的小字加一层纸色柔光，保证可读 */
+.msg .who,
+.notice,
+.empty .duck-line1,
+.empty .duck-line2,
+.empty .credit {
+  text-shadow: 0 0 4px var(--paper), 0 0 9px var(--paper);
+}
+
+/* ---------- 面板毛玻璃（「液态玻璃」关掉时的纸面兜底）---------- */
+[data-theme="hiru"] #sidebar,
+[data-theme="hiru"] #topbar,
+[data-theme="hiru"] #composer {
+  background: rgba(250, 247, 242, .72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* ---------- 动态壁纸（Wallpaper Engine 原片）----------
+   收起侧栏 → **缓慢启动**：转速由静止慢慢加上去；
+   展开会话 → **缓慢停止**：转速慢慢减到停，**停住的那一帧就是静态背景**
+   （直接暂停视频本身，不再截图/不再有 #bg-freeze 那一层）。
+   没有可用原片（没装 WE / 没订阅 / 系统要求减少动态）→ 两侧都用主题自带的静态壁纸，不做动画。 */
+
+/* 静态壁纸兜底（没有动态层时用它）：
+   会话界面（展开）也套同一个亮度 + 毛玻璃；收起时保持原样（不模糊）。 */
+/* 静态背景两层同样套亮度；展开时再套毛玻璃 */
+#static-bg .sb { filter: brightness(var(--bg-dim, 1)); }
+html[data-sidebar="open"] #static-bg .sb {
+  filter: brightness(var(--bg-dim, 1));
+}
+
+/* 视频层：有动态壁纸时**一直可见**（收起在播、展开暂停）。
+   自带一张主题静态壁纸当底 —— 视频还没解码出来时也不会出现空白。
+   亮度统一用 --bg-dim；展开（会话界面那侧）再套毛玻璃。 */
+#live-bg {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+  background-position: center 16%; background-size: cover; background-repeat: no-repeat;
+  filter: brightness(var(--bg-dim, 1));
+}
+html[data-theme="hiru"] #live-bg { background-image: url("/assets/hiru-bg.jpg"); }
+html:not(.has-live) #live-bg { display: none; }
+html[data-sidebar="open"] #live-bg {
+  filter: brightness(var(--bg-dim, 1));
+}
+/* 动态层一旦上屏，静态那张就让位（否则它画在更上层，会把视频盖住） */
+html.has-live #static-bg { display: none; }
+/* 模糊会把图层边缘和"透明"混出一圈淡边：开模糊时把图层撑出视口一点。
+   收起/展开都撑 —— 两层几何一致，切换时不会有一点点位移。 */
+
+.lb-video {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; display: block; background: transparent;
+  /* ⚠ 没解码出帧的 <video> 会画黑（盖住下面的静态壁纸 → 昼夜切换时一大块黑屏）。
+     默认 opacity:0 藏着，**且默认不设过渡 —— 藏要立刻藏**（否则换片瞬间它会带着黑
+     慢慢淡出，仍有约 0.25s 的黑）；露出来时才淡入。 */
+  opacity: 0;
+}
+.lb-video.ready { opacity: 1; transition: opacity .25s ease; }
+
+/* 纸色蒙层：跟静态壁纸用同一组渐变 —— 保证读字清楚、浓淡一致 */
+#live-bg .lb-wash {
+  position: absolute; inset: 0; z-index: 3;
+  background: linear-gradient(180deg,
+    rgba(250,247,242,.34) 0%, rgba(250,247,242,.44) 55%, rgba(250,247,242,.58) 100%);
+}
+html[data-theme="hiru"].has-live #live-bg .lb-wash { display: none; }
+
+/* 系统要求减少动态效果：不播，直接用静态壁纸 */
+@media (prefers-reduced-motion: reduce) {
+  #live-bg { display: none !important; }
+}
+
+/* ---------- 弹窗：设置 ---------- */
+
+/* ★设置 = 右侧抽屉（**跟群聊一样的展开形式**：右滑入 + 分屏让位 + 左边缘可拖宽） */
+.cfg {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: var(--cfg-w, 560px); min-width: 300px; max-width: calc(96vw / var(--ui-z)); z-index: 22;
+  display: flex; flex-direction: column;
+  background: var(--paper); border-left: 1px solid var(--line);
+  box-shadow: -14px 0 34px rgba(0, 0, 0, .24);
+  transform: translateX(102%); visibility: hidden;
+  transition: transform .22s ease, visibility .22s ease;
+  contain: layout paint;
+}
+.cfg.open { transform: translateX(0); visibility: visible; }
+.cfg.resizing { transition: none; }                 /* 拖动中别走过渡，跟手 */
+/* 左边缘拖拽手柄 */
+.cfg-resize {
+  position: absolute; left: -3px; top: 0; bottom: 0; width: 7px;
+  cursor: col-resize; z-index: 2; touch-action: none;
+}
+.cfg-resize::after {
+  content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 1px;
+  background: var(--gold-soft); opacity: 0; transition: opacity .15s ease;
+}
+.cfg-resize:hover::after, .cfg.resizing .cfg-resize::after { opacity: .85; background: var(--hi); }
+/* 抽屉内容：填满抽屉、自己滚动 */
+.cfg-box {
+  flex: 1; min-height: 0; overflow: auto;
+  width: auto; max-height: none; border: 0; border-radius: 0;
+  background: transparent; box-shadow: none; padding: 16px 18px 12px;
+}
+/* 分屏：开关设置抽屉时给面板让出右侧（跟群聊一致） */
+html.cfg-open #app { padding-right: clamp(300px, var(--cfg-w, 560px), calc(96vw / var(--ui-z))); }
+html.cfg-resizing #app { transition: none; }
+.cfg-head { display: flex; align-items: center; gap: 10px;
+            border-bottom: 1px solid var(--line-soft); padding-bottom: 10px; }
+.cfg-head b { font-family: var(--serif); font-size: 16px; }
+.cfg-body { padding: 6px 0 2px; }
+.cfg-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 2px; border-bottom: 1px solid var(--line-soft);
+}
+.cfg-row:last-child { border-bottom: 0; }
+.cfg-row[hidden] { display: none; }                  /* [hidden] 要压过 .cfg-row 的 flex */
+.cfg-row.sub {
+  padding-left: 16px;
+  border-left: 2px solid color-mix(in srgb, var(--hi) 35%, var(--line-soft));
+}
+.cfg-row.sub > label { font-size: 12.5px; }
+.cfg-row.sub input[type="range"] { width: 150px; }
+.cfg-row > label { flex: 1; min-width: 0; font-size: 13px; }
+.cfg-row > label i { display: block; font-style: normal; font-size: 11px; color: var(--ink-faint); margin-top: 2px; }
+/* ★设置项里的「说明」默认**不显示**（否则面板里全是碎碎念、占版面）——
+ *  鼠标悬停那一行时用原生 tooltip 显示（文案由 initCfgNotes() 搬到 .cfg-row 的 title 上）。
+ *  ⚠ 动态状态（当前引擎 / 更新进度 / 面板窗口说明…）在 index.html 里带 `data-live`，照常显示。 */
+.cfg-row > label > i:not([data-live]) { display: none; }
+/* 「上下两行」的行：label 独占一行，控件在下一行（给"输入框 + 输入框 + 按钮"这种多的用）。
+   ⚠ 不加这个的话，一行里塞两个 190px 输入框会把 label 挤成"一行一个字"（实测踩到）。 */
+.cfg-row.wide { flex-direction: column; align-items: stretch; gap: 6px; }
+.cfg-row.wide > label { flex: none; }
+.cfg-row .cfg-ctl { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cfg-row .cfg-ctl input[type="text"],
+.cfg-row .cfg-ctl input[type="password"] { flex: 1 1 160px; width: auto; min-width: 0; }
+.cfg-row .cfg-ctl button { flex: none; }
+/* 新会话：项目单选列表（当前 agent 用过的目录）+ 「＋ 新建项目…」 */
+.ns-projects { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow: auto; }
+.ns-proj {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  width: 100%; text-align: left; padding: 7px 10px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ink-faint) 6%, transparent);
+}
+.ns-proj:hover { border-color: var(--gold-soft); }
+.ns-proj.on { border-color: var(--gold); box-shadow: inset 0 0 0 1px var(--gold); }
+.ns-proj .np-name { font-size: 13px; }
+.ns-proj .np-path { font-size: 11px; color: var(--ink-faint); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ns-proj.ns-new { align-items: center; color: var(--gold); font-size: 13px; }
+.ns-empty { font-size: 12px; padding: 2px 2px 4px; }
+/* API Key：变量名是**只读小标签**（按品牌自动决定），旁边只有值输入框 + 保存。
+   ⚠ 以前是两个输入框（变量名 + 值），用户第一反应是"为什么有两个"——所以砍掉手填。 */
+.cfg-key-var {
+  flex: none; display: inline-flex; align-items: center;
+  padding: 5px 9px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ink-faint) 10%, transparent);
+  font-size: 11.5px; letter-spacing: .02em; color: var(--ink-dim); white-space: nowrap;
+}
+/* 自定义素材那一排（头像 / 空会话主图 / 贴纸） */
+.cfg-art { gap: 8px; }
+.cfg-art .cfg-art-k { flex: 0 0 88px; font-size: 11.5px; color: var(--ink-dim); }
+.cfg-art button { padding: 4px 10px; font-size: 11.5px; }
+.cfg-art .cfg-img-name {
+  flex: 1 1 90px; min-width: 0; font-size: 10.5px; color: var(--ink-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cfg-row input[type="range"] {
+  -webkit-appearance: none; appearance: none; width: 190px; height: 4px;
+  border-radius: 2px; cursor: pointer; outline: none;
+  background: color-mix(in srgb, var(--ink-faint) 35%, transparent);
+}
+.cfg-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%;
+  background: var(--hi); border: 1px solid var(--paper); cursor: pointer;
+}
+.cfg-row input[type="text"],
+.cfg-row input[type="password"] {
+  width: 190px; padding: 6px 9px; font: inherit; font-size: 12.5px;
+  color: var(--ink); background: var(--paper);
+  border: 1px solid var(--line); border-radius: var(--radius); outline: none;
+}
+.cfg-row input[type="text"]:focus,
+.cfg-row input[type="password"]:focus { border-color: var(--hi); box-shadow: 0 0 0 3px var(--hi-wash); }
+#cfg-engine {
+  min-width: 140px; padding: 6px 9px; font: inherit; font-size: 12.5px;
+  color: var(--ink); background: var(--paper);
+  border: 1px solid var(--line); border-radius: var(--radius); outline: none;
+}
+#cfg-engine:focus { border-color: var(--hi); box-shadow: 0 0 0 3px var(--hi-wash); }
+#cfg-engine:disabled { opacity: .6; }
+.cfg-row select {
+  min-width: 160px; max-width: 300px; padding: 6px 9px; font: inherit; font-size: 12.5px;
+  color: var(--ink); background: var(--paper);
+  border: 1px solid var(--line); border-radius: var(--radius); outline: none;
+}
+.cfg-row select:focus { border-color: var(--hi); box-shadow: 0 0 0 3px var(--hi-wash); }
+.cfg-row select:disabled { opacity: .6; }
+/* 路径用等宽字体：日文字体里 U+005C(\) 会画成 ￥，换 Consolas 这类字体就正常 */
+#cfg-wall-root { font-family: var(--mono); font-size: 12px; letter-spacing: 0; }
+.cfg-row output { width: 44px; text-align: right; font-family: var(--mono); font-size: 12px; color: var(--ink-dim); }
+.cfg-toggle { min-width: 52px; padding: 5px 10px; font-size: 12.5px; }
+.cfg-toggle.on { background: var(--hi); border-color: var(--hi); color: #fff; font-weight: 600; }
+.cfg-foot { display: flex; align-items: center; gap: 10px;
+            border-top: 1px solid var(--line-soft); padding-top: 10px; font-size: 11.5px; }
+.cfg-foot button { margin-left: auto; }
+/* ---------- 输入区：绘梨衣的小本子 ---------- */
+
+#composer {
+  position: relative;
+  display: flex; gap: 10px; align-items: flex-end;
+  /* 底部留白加大：把输入框整体抬高一点，下方空出"水面"，落樱涟漪就在那里溅开 */
+  padding: 14px 18px 38px; border-top: 1px solid var(--line);
+  background: var(--paper-2);
+}
+.composer-wrap { flex: 1; min-width: 0; }
+.composer-foot { display: flex; gap: 8px; margin: 6px 0 0 2px; }
+.perm-btn {
+  font: inherit; font-size: 11px; line-height: 1; padding: 5px 9px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 6px; background: transparent;
+  color: var(--ink-dim);
+}
+.perm-btn:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.perm-btn[data-level="edit"],
+.perm-btn[data-level="exec"] { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 35%, var(--line)); }
+.perm-btn[data-level="all"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+/* ★上下文用量：平时淡、快满时金/红；靠右（和左边权限/技能分开） */
+.ctx-chip { margin-left: auto; color: var(--ink-faint); }
+.ctx-chip.warn { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 55%, transparent); }
+.ctx-chip.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 55%, transparent); }
+.ctx-chip[hidden] { display: none; }
+.perm-menu {
+  position: fixed; z-index: 24; display: flex; flex-direction: column; gap: 4px;
+  padding: 8px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--paper); box-shadow: 0 10px 30px rgba(0,0,0,.28);
+}
+.perm-menu button {
+  font: inherit; font-size: 12px; text-align: left; padding: 7px 10px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--ink-dim);
+}
+.perm-menu button:hover { color: var(--hi); background: color-mix(in srgb, var(--hi) 8%, transparent); }
+.perm-menu button.on { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.perm-menu .perm-more { margin-top: 2px; border-top: 1px solid var(--line-soft); border-radius: 0 0 7px 7px; color: var(--hi); }
+.composer-label {
+  font-family: var(--serif); font-size: 11px; color: var(--ink-faint);
+  letter-spacing: .12em; margin: 0 0 6px 2px;
+  display: flex; align-items: center; gap: 7px;
+}
+.composer-label::after {
+  content: ""; flex: 1; height: 1px; background: var(--line-soft);
+}
+#input {
+  width: 100%; resize: none; max-height: 200px; min-height: 44px;
+  background: var(--paper); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 10px 13px; font: inherit; outline: none; line-height: 26px;
+  /* 横线格：小本子的书写线 */
+  background-image: repeating-linear-gradient(
+    to bottom, transparent 0 25px, var(--line-soft) 25px 26px);
+  background-attachment: local;
+}
+#input:focus {
+  border-color: var(--hi);
+  box-shadow: 0 0 0 3px var(--hi-wash);
+}
+#input:disabled { opacity: .45; }
+#input::placeholder { color: var(--ink-faint); }
+
+/* ---------- 收起侧栏后：输入框上方的真频谱音频条 ----------
+   收起时播放条被隐藏（见「侧栏收起」一节），音频条挪到输入框正上方这一条独立的容器里。
+   数据仍是 /qq/spectrum 的真频谱（系统回环，任何声音都会跳），拿不到就退回合成动画。 */
+
+.vis-bar { display: none; position: relative; z-index: 3; }
+html[data-sidebar="closed"] .vis-bar {
+  display: flex; align-items: flex-end; justify-content: center;
+  gap: 4px; height: 64px; padding: 10px 18px 8px;
+  width: min(100%, 1000px); align-self: center;   /* 长：整条拉到 1000px 宽后居中 */
+  /* 半透明渐隐：压在壁纸上，不切出一条硬邦邦的色带 */
+  background: linear-gradient(to top,
+    color-mix(in srgb, var(--paper-2) 62%, transparent), transparent);
+}
+.vis-bar span {
+  flex: 1 1 0; max-width: 17px; min-width: 0;      /* 密：48 根铺满整条 */
+  border-radius: 2px 2px 1px 1px;
+  /* 上淡下浓，像真的电平表；再叠一层整体透明 */
+  background: linear-gradient(to top,
+    color-mix(in srgb, var(--hi) 45%, transparent),
+    color-mix(in srgb, var(--hi) 95%, transparent));
+  height: 10%;
+  opacity: .5;
+  animation: visBounce .9s ease-in-out infinite alternate;
+  animation-play-state: paused;                    /* 没在放歌时静止成一条矮基线 */
+}
+.vis-bar span:nth-child(3n)   { animation-duration: .62s; animation-delay: -.18s; }
+.vis-bar span:nth-child(3n+1) { animation-duration: 1.04s; animation-delay: -.34s; }
+.vis-bar.playing span { animation-play-state: running; }
+/* 真频谱模式：高度由 JS 直接给，关掉合成动画（否则动画会盖掉内联高度） */
+.vis-bar.real span { animation: none; }
+
+/* ---------- 会话区两侧的真频谱音频条 ----------
+   数据同 /qq/spectrum；默认由设置里的「对话两侧音频条」开关控制。
+   两根都从底部长起，左条贴左、右条贴右，避免压住正文。 */
+
+.spec-side {
+  position: absolute; bottom: 0; z-index: 1;   /* 相对 #chat-stage：从音乐条顶部往上算 */
+  height: var(--spec-side-h, 100%);            /* 100% = 顶到顶部设置栏（chat-stage 顶） */
+  max-height: 100%;
+  width: min(calc(14vw / var(--ui-z)), 110px);                     /* 柱子伸出宽度；窄屏由 media 隐藏 */
+  display: none; flex-direction: column-reverse; justify-content: flex-start;
+  gap: 2px; pointer-events: none; opacity: .5;
+}
+html.spec-sides .spec-side { display: flex; }
+#spec-left  { left: 3px;  align-items: flex-start; }
+#spec-right { right: 3px; align-items: flex-end; }
+.spec-side span {
+  flex: none; height: 3px; min-height: 2px; max-height: 3px;
+  width: 10%; border-radius: 2px;
+  background: linear-gradient(to right,
+    color-mix(in srgb, var(--hi) 45%, transparent),
+    color-mix(in srgb, var(--hi) 95%, transparent));
+}
+#spec-right span {
+  background: linear-gradient(to left,
+    color-mix(in srgb, var(--hi) 45%, transparent),
+    color-mix(in srgb, var(--hi) 95%, transparent));
+}
+@media (max-width: 820px) {
+  .spec-side { display: none !important; }
+}
+
+/* ---------- 控件 ---------- */
+
+button {
+  background: var(--paper); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 8px 14px; cursor: pointer; font: inherit; font-size: 13px;
+  letter-spacing: .03em; transition: all .13s ease;
+}
+button:hover:not(:disabled) {
+  border-color: var(--hi); color: var(--hi);
+  background: var(--hi-wash);
+}
+button:disabled { opacity: .4; cursor: not-allowed; }
+/* 主按钮：绯袴 —— 实心绯红 */
+button.primary {
+  background: var(--hi); border-color: var(--hi); color: #fff; font-weight: 600;
+}
+button.primary:hover:not(:disabled) {
+  background: var(--hi-deep); border-color: var(--hi-deep); color: #fff;
+}
+button.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 35%, transparent); }
+button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 10%, transparent); color: var(--err); }
+
+/* ---------- 顶栏按钮：统一成同一尺寸的方形图标按钮 ---------- */
+/* 尺寸只在这里定义一次；下面各按钮只调字形，不再各自定宽高。 */
+#btn-sidebar,
+#topbar .actions button {
+  width: 34px; height: 34px; min-width: 34px; flex: none;
+  padding: 0; display: grid; place-items: center;
+  font-size: 16px; line-height: 1; letter-spacing: 0;
+}
+
+.muted { color: var(--ink-faint); }
+.error-box {
+  max-width: 880px; margin: 0 auto 16px; padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+  border-left: 2px solid var(--err);
+  background: color-mix(in srgb, var(--err) 8%, var(--paper));
+  color: var(--err); border-radius: var(--radius); white-space: pre-wrap;
+  font-size: 13px;
+}
+
+/* ---------- 空状态：小黄鸭（Sakura & 絵梨衣 のDuck） ---------- */
+
+.empty {
+  max-width: 880px; margin: 0 auto; padding: 48px 20px; text-align: center;
+  color: var(--ink-faint);
+}
+.empty .duck { display: block; margin: 0 auto 14px; }
+.empty .duck-line1 { font-family: var(--serif); font-size: 14px; color: var(--ink-dim); letter-spacing: .06em; }
+.empty .duck-line2 { font-size: 11px; margin-top: 5px; font-family: var(--mono); letter-spacing: .06em; }
