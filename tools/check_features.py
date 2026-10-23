@@ -115,6 +115,8 @@ CHECKS = [
     ("消息", "★复制走剪贴板（同步 execCommand 优先 + Clipboard API 兜底）", r"async function copyToClipboard"),
     ("消息", "★复制先走 execCommand（WebView2 点击手势内）", r'const ok = document\.execCommand\("copy"\)'),
     ("消息", "★剪贴板两条都失败 → 手动复制兜底框", r"function showCopyFallback"),
+    ("消息", "★完成后的最后一段正文不被「旁白」规则吞掉（Codex 常见：正文后跟 tool 收尾）",
+     r"finishedMsg && !hasTextAfter"),
     ("消息", "★复制正文从权威数据取（实时缓冲优先，不靠 DOM）", r"function copyMessageById"),
     ("消息", "★复制后按钮给瞬时反馈", r"function flashCopied"),
     # ---- 消息渲染（重写过的高危区）----
@@ -138,7 +140,7 @@ CHECKS = [
     ("消息", "★本轮进展：没有工具的那一轮**不出现**", r"if \(!g \|\| !g\.items\.length\) return"),
     ("消息", "★本轮进展：不再有「一步步列表」的卡片（细节统一去轨迹页）", r"NOT:tc-rows"),
     ("消息", "★思考 / 工具已移出主界面（只记标记）", r"hadReasoning = true"),
-    ("消息", "★只显示最终输出：旁白（后面还跟着工具）不进主界面", r'slice\(i \+ 1\)\.some'),
+    ("消息", "★只显示最终输出：旁白（后面还跟着工具）不进主界面", r"hasToolAfter"),
     ("消息", "★系统注入通知（指令变更/日期/环境）不进主界面", r'if \(type === "system"\) return ""'),
     ("消息", "★系统通知归「轨迹」页（kind:note）", r'kind: "note", label: sysNoteLabel'),
     ("消息", "★系统通知短标题（指令变更 · 文件名）", r"function sysNoteLabel"),
@@ -1678,6 +1680,9 @@ PY_CHECKS = [
     ("API Key", "★换 Key 后失效 config 缓存 + 重起子进程", r"def reload_config"),
     ("API Key", "★update_agent 接受 credentials 覆盖", r'"credentials"\):'),
     ("API Key", "★engine.config 注入凭据 env", r"_credentials\.env_for\(a\)"),
+    # ---- ★权限自动放行下沉到后端（0.2.24）----
+    ("权限", "★后端按面板等级自动放行（不依赖前端轮询 / 当前会话）", r"_ca\.allowed_by_level"),
+    ("权限", "★破坏性命令后端也不自动（即使 level=all）", r"_ca\._is_destructive"),
     # ---- 自定义外观（头像 / 空会话素材）----
     ("外观", "★素材状态文件（只记本机路径）", r"APPEARANCE_FILE"),
     ("外观", "允许的图片扩展名白名单", r"IMAGE_EXTS"),
@@ -2146,6 +2151,7 @@ def main() -> int:
               "cross_engine_model_test.py", "perm_audit_test.py", "inbox_queue_test.py",
               "workflow_canvas_ui_test.py", "agent_install_test.py", "agent_update_ui_test.py",
               "credentials_test.py", "credentials_ui_test.py", "permission_copy_ui_test.py",
+              "perm_level_auto_test.py",
               "acp_events_test.py", "acp_api_test.py", "acp_engine_ui_test.py",
               "watch_mode_test.py", "md_render_test.py", "selftest.py",
               "cocraft_agents_check.py", "cocraft_ws_check.py")

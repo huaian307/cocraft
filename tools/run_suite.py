@@ -64,6 +64,7 @@ TESTS = [
     "credentials_test",
     "credentials_ui_test",
     "permission_copy_ui_test",
+    "perm_level_auto_test",
     "acp_events_test",
     "acp_api_test",
     "watch_mode_test",

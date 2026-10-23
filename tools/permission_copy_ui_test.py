@@ -76,6 +76,22 @@ STUB = r"""<script>
       content: [
         { type: "reasoning", text: "（思考不该被复制）" },
         { type: "text", text: "第一段要复制的内容。\n\n```js\nconst a = 1;\n```\n" }
+      ] },
+    // ★Codex 常见形态：最终正文后面还跟着一条 tool 状态更新 → 完成后的正文必须显示
+    { id: "a2", type: "assistant", model: { id: "mock-fast", providerID: "mock" },
+      time: { created: NOW - 3000, completed: NOW - 2000 },
+      content: [
+        { type: "reasoning", text: "（思考）" },
+        { type: "text", text: "完成后的反馈文字" },
+        { type: "tool", name: "shell", state: { status: "completed", input: { command: "echo" } } }
+      ] },
+    // 还在生成：这段是"边做边说"的旁白 → 主界面不该显示
+    { id: "a3", type: "assistant", model: { id: "mock-fast", providerID: "mock" },
+      time: { created: NOW - 800 },
+      content: [
+        { type: "reasoning", text: "（思考）" },
+        { type: "text", text: "进行中的旁白" },
+        { type: "tool", name: "shell", state: { status: "running", input: { command: "echo" } } }
       ] }
   ];
   window.fetch = function (u, o) {
@@ -133,6 +149,11 @@ function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; 
     await __s(300);
     await openSession("s1");
     await __s(400);
+
+    // 0) Codex 的最终反馈：正文后面跟一条 tool 状态更新，也要显示
+    var boxText = __t(document.getElementById("messages"));
+    step("★完成后的正文（后面跟 tool 状态）仍显示", /完成后的反馈文字/.test(boxText), boxText.slice(-160));
+    step("★还在生成时的旁白不显示", !/进行中的旁白/.test(boxText), boxText.slice(-160));
 
     // 1) 自动放行：请求体必须是合法 JSON
     await pollAsks();

@@ -632,7 +632,14 @@ function renderMessage(m) {
       const key = `${m.id}:${i}`;
       if (p.type === "text") {
         // ★"边做边说"的旁白（这一段后面还跟着工具调用）**不是最终输出** → 主界面不显示。
-        if (contentArr.slice(i + 1).some((q) => q && q.type === "tool")) return "";
+        //   ⚠ 但**已经结束**的回复里，最后一段正文即使后面还跟着 tool 状态更新，也必须显示 ——
+        //     Codex 常把「最终一段话」发完后再补一条 tool 完成状态；旧逻辑会把整条反馈吞掉
+        //     （用户报："codex 完成工作后不会反馈"）。只有"后面还有别的正文"才算旁白。
+        const later = contentArr.slice(i + 1);
+        const hasToolAfter = later.some((q) => q && q.type === "tool");
+        const hasTextAfter = later.some((q) => q && q.type === "text" && String(q.text || "").trim());
+        const finishedMsg = !!(m.time && m.time.completed);
+        if (hasToolAfter && !(finishedMsg && !hasTextAfter)) return "";
         if (p.live) {
           return `<div class="text"><span data-live-text data-msgid="${esc(m.id)}">`
             + `${renderText(stripModelWarning(p.text))}</span><span class="caret"></span></div>`;

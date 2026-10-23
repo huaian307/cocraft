@@ -1100,9 +1100,9 @@ class AcpService:
         #   ★ 2026-10-13：把 `info`（含**命令原文** rawInput/command）也传给钩子 —— 否则桥只能看到
         #     "Run command" 这种标题，等于**盲签**（桌面被清空那次就是盲签 + 自动放行）。
         hook = getattr(self, "auto_permission", None)
+        raw = tc.get("rawInput") if isinstance(tc.get("rawInput"), dict) else {}
+        cmd = str(raw.get("command") or raw.get("cmd") or raw.get("script") or "").strip()
         if callable(hook):
-            raw = tc.get("rawInput") if isinstance(tc.get("rawInput"), dict) else {}
-            cmd = str(raw.get("command") or raw.get("cmd") or raw.get("script") or "").strip()
             info = {"kind": kind, "title": title, "locations": locations, "options": options,
                     "command": cmd, "toolCallId": tc.get("toolCallId"), "rawInput": raw}
             try:
@@ -1122,6 +1122,26 @@ class AcpService:
                         "sessionID": sid, "action": title, "verdict": str(verdict)}})
                     self._log("[acp] 自动应答权限（%s）：%s" % (verdict, title))
                     return {"outcome": {"outcome": "selected", "optionId": oid2}}
+
+        # ★按「面板权限等级」自动放行（**后端**做，别只靠前端轮询）。
+        #   为什么：前端只轮询「当前会话」，切到别的会话 / 页面关掉 / 页面刚好刷新
+        #   时，这条申请就没人应答 → 等到 ANSWER_TIMEOUT(30min) → 用户看到"问了不回答"。
+        #   规则与群聊桥 / 前端 permAllowedByLevel 一致：**破坏性永不自动**；范围未知不自动。
+        try:
+            import cocraft_agents as _ca          # 同一份 _perm_level.json（延迟 import，避免环）
+            lv = _ca.perm_level()
+            if lv and lv != "ask" and not (cmd and _ca._is_destructive(cmd)):
+                s0 = self._sessions.get(sid) or {}
+                ws = str(((s0.get("location") or {}).get("directory")) or "")
+                if _ca.allowed_by_level(lv, kind, title, reason or title, locations, ws):
+                    oid3 = pick_option_id(options, "once")
+                    if oid3 is not None:
+                        self._emit({"type": "permission.auto", "data": {
+                            "sessionID": sid, "action": title, "level": lv, "verdict": "once"}})
+                        self._log("[acp] 按面板等级自动放行（%s）：%s" % (lv, title))
+                        return {"outcome": {"outcome": "selected", "optionId": oid3}}
+        except Exception as exc:                   # noqa: BLE001
+            self._log("[acp] 等级自动放行检查失败（不影响询问）：%s" % exc)
         detail = _perm_detail(tc)
         with self._lock:
             s = self._sessions.get(sid)
