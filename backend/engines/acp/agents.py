@@ -360,6 +360,15 @@ def effective_baseline(entry) -> dict:
     mode = str((entry or {}).get("mode") or "").strip()
     if mode:
         b["mode"] = mode
+    # ★凭据（多 Key）：按「agent 覆盖 → 全局默认」解析成环境变量。
+    #   以前所有 agent 只共用 baseline.env 里那一个 Key，同一家两个账号无法共存。
+    try:
+        from . import credentials as _credentials
+        env = dict(b.get("env") or {})
+        env.update(_credentials.env_for(entry))
+        b["env"] = env
+    except Exception:                       # noqa: BLE001
+        pass
     return b
 
 
@@ -1118,9 +1127,16 @@ def update_agent(aid: str, patch: dict) -> dict:
     a = find_agent(reg, aid)
     if not a:
         return {}
-    for k in ("label", "command", "cwd", "env", "note", "provider", "mode"):
+    for k in ("label", "command", "cwd", "env", "note", "provider", "mode", "credentials"):
         if k in patch and patch[k] is not None:
             a[k] = patch[k]
+    # 凭据覆盖：只留 `{ENV: 凭据 id}` 的字符串对；形状不对就当没配
+    if isinstance(a.get("credentials"), dict):
+        a["credentials"] = {str(k2).strip().upper(): str(v).strip()
+                            for k2, v in (a.get("credentials") or {}).items()
+                            if str(k2).strip() and str(v).strip()}
+    else:
+        a.pop("credentials", None)
     # ★写的时候也纠正：用户/接口把 dsh 改成 danger-full-access 也不会真的生效（除非显式放行）
     env, fixes = sanitize_agent_env(aid, a.get("env"))
     if fixes:
@@ -1455,6 +1471,8 @@ def public(a: dict, det: dict = None) -> dict:
         "provider": str(a.get("provider") or ""),
         # 审批模式（覆盖共享 baseline.mode；不同 agent 的模式名不一样，留空=用基线）
         "mode": str(a.get("mode") or ""),
+        # ★凭据覆盖：{ENV: 凭据 id}；空 = 跟随全局默认（见 credentials.py）
+        "credentials": dict(a.get("credentials") or {}),
         # 没配时给一个「猜出来的」建议（前端编辑框可一键填入；不写入注册表）
         "providerGuess": "" if str(a.get("provider") or "").strip() else guess_provider(a),
         # ★安全：这个 agent 是否声明了「永不问」的权限模式（正常应为空）

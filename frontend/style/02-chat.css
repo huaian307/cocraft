@@ -343,6 +343,29 @@ html.cfg-resizing #app { transition: none; }
   background: color-mix(in srgb, var(--ink-faint) 10%, transparent);
   font-size: 11.5px; letter-spacing: .02em; color: var(--ink-dim); white-space: nowrap;
 }
+/* ★模型凭据（多 Key）：列表 + 默认标记 + 行内操作，窄面板也不横向溢出 */
+.cred-ctl { flex-direction: column; align-items: stretch; gap: 6px; }
+.cred-list { display: flex; flex-direction: column; gap: 2px; width: 100%; }
+.cred-row {
+  display: flex; align-items: baseline; gap: 7px; font-size: 11.5px;
+  padding: 4px 0; border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+.cred-row:first-child { border-top: 0; }
+.cred-row > b { flex: none; color: var(--ink); max-width: 34%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cred-row .cred-env { flex: none; font: 10px var(--mono); color: var(--ink-faint); }
+.cred-row .cred-mask { flex: none; font: 10px var(--mono); color: var(--ink-dim); }
+.cred-row .cred-tag { flex: none; font-size: 9.5px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--line); }
+.cred-row .cred-tag.def { color: #d29922; border-color: color-mix(in srgb, #d29922 50%, transparent); }
+.cred-row .cred-used { min-width: 0; flex: 1; color: var(--ink-faint); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cred-acts { flex: none; display: flex; gap: 4px; }
+.cred-acts button {
+  padding: 0 8px; font-size: 10px; cursor: pointer; color: var(--ink-faint);
+  background: transparent; border-radius: 999px; border: 1px solid var(--line);
+}
+.cred-acts button:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+.cred-acts button[data-cred-del]:hover { color: #e5534b; border-color: color-mix(in srgb, #e5534b 45%, transparent); }
+.cred-empty { font-size: 11px; color: var(--ink-faint); padding: 2px 0; }
+#cred-add { align-self: flex-start; }
 /* 自定义素材那一排（头像 / 空会话主图 / 贴纸） */
 .cfg-art { gap: 8px; }
 .cfg-art .cfg-art-k { flex: 0 0 88px; font-size: 11.5px; color: var(--ink-dim); }

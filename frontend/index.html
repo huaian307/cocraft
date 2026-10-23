@@ -5,14 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft · 絵梨衣</title>
 <link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style/01-base.css?v=0.2.21">
-<link rel="stylesheet" href="/style/02-chat.css?v=0.2.21">
-<link rel="stylesheet" href="/style/03-music.css?v=0.2.21">
-<link rel="stylesheet" href="/style/04-collab.css?v=0.2.21">
-<link rel="stylesheet" href="/style/05-settings.css?v=0.2.21">
-<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.21">
-<link rel="stylesheet" href="/style/07-code.css?v=0.2.21">
-<link rel="stylesheet" href="/style/08-visual.css?v=0.2.21">
+<link rel="stylesheet" href="/style/01-base.css?v=0.2.22">
+<link rel="stylesheet" href="/style/02-chat.css?v=0.2.22">
+<link rel="stylesheet" href="/style/03-music.css?v=0.2.22">
+<link rel="stylesheet" href="/style/04-collab.css?v=0.2.22">
+<link rel="stylesheet" href="/style/05-settings.css?v=0.2.22">
+<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.22">
+<link rel="stylesheet" href="/style/07-code.css?v=0.2.22">
+<link rel="stylesheet" href="/style/08-visual.css?v=0.2.22">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -584,11 +584,10 @@
         <button id="cfg-acp-btn">agentlist…</button>
       </div>
       <div class="cfg-row wide" id="cfg-key-row">
-        <label>模型 API Key<i id="cfg-key-note" data-live>写进共享基线的环境变量；只存本机 runtime/state，不进安装包</i></label>
-        <div class="cfg-ctl">
-          <span class="cfg-key-var mono" id="cfg-key-var" title="变量名按当前 agent 的品牌自动决定（不用手填）">DEEPSEEK_API_KEY</span>
-          <input type="password" id="cfg-key-value" placeholder="sk-…（留空=清除）" autocomplete="off">
-          <button id="cfg-key-save">保存</button>
+        <label>模型凭据<i id="cfg-key-note" data-live>可以保存多个 Key（同一家多个账号也行）；列表只显示掩码</i></label>
+        <div class="cfg-ctl cred-ctl">
+          <div id="cred-list" class="cred-list"></div>
+          <button id="cred-add" type="button">＋ 添加凭据</button>
         </div>
       </div>
       <div class="cfg-row">
@@ -1117,6 +1116,10 @@
         <button id="ae-guess" type="button">自动</button>
       </div>
       <div class="cfg-row">
+        <label>凭据<i>这个 agent 用哪个 Key；留空 = 跟随默认</i></label>
+        <select id="ae-cred"></select>
+      </div>
+      <div class="cfg-row">
         <label>说明<i>备注，鼠标停在卡片上时可见</i></label>
         <input id="ae-note" type="text" autocomplete="off">
       </div>
@@ -1125,6 +1128,39 @@
       <span class="muted" id="ae-msg">改命令 / provider 会重启这个 agent 的子进程</span>
       <button id="ae-save">保存</button>
       <button id="ae-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="cred" class="wp" hidden>
+  <div class="wp-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <span class="wp-kind">Key</span><b id="cred-title">添加凭据</b><i class="mk-cap">装备部</i>
+      <button id="cred-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="cfg-body">
+      <div class="cfg-row">
+        <label>名称<i>例如「DeepSeek · 个人」「DeepSeek · 公司」</i></label>
+        <input id="cred-label" type="text" autocomplete="off">
+      </div>
+      <div class="cfg-row">
+        <label>环境变量<i>同一家多个账号用同一个变量名，靠名称区分</i></label>
+        <input id="cred-env" type="text" class="mono" placeholder="DEEPSEEK_API_KEY" autocomplete="off">
+      </div>
+      <div class="cfg-row">
+        <label>Provider<i>只影响模型图标 / 分组；留空自动推断</i></label>
+        <input id="cred-provider" type="text" placeholder="deepseek / openai / anthropic…" autocomplete="off">
+      </div>
+      <div class="cfg-row">
+        <label>Key<i>只存本机 runtime/state；编辑时留空 = 不修改</i></label>
+        <input id="cred-secret" type="password" placeholder="sk-…" autocomplete="off">
+      </div>
+    </div>
+    <div class="wp-foot">
+      <span class="muted" id="cred-msg">保存后会重启 ACP 子进程（下一条消息用新 Key）</span>
+      <button id="cred-save">保存</button>
+      <button id="cred-cancel">取消</button>
     </div>
   </div>
 </div>
@@ -1207,17 +1243,17 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/js/00-util.js?v=0.2.21"></script>
-<script src="/js/01-chat.js?v=0.2.21"></script>
-<script src="/js/02-shell.js?v=0.2.21"></script>
-<script src="/js/21-cocraft.js?v=0.2.21"></script>
-<script src="/js/40-music.js?v=0.2.21"></script>
-<script src="/js/12-asks.js?v=0.2.21"></script>
-<script src="/js/11-engine.js?v=0.2.21"></script>
-<script src="/js/41-visual.js?v=0.2.21"></script>
-<script src="/js/30-code.js?v=0.2.21"></script>
-<script src="/js/20-collab.js?v=0.2.21"></script>
-<script src="/app.js?v=0.2.21"></script>
+<script src="/js/00-util.js?v=0.2.22"></script>
+<script src="/js/01-chat.js?v=0.2.22"></script>
+<script src="/js/02-shell.js?v=0.2.22"></script>
+<script src="/js/21-cocraft.js?v=0.2.22"></script>
+<script src="/js/40-music.js?v=0.2.22"></script>
+<script src="/js/12-asks.js?v=0.2.22"></script>
+<script src="/js/11-engine.js?v=0.2.22"></script>
+<script src="/js/41-visual.js?v=0.2.22"></script>
+<script src="/js/30-code.js?v=0.2.22"></script>
+<script src="/js/20-collab.js?v=0.2.22"></script>
+<script src="/app.js?v=0.2.22"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

@@ -61,6 +61,7 @@ import themes
 import updater
 from engines.base import HOP_BY_HOP, EngineError
 from engines.acp import agents as acp_agents
+from engines.acp import credentials as acp_credentials
 
 # 抑制「应用程序无法正常启动 (0xc0000142)」这类硬错误模态框：本进程 + 所有子进程
 # （音乐/频谱/QQ SMTC/外部打开/更新器/pick 对话框…… 都会继承）。
@@ -1428,6 +1429,38 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 eng.set_baseline_env(patch)
                 self._send_json(200, {"ok": True, "data": eng.baseline_view()})
+            elif path == "/engine/acp/credentials":
+                # ★模型凭据（多 Key）：列表只回掩码；任何写操作后让配置失效并重起子进程
+                if method == "GET":
+                    self._send_json(200, {"ok": True, "data": acp_credentials.list_public()})
+                    return
+                if method != "POST":
+                    self._send_json(405, {"error": "GET or POST only"})
+                    return
+                b = self._read_json_body() or {}
+                act = str(b.get("action") or "add")
+                try:
+                    if act == "add":
+                        acp_credentials.add(str(b.get("label") or ""), str(b.get("env") or ""),
+                                            str(b.get("secret") or ""), str(b.get("provider") or ""))
+                    elif act == "update":
+                        acp_credentials.update(str(b.get("id") or ""), b)
+                    elif act == "delete":
+                        acp_credentials.delete(str(b.get("id") or ""))
+                    elif act == "default":
+                        acp_credentials.set_default(str(b.get("id") or ""))
+                    else:
+                        self._send_json(400, {"ok": False, "error": "未知 action：%s" % act})
+                        return
+                except KeyError as exc:
+                    self._send_json(404, {"ok": False, "error": str(exc)})
+                    return
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                eng = engines.get_engine("acp")
+                eng.reload_config()             # 换 Key 之后下一条消息用新 env 重起 agent
+                self._send_json(200, {"ok": True, "data": acp_credentials.list_public()})
             elif path == "/engine/acp/log":
                 # 最近几行 ACP / agent 日志（随包 codex 起不来 / 网络不通 / 缺 Key 时看这个）
                 eng = engines.get_engine("acp")
@@ -1862,7 +1895,8 @@ class Handler(BaseHTTPRequestHandler):
         if not aid:
             self._send_json(400, {"ok": False, "error": "缺少 id"})
             return
-        patch = {k: b[k] for k in ("label", "command", "cwd", "env", "note", "provider", "mode") if k in b}
+        patch = {k: b[k] for k in ("label", "command", "cwd", "env", "note", "provider", "mode",
+                                   "credentials") if k in b}
         if patch and not eng.patch_agent(aid, patch):
             self._send_json(404, {"ok": False, "error": "agent 不存在", "id": aid})
             return

@@ -87,6 +87,12 @@ class AcpEngine(Engine):
             b = agents.baseline()
             env = {}
             env.update(b.get("env") or {})
+            # ★凭据（多 Key）：按 agent 选中的凭据解析成环境变量（agent.env 仍然最后覆盖）
+            try:
+                from . import credentials as _credentials
+                env.update(_credentials.env_for(a))
+            except Exception:               # noqa: BLE001
+                pass
             env.update(a.get("env") or {})
             # ★安全兜底（第 ② 层）：就算调用方拿着旧注册表 dict，也不把「永不问」模式传给子进程
             env, _sec_fixes = agents.sanitize_agent_env(a.get("id"), env)
@@ -164,18 +170,22 @@ class AcpEngine(Engine):
         return ok
 
     def set_baseline_env(self, patch: dict) -> dict:
-        """写共享基线的环境变量（模型 API Key）。
-
-        ⚠ 环境变了，**所有** ACP 子进程都得重起（它们启动时把 env 传给子进程），
-          所以这里清掉配置缓存 + 关掉所有 AcpService；下次用的时候按需重拉。
-        """
+        """写共享基线的环境变量（**非密钥**用它；密钥走 credentials.py）。"""
         b = agents.update_baseline_env(patch)
+        self.reload_config()
+        return b
+
+    def reload_config(self) -> None:
+        """配置（含凭据）变了：让 config 缓存失效 + 收起所有 agent 子进程。
+
+        子进程启动时把 env 传给 agent，所以换 Key / 换凭据之后必须重起；
+        下次建会话 / 发消息会按需重拉。
+        """
         self._config = None
         with self._services_lock:
             ids = list(self._services.keys())
         for aid in ids:
             self.shutdown_agent(str(aid))
-        return b
 
     def baseline_view(self) -> dict:
         """给界面看的基线视图：**只给掩码**，绝不出明文。"""

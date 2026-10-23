@@ -97,7 +97,7 @@ CHECKS = [
     ("音乐", "★刷新不强行打开播放条（恢复曲目 ≠ 显示条形）", r"keepShown"),
     ("音乐", "★播放条显示状态用新键（旧键曾被 bug 污染）", r"cocraft\.player\.shown2"),
     ("音乐", "★自动续播不顶开播放条", r"keepShown: !!auto"),
-    ("安装包", "★Key 变量名按当前 agent 决定（不被别的 Key 顶掉）", r"varEl\.textContent = guessKeyName\(\)"),
+    ("安装包", "★Key 变量名按当前 agent 决定（不被别的 Key 顶掉）", r"const env = guessKeyName\(\)"),
     ("安装包", "★扫描本机 agent 弹窗", r'action: "scan"'),
     ("安装包", "★面板窗口可切原生/浏览器", r'api\("/panel/window"'),
     ("安装包", "可用的一键加入", r"addAllCandidates"),
@@ -555,6 +555,13 @@ CHECKS = [
     ("API Key", "★设置里能填/清模型 Key", r"async function saveApiKey"),
     ("API Key", "按 provider 猜变量名", r"KEY_NAME_BY_PROVIDER"),
     ("API Key", "打开设置就拉（只拿掩码）", r'loadApiKeyRow\("cfg"\)'),
+    # ---- ★模型凭据（多 Key，0.2.22）----
+    ("API Key", "★凭据列表加载 /engine/acp/credentials", r'api\("/engine/acp/credentials"\)'),
+    ("API Key", "★凭据渲染（同一 env 多条 + 默认标记）", r"function renderCredList"),
+    ("API Key", "★添加凭据带 action=add", r'action: "add"'),
+    ("API Key", "★行内「设默认 / 改 / 删」委托", r"data-cred-def"),
+    ("API Key", "★编辑时留空 Key = 不修改（不误清）", r'if \(secret\) body\.secret = secret'),
+    ("API Key", "★Agent 保存时带上 credentials 覆盖", r"body\.credentials = creds"),
     # ---- 智能体 / 模式切换 ----
     ("模式", "★模式清单接口 /api/agent", r'api\("/api/agent"\)'),
     ("模式", "★切换模式：POST /api/session/{id}/agent", r"/agent`,\s*\{\s*method:\s*\"POST\""),
@@ -945,13 +952,15 @@ HTML_CHECKS = [
     ("设置", "首次设置引擎下拉", r'id="setup-engine"'),
     ("中性化", "agent 编辑弹窗", r'id="agent-edit"'),
     ("中性化", "编辑弹窗里的 provider 输入", r'id="ae-provider"'),
-    ("API Key", "设置里的 Key 输入框", r'id="cfg-key-value"'),
+    ("API Key", "设置里的「模型凭据」列表（多 Key）", r'id="cred-list"'),
+    ("API Key", "添加凭据按钮", r'id="cred-add"'),
+    ("API Key", "凭据编辑弹窗", r'id="cred"'),
     ("模式", "★顶栏模式按钮", r'id="btn-agent"'),
     ("模式", "模式弹窗", r'id="mode-list"'),
     ("模式", "弹窗标题（智能体/模式）", r'id="mode-title"'),
     ("API Key", "向导里的 Key 行", r'id="setup-key-row"'),
-    ("API Key", "★变量名改成只读标签（不再两个输入框）", r'id="cfg-key-var"'),
     ("API Key", "向导里的变量名只读标签", r'id="setup-key-var"'),
+    ("API Key", "Agent 编辑里的「凭据」下拉（留空=跟随默认）", r'id="ae-cred"'),
     ("外观", "头像/素材选择行（data-img）", r'data-img="brand"'),
     ("外观", "空会话主图可换", r'data-img="hero"'),
     ("外观", "空会话贴纸可换", r'data-img="sticker2"'),
@@ -1130,6 +1139,10 @@ CSS_CHECKS = [
     ("主题", "★反斜杠修正字体面限定 unicode-range", r"unicode-range: U\+005C"),
     ("主题", "★serif/sans 前置 bslash 字体（余字符仍走日文字体）", r'"cocraft-bslash", "Yu Mincho"'),
     ("设置", "★宽行布局（防止 label 被挤成竖排）", r"\.cfg-row\.wide\s*\{"),
+    # ---- ★模型凭据（多 Key，0.2.22）----
+    ("API Key", "★凭据行（标签 / 变量名 / 掩码 / 默认 / 操作）", r"\.cred-row \{"),
+    ("API Key", "★默认标记（金色）", r"\.cred-tag\.def"),
+    ("API Key", "★凭据列表纵向排列（窄面板不横向溢出）", r"\.cred-ctl \{[^}]*flex-direction: column"),
     ("设置", "密码框也有样式（不是白框）", r'input\[type="password"\]'),
     ("模式", "★顶栏模式按钮放开 34px 宽度（踩坑 #24）", r"#topbar \.actions #btn-agent"),
     ("消息", "★代码块复制按钮样式", r"\.code-wrap \.copy-code"),
@@ -1646,6 +1659,16 @@ PY_CHECKS = [
     ("API Key", "改 Key 后重启 ACP 子进程", r"def set_baseline_env"),
     ("API Key", "基线视图（掩码 + 变量名）", r"def baseline_view"),
     ("API Key", "接口 /engine/acp/baseline", r'"/engine/acp/baseline"'),
+    # ---- ★模型凭据（多 Key，0.2.22）----
+    ("API Key", "★凭据文件 _credentials.json（不进安装包）", r'CRED_FILE'),
+    ("API Key", "★迁移：只搬像密钥的 env（BASE_URL 留下）", r"SECRET_ENV_RE"),
+    ("API Key", "★迁移前备份注册表", r"bak-before-credentials"),
+    ("API Key", "★解析：agent 覆盖 > 全局默认", r"def env_for"),
+    ("API Key", "★列表只回掩码", r"def list_public"),
+    ("API Key", "★路由 /engine/acp/credentials（GET/POST）", r'path == "/engine/acp/credentials"'),
+    ("API Key", "★换 Key 后失效 config 缓存 + 重起子进程", r"def reload_config"),
+    ("API Key", "★update_agent 接受 credentials 覆盖", r'"credentials"\):'),
+    ("API Key", "★engine.config 注入凭据 env", r"_credentials\.env_for\(a\)"),
     # ---- 自定义外观（头像 / 空会话素材）----
     ("外观", "★素材状态文件（只记本机路径）", r"APPEARANCE_FILE"),
     ("外观", "允许的图片扩展名白名单", r"IMAGE_EXTS"),
@@ -2032,7 +2055,7 @@ def main() -> int:
     py = []
     py_files = [os.path.join("backend", "engines", "acp", n)
                 for n in ("map_events.py", "service.py", "engine.py", "process.py",
-                          "client.py", "agents.py", "skills.py")]
+                          "client.py", "agents.py", "skills.py", "credentials.py")]
     py_files += [os.path.join("backend", "engines", "__init__.py"),
                  os.path.join("backend", "engines", "opencode.py"),
                  os.path.join("backend", "server.py"),
@@ -2113,6 +2136,7 @@ def main() -> int:
               "agent_safety_test.py", "context_estimate_test.py",
               "cross_engine_model_test.py", "perm_audit_test.py", "inbox_queue_test.py",
               "workflow_canvas_ui_test.py", "agent_install_test.py", "agent_update_ui_test.py",
+              "credentials_test.py", "credentials_ui_test.py",
               "acp_events_test.py", "acp_api_test.py", "acp_engine_ui_test.py",
               "watch_mode_test.py", "md_render_test.py", "selftest.py",
               "cocraft_agents_check.py", "cocraft_ws_check.py")

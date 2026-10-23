@@ -267,60 +267,189 @@ const KEY_NAME_BY_PROVIDER = {
 /** 当前 ACP agent 大概是哪家 → 猜一个环境变量名 */
 function guessKeyName() {
   const a = (ACP.list || []).find((x) => x.id === ACP.active) || {};
-  const prov = String(a.provider || a.providerGuess || "").toLowerCase();
+  return keyEnvForAgent(a);
+}
+
+/** 某个 agent 对应的 Key 环境变量名（同一套 provider 映射） */
+function keyEnvForAgent(a) {
+  const prov = String((a || {}).provider || (a || {}).providerGuess || "").toLowerCase();
   return KEY_NAME_BY_PROVIDER[prov] || "DEEPSEEK_API_KEY";
 }
 
-/** 拉基线里的 Key（只拿掩码）并回填到某一行：where = "cfg" | "setup"
- *  ⚠ 变量名**不让手填**（用户反馈"怎么有两个输入框"）：按当前 agent 的品牌自动决定，
- *    界面只显示一个只读小标签 + 一个密码框。 */
+/* ---------------- ★模型凭据（多 Key）：同一家可以有多个账号 ---------------- */
+
+const CRED = { items: [], defaults: {}, envNames: [], editId: "", itemsErr: "" };
+
+async function loadCredentials() {
+  try {
+    const r = await api("/engine/acp/credentials");
+    const d = (r && r.data) || {};
+    CRED.items = d.items || [];
+    CRED.defaults = d.defaults || {};
+    CRED.envNames = d.envNames || [];
+    CRED.itemsErr = "";
+  } catch (e) {
+    CRED.items = [];
+    CRED.itemsErr = (e && e.message) ? e.message : String(e);
+  }
+  renderCredList();
+}
+
+function renderCredList() {
+  const box = $("cred-list");
+  if (!box) return;
+  if (!(CRED.items || []).length) {
+    box.innerHTML = `<div class="cred-empty">${esc(CRED.itemsErr || "还没有凭据——点「＋ 添加凭据」")}</div>`;
+    return;
+  }
+  box.innerHTML = CRED.items.map((it) => {
+    const used = (it.usedBy || []).length ? "用于 " + it.usedBy.join("、") : "";
+    return `<div class="cred-row">`
+      + `<b title="${esc(it.label)}">${esc(it.label)}</b>`
+      + `<span class="cred-env">${esc(it.env)}</span>`
+      + `<span class="cred-mask" title="只显示掩码">${esc(it.masked)}</span>`
+      + (it.isDefault ? `<span class="cred-tag def">默认</span>` : "")
+      + `<span class="cred-used" title="${esc(used)}">${esc(used)}</span>`
+      + `<span class="cred-acts">`
+      + (it.isDefault ? "" : `<button type="button" data-cred-def="${esc(it.id)}">设默认</button>`)
+      + `<button type="button" data-cred-edit="${esc(it.id)}">改</button>`
+      + `<button type="button" data-cred-del="${esc(it.id)}">删</button>`
+      + `</span></div>`;
+  }).join("");
+}
+
+function applyCred(r) {
+  const d = (r && r.data) || {};
+  CRED.items = d.items || [];
+  CRED.defaults = d.defaults || {};
+  CRED.envNames = d.envNames || [];
+  CRED.itemsErr = "";
+  renderCredList();
+}
+
+async function openCredEdit(id) {
+  if (!(CRED.items || []).length && !CRED.itemsErr) {
+    try { await loadCredentials(); } catch { /* 后端老版本 */ }
+  }
+  const it = (CRED.items || []).find((x) => x.id === id) || {};
+  CRED.editId = id || "";
+  $("cred-title").textContent = id ? "编辑凭据" : "添加凭据";
+  $("cred-label").value = it.label || "";
+  const cur = (ACP.list || []).find((x) => x.id === ACP.active) || {};
+  $("cred-env").value = it.env || keyEnvForAgent(cur);
+  $("cred-provider").value = it.provider || "";
+  $("cred-secret").value = "";
+  $("cred-secret").placeholder = id ? "留空 = 不修改" : "sk-…";
+  $("cred-msg").textContent = "保存后会重启 ACP 子进程（下一条消息用新 Key）";
+  $("cred").hidden = false;
+  OVERLAY.push("cred", closeCredEdit);
+  try { $("cred-label").focus(); } catch { /* ignore */ }
+}
+
+function closeCredEdit() {
+  $("cred").hidden = true;
+  CRED.editId = "";
+  OVERLAY.pop("cred");
+}
+
+async function saveCred() {
+  const label = $("cred-label").value.trim();
+  const env = $("cred-env").value.trim();
+  const provider = $("cred-provider").value.trim();
+  const secret = $("cred-secret").value.trim();
+  const btn = $("cred-save");
+  if (btn) btn.disabled = true;
+  try {
+    if (CRED.editId) {
+      const body = { action: "update", id: CRED.editId, label, env, provider };
+      if (secret) body.secret = secret;          // 留空 = 不修改 Key
+      const r = await api("/engine/acp/credentials", { method: "POST", body: JSON.stringify(body) });
+      applyCred(r);
+      setBanner("已更新凭据：" + (label || env));
+    } else {
+      if (!secret) { $("cred-msg").textContent = "Key 不能为空"; return; }
+      const r = await api("/engine/acp/credentials", { method: "POST",
+        body: JSON.stringify({ action: "add", label, env, provider, secret }) });
+      applyCred(r);
+      setBanner("已添加凭据：" + (label || env));
+    }
+    closeCredEdit();
+  } catch (e) {
+    $("cred-msg").textContent = "保存失败：" + (e && e.message ? e.message : e);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function setCredDefault(id) {
+  try {
+    const r = await api("/engine/acp/credentials", { method: "POST",
+      body: JSON.stringify({ action: "default", id }) });
+    applyCred(r);
+    setBanner("已设为默认凭据");
+  } catch (e) {
+    setBanner("设默认失败：" + (e && e.message ? e.message : e), { sticky: true });
+  }
+}
+
+async function deleteCred(id) {
+  const it = (CRED.items || []).find((x) => x.id === id) || {};
+  if (!window.confirm(`删除凭据「${it.label || id}」？只删本机保存的 Key，不影响已保存的会话。`)) return;
+  try {
+    const r = await api("/engine/acp/credentials", { method: "POST",
+      body: JSON.stringify({ action: "delete", id }) });
+    applyCred(r);
+    setBanner("已删除凭据：" + (it.label || id));
+  } catch (e) {
+    setBanner("删除失败：" + (e && e.message ? e.message : e), { sticky: true });
+  }
+}
+
+/** 拉凭据并回填到某一行：where = "cfg"（列表）/ "setup"（向导里的快速添加） */
 async function loadApiKeyRow(where) {
   const p = where === "setup" ? "setup" : "cfg";
   const varEl = $(p + "-key-var"), noteEl = $(p + "-key-note");
   if (!varEl && !noteEl) return;
   try {
-    // 变量名要按**当前 agent 的品牌**决定：所以先把 agentlist 拉回来（设置弹窗里可能还没加载过）
     if (!(ACP.list || []).length) { try { await loadAcpAgents(); } catch { /* 老后端忽略 */ } }
-    const r = await api("/engine/acp/baseline");
-    const d = (r && r.data) || {};
-    const names = d.envNames || [];
-    const shown = names.map((n) => n + " = " + ((d.env || {})[n] || "")).join("　");
+    await loadCredentials();
+    const env = guessKeyName();
+    if (varEl) varEl.textContent = env;
+    if (p === "cfg") return;                    // 设置里是列表，不再有单输入框
+    const same = (CRED.items || []).filter((x) => x.env === env);
+    const def = same.find((x) => x.isDefault) || same[0];
     if (noteEl) {
-      noteEl.textContent = names.length
-        ? `已设置：${shown}（改完点保存；值留空 = 清除）`
-        : "写进共享基线的环境变量；只存本机 runtime/state，不进安装包";
+      noteEl.textContent = same.length
+        ? `这个变量已有 ${same.length} 个 Key（默认：${def ? def.label : "—"}）；向导里填会新增一条并设为默认，留空跳过`
+        : "还没有这个变量的 Key；可以留空，之后到设置 →「模型凭据」里添加";
     }
-    // ⚠ 始终显示**当前 agent 对应的变量名**，不要因为"已经有别的 Key"就显示那一个 ——
-    //   否则切到 codex 后标签还停在 ANTHROPIC_API_KEY，用户会把 DeepSeek Key 填到错的地方。
-    if (varEl) varEl.textContent = guessKeyName();
   } catch {
-    if (noteEl) noteEl.textContent = "拿不到基线（后端需支持 /engine/acp/baseline）";
+    if (noteEl) noteEl.textContent = "拿不到凭据列表（后端需支持 /engine/acp/credentials）";
     if (varEl && !varEl.textContent) varEl.textContent = "DEEPSEEK_API_KEY";
   }
 }
 
-/** 保存/清除 Key：name + value（value 为空 = 删除该变量）。
- *  name 取小标签里那个（按品牌自动决定，见 loadApiKeyRow）。 */
+/** 向导里的快速添加：新增一条凭据（并设为该 env 的默认）；留空 = 不动。 */
 async function saveApiKey(where) {
   const p = where === "setup" ? "setup" : "cfg";
   const name = String((($(p + "-key-var") || {}).textContent) || "").trim() || guessKeyName();
-  const value = String($(p + "-key-value").value || "").trim();
+  const value = String((($(p + "-key-value") || {}).value) || "").trim();
   const noteEl = $(p + "-key-note");
-  try {
-    const r = await api("/engine/acp/baseline", { method: "POST",
-      body: JSON.stringify({ name, value }) });
-    const d = (r && r.data) || {};
-    $(p + "-key-value").value = "";
-    const names = d.envNames || [];
-    const shown = names.map((n) => n + " = " + ((d.env || {})[n] || "")).join("　");
-    if (noteEl) {
-      noteEl.textContent = (value ? `已保存 ${name}。` : `已清除 ${name}。`)
-        + (names.length ? `当前：${shown}` : "当前没有设置任何 Key");
-    }
-    setBanner(value ? `已保存模型 Key：${name}（改完会重启 ACP 子进程）` : `已清除模型 Key：${name}`);
+  if (!value) {
+    if (noteEl) noteEl.textContent = "留空 = 不修改（要删除请到设置 →「模型凭据」）";
     return true;
-  } catch (err) {
-    if (noteEl) noteEl.textContent = "保存失败：" + (err && err.message ? err.message : err);
+  }
+  try {
+    const r = await api("/engine/acp/credentials", { method: "POST",
+      body: JSON.stringify({ action: "add", label: name.replace(/_/g, " ") + " · 向导",
+                             env: name, secret: value }) });
+    applyCred(r);
+    $(p + "-key-value").value = "";
+    if (noteEl) noteEl.textContent = `已保存 ${name}（可在设置 →「模型凭据」里管理）`;
+    setBanner("已保存模型 Key：" + name + "（改完会重启 ACP 子进程）");
+    return true;
+  } catch (e) {
+    if (noteEl) noteEl.textContent = "保存失败：" + (e && e.message ? e.message : e);
     return false;
   }
 }
@@ -1841,7 +1970,7 @@ async function pickAgent(id) {
 const AE = { id: "" };
 
 /** 打开编辑弹窗；`id` 不给就编辑「当前使用中」的那个 */
-function editAgentCommand(id) {
+async function editAgentCommand(id) {
   const aid = id || ACP.active;
   if (!aid) { setBanner("还没有选中的 agent"); return; }
   const a = ACP.list.find((x) => x.id === aid);
@@ -1853,8 +1982,25 @@ function editAgentCommand(id) {
   $("ae-cwd").value = a.cwd || "";
   $("ae-provider").value = a.provider || "";
   $("ae-note").value = a.note || "";
+  // ★凭据：这个 agent 用哪个 Key（只列当前 agent 那个 env 的；留空 = 跟随默认）
+  try {
+    if (!(CRED.items || []).length) await loadCredentials();
+    const env = keyEnvForAgent(a);
+    const same = (CRED.items || []).filter((x) => x.env === env);
+    const cur = (a.credentials || {})[env] || "";
+    const sel = $("ae-cred");
+    if (sel) {
+      sel.dataset.env = env;
+      sel.innerHTML = `<option value="">跟随默认（${esc(env)}）</option>`
+        + same.map((x) => `<option value="${esc(x.id)}"${x.id === cur ? " selected" : ""}>`
+          + `${esc(x.label)}${x.isDefault ? "（默认）" : ""} · ${esc(x.masked)}</option>`).join("");
+      if (!same.length) {
+        sel.innerHTML += `<option value="" disabled>（还没有 ${esc(env)} 的凭据）</option>`;
+      }
+    }
+  } catch { /* 凭据拉不到也不挡编辑 */ }
   $("ae-msg").textContent = a.provider || !(a.providerGuess)
-    ? "改命令 / provider 会重启这个 agent 的子进程"
+    ? "改命令 / provider / 凭据 会重启这个 agent 的子进程"
     : `推断出的 provider 是「${a.providerGuess}」（点「自动」填入）`;
   $("agent-edit").hidden = false;
   OVERLAY.push("agent-edit", closeAgentEdit);
@@ -1899,6 +2045,15 @@ async function saveAgentEdit() {
     const body = { id: AE.id, label: $("ae-label").value.trim(), command: cmd,
                    cwd: $("ae-cwd").value.trim(), provider: $("ae-provider").value.trim(),
                    note: $("ae-note").value.trim(), activate: false };
+    // ★凭据选择：只改这个 agent 对应 env 的那一项，别的 env 覆盖保留
+    const sel = $("ae-cred");
+    if (sel && sel.dataset && sel.dataset.env) {
+      const a = ACP.list.find((x) => x.id === AE.id) || {};
+      const creds = Object.assign({}, (a.credentials || {}));
+      if (sel.value) creds[sel.dataset.env] = sel.value;
+      else delete creds[sel.dataset.env];
+      body.credentials = creds;
+    }
     const r = await api("/engine/acp/agents", { method: "POST", body: JSON.stringify(body) });
     ACP.list = (r && r.agents) || ACP.list;
     ACP.active = (r && r.active) || ACP.active;
@@ -2178,8 +2333,21 @@ function initSettings() {
     const row = e.target.closest("[data-upath]");
     if (row) undoToggleFile(row);
   });
-  $("cfg-key-save").addEventListener("click", () => saveApiKey("cfg"));
   $("setup-key-save").addEventListener("click", () => saveApiKey("setup"));
+  // ★模型凭据（多 Key）：添加 / 编辑 / 删除 / 设默认
+  $("cred-add").addEventListener("click", () => openCredEdit(""));
+  $("cred-close").addEventListener("click", closeCredEdit);
+  $("cred-cancel").addEventListener("click", closeCredEdit);
+  $("cred-save").addEventListener("click", saveCred);
+  $("cred").addEventListener("click", (e) => { if (e.target === $("cred")) closeCredEdit(); });
+  $("cred-list").addEventListener("click", (e) => {
+    const d = e.target.closest && e.target.closest("[data-cred-def]");
+    if (d) { setCredDefault(d.dataset.credDef); return; }
+    const ed = e.target.closest && e.target.closest("[data-cred-edit]");
+    if (ed) { openCredEdit(ed.dataset.credEdit); return; }
+    const del = e.target.closest && e.target.closest("[data-cred-del]");
+    if (del) deleteCred(del.dataset.credDel);
+  });
   $("ae-close").addEventListener("click", closeAgentEdit);
   $("ae-cancel").addEventListener("click", closeAgentEdit);
   $("ae-save").addEventListener("click", saveAgentEdit);
