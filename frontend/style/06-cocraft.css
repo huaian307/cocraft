@@ -90,6 +90,8 @@
               right .22s ease, left .22s ease, background .22s ease, opacity .22s ease;
 }
 html[data-sidebar="closed"] .lyric-ball { display: flex; }
+/* 没开音乐（没有播放会话）时歌词球不出现 —— 别让一个用不上的球挂在边上 */
+html[data-sidebar="closed"]:not(.music-playing) .lyric-ball { display: none; }
 .lyric-ball .lb-ico { display: block; font-size: 18px; line-height: 1; }
 .lyric-ball .lb-ico img { display: block; width: 30px; height: 30px; border-radius: 50%; object-fit: cover; }
 .lyric-ball .lb-arrow { display: none; }

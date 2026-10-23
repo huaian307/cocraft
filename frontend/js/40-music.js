@@ -223,13 +223,28 @@ function lyricsWanted() {
 /** 收起侧栏 = 纯听歌模式：歌词浮层显示；没有歌词时给一行提示，别留一片空白 */
 function syncLyricsVisibility() {
   const collapsed = document.documentElement.dataset.sidebar === "closed";
-  const playing = !!(MUSIC.on || MUSIC.panel);
+  // 「有播放会话」不等于「正在放」：暂停 / 停止时球也应该收起来（面板内播放还要看 audio 状态）
+  const audio = $("mus-audio");
+  const panelPlaying = !!(MUSIC.panel && audio && !audio.paused && !audio.ended);
+  const smtcStatus = String((MUSIC.state || {}).status || "").toLowerCase();
+  const smtcPlaying = !!MUSIC.on && !/paused|stopped|none|closed/.test(smtcStatus);
+  const playing = panelPlaying || smtcPlaying;
   const want = lyricsWanted();
   const withLyrics = want && playing && MUSIC.lyrics.length > 0;
   const wasOn = document.documentElement.classList.contains("lyrics-on");
+  const wasPlaying = _lyricWasPlaying, wasCollapsed = _lyricWasCollapsed;
+  _lyricWasPlaying = playing;
+  _lyricWasCollapsed = collapsed;
+  // ← 没开音乐时歌词球也应该隐藏（不能只在 sidebar=closed 时无条件显示）
+  document.documentElement.classList.toggle("music-playing", playing);
   document.documentElement.classList.toggle("lyrics-on", withLyrics);
   // ⚠ 只有"用户没明确关闭"时才在收起侧栏时把浮层放出来（否则又变成关不掉）
   document.documentElement.classList.toggle("collapsed-focus", collapsed && want);
+  // 只在「刚开音乐 / 刚收起侧栏」时摆一次球；每秒 poll 不能重置 idle 计时
+  if (playing && collapsed && (!wasPlaying || !wasCollapsed)) {
+    applyLyricBall();
+    lbScheduleIdle(2800);
+  }
   // 刚由关变开时，播放条可能刚从 display:none 变可见 → 重新量一次宽度（滚动才准）
   if (withLyrics && !wasOn) highlightLyrics(true);
   const showHint = want && playing && !MUSIC.lyrics.length;
@@ -250,6 +265,7 @@ function syncLyricsVisibility() {
  * 位置与贴边（left/right + 竖直比例 y）存 localStorage，刷新后还在。 */
 const LB_KEY = "cocraft.lyricball";
 const LB = { edge: "right", y: 0.5, idle: true, timer: null };
+let _lyricWasPlaying = false, _lyricWasCollapsed = false;
 
 function loadLyricBall() {
   try {
@@ -310,9 +326,31 @@ function initLyricBall() {
   lbScheduleIdle(3000);
 
   let drag = null;   // {id, sx, sy, gx, gy, moved}
+  let dragWatch = 0;
+
+  const stopDragListeners = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+    if (dragWatch) { clearTimeout(dragWatch); dragWatch = 0; }
+  };
+
+  /** 拖动没收尾（松手在窗口外 / WebView2 丢了 pointerup）→ 强制回到 idle，
+   *  否则 `.dragging` 会一直留着，applyLyricBall 每次 return，球就再也收不起来。 */
+  const abandonDrag = () => {
+    if (!drag) return;
+    drag = null;
+    stopDragListeners();
+    b.classList.remove("dragging");
+    b.style.right = "auto";
+    LB.idle = true;
+    saveLyricBall();
+    applyLyricBall();
+  };
 
   const onMove = (e) => {
     if (!drag || e.pointerId !== drag.id) return;
+    if (dragWatch) { clearTimeout(dragWatch); dragWatch = setTimeout(abandonDrag, 3500); }
     if (!drag.moved) {
       if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) < 4) return;  // 没动够 = 仍算点击
       drag.moved = true;
@@ -333,14 +371,13 @@ function initLyricBall() {
   const onUp = (e) => {
     if (!drag || e.pointerId !== drag.id) return;
     const moved = drag.moved;
+    const cancelled = e.type === "pointercancel";
     drag = null;
-    window.removeEventListener("pointermove", onMove);
-    window.removeEventListener("pointerup", onUp);
-    window.removeEventListener("pointercancel", onUp);
+    stopDragListeners();
     b.classList.remove("dragging");
     // ⚠ 不要先把 left 清成 auto（那会瞬移）；让 applyLyricBall 从"当前拖动位置"平滑过渡到贴边位置
     b.style.right = "auto";
-    if (!moved) {                                      // 只是点了一下 = 开关歌词
+    if (!moved && !cancelled) {                        // 只是点了一下 = 开关歌词（取消不算点击）
       const on = lyricsWanted();
       MUSIC.lyrWanted = !on;
       saveLyricsPref();
@@ -361,12 +398,22 @@ function initLyricBall() {
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
+    clearTimeout(dragWatch);
+    dragWatch = setTimeout(abandonDrag, 3500);          // 3.5s 没有 pointermove/up = 视为松手丢了
   });
   b.addEventListener("pointerenter", () => {
     lbCancelIdle();
     if (LB.idle && !drag) { LB.idle = false; saveLyricBall(); applyLyricBall(); }
+    if (!drag) lbScheduleIdle(2800);                   // 悬停也不是永久圆球：停 2.8s 就收回
+  });
+  b.addEventListener("pointermove", () => {
+    if (!drag && !LB.idle) lbScheduleIdle(2800);        // 还在动 → 重新计时
   });
   b.addEventListener("pointerleave", () => { if (!drag) lbScheduleIdle(); });
+  window.addEventListener("blur", () => { if (drag) abandonDrag(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && drag) abandonDrag();
+  });
   window.addEventListener("resize", () => { if (!drag) applyLyricBall(); });
 }
 

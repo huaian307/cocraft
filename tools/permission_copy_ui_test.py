@@ -142,6 +142,9 @@ STUB = r"""<script>
     if (path === "/api/model") return J({ data: [] });
     if (path === "/engine/status") return J({ active: "acp", available: ["opencode", "acp"], engines: [] });
     if (path === "/api/skill") return J({ data: [] });
+    if (path === "/qq/state") {
+      return J({ music: { sessions: window.__musicSessions || 0 }, qqRunning: false, spectrum: false });
+    }
     for (var i = 0; i < DEAD.length; i++) {
       if (s.indexOf(DEAD[i]) >= 0) return Promise.resolve(new Response("{}", { status: 200 }));
     }
@@ -341,6 +344,62 @@ function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; 
          && getComputedStyle(bamboos[0]).display !== "none");
     if (petalBtn) petalBtn.click();
     await __s(120);
+
+    // 6) 歌词气泡球：没开音乐不显示；开了才出现；空闲会缩成小箭头
+    window.__musicSessions = 0;
+    document.documentElement.dataset.sidebar = "closed";
+    var lb = document.getElementById("lyric-ball");
+    await __s(1200);
+    step("★没开音乐时不显示歌词球", !!lb && getComputedStyle(lb).display === "none");
+    window.__musicSessions = 1;
+    await __s(1200);
+    step("★开音乐后才显示歌词球", !!lb && getComputedStyle(lb).display !== "none");
+    MUSIC.state = { status: "Paused" };
+    syncLyricsVisibility();
+    await __s(120);
+    step("★暂停时也隐藏歌词球", !!lb && getComputedStyle(lb).display === "none");
+    MUSIC.state = {};
+    syncLyricsVisibility();
+    await __s(120);
+    step("★恢复播放后歌词球回来", !!lb && getComputedStyle(lb).display !== "none");
+    await __s(3300);
+    step("★歌词球空闲后收起（idle）", !!lb && lb.classList.contains("idle"));
+    if (lb) {
+      var lr = lb.getBoundingClientRect();
+      var cxp = lr.left + lr.width / 2, cyp = lr.top + lr.height / 2;
+      try {
+        lb.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 9, button: 0, buttons: 1,
+          clientX: cxp, clientY: cyp, bubbles: true }));
+        await __s(60);
+        window.dispatchEvent(new PointerEvent("pointerup", { pointerId: 9, button: 0, buttons: 0,
+          clientX: cxp, clientY: cyp, bubbles: true }));
+        await __s(300);
+        step("★点歌词球能展开歌词（.on）", lb.classList.contains("on"));
+        await __s(3000);
+        step("★点过之后仍会收回成小箭头", lb.classList.contains("idle"));
+      } catch (e) {
+        step("★歌词球指针事件可用", false, String(e));
+      }
+      // 再点一次 → 关闭歌词
+      lb.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 9, button: 0, buttons: 1,
+        clientX: cxp, clientY: cyp, bubbles: true }));
+      await __s(60);
+      window.dispatchEvent(new PointerEvent("pointerup", { pointerId: 9, button: 0, buttons: 0,
+        clientX: cxp, clientY: cyp, bubbles: true }));
+      await __s(300);
+      step("★再点歌词球能关闭歌词（.on 移除）", !lb.classList.contains("on"));
+
+      // 模拟 WebView2 丢掉 pointerup：3.5s 后应强制退出 dragging 并收回
+      lb.dispatchEvent(new PointerEvent("pointerdown", { pointerId: 9, button: 0, buttons: 1,
+        clientX: cxp, clientY: cyp, bubbles: true }));
+      await __s(3900);
+      step("★松手事件丢失时也能恢复收起",
+           !lb.classList.contains("dragging") && lb.classList.contains("idle"));
+    }
+    window.__musicSessions = 0;
+    await __s(1200);
+    step("★音乐停了歌词球也隐藏", !!lb && getComputedStyle(lb).display === "none");
+    document.documentElement.dataset.sidebar = "open";
   } catch (err) {
     out.crash = String(err && err.stack ? err.stack : err);
   }
@@ -385,7 +444,7 @@ def render(edge: str) -> str:
              "--no-default-browser-check",
              "--user-data-dir=" + os.path.join(tmp, "edge-probepermcopy"),
              "--window-size=1400,920",
-             "--virtual-time-budget=30000", "--dump-dom", URL],
+             "--virtual-time-budget=45000", "--dump-dom", URL],
             stdout=fh_dom, stderr=fh_err)
         try:
             proc.wait(timeout=90)
