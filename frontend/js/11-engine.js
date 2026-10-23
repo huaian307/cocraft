@@ -25,7 +25,7 @@ const SET_DEFAULT = {
   dimHiru: 100, blur: 28, rate: 80,
   zoom: 100,                         // ★界面缩放（%）：整页等比放大/缩小（文字/间距/图标一起）
   live: true, taskbar: true, spectrumSides: true, spectrumSidesH: 100, spectrumSidesGain: 120,
-  petals: true, zh: true,
+  petals: true, gold: true, bamboo: true, zh: true,
   glass: true,                       // ★液态玻璃皮肤（面板半透明磨砂 + 壁纸透出）
   // ★可逆执行：每轮工作区快照（发消息前留底 → 「撤销这一轮」）。
   //   ⚠ **默认关**（用户 2026-10-16 反馈：把整个工作区镜像进内容仓太重）——
@@ -82,6 +82,8 @@ function applySettings() {
   root.style.zoom = String(_z);
   liveRate = Math.min(1.3, Math.max(0.5, SET.rate / 100));
   document.body.classList.toggle("no-petals", !SET.petals);
+  document.body.classList.toggle("no-gold", !SET.gold);
+  document.body.classList.toggle("no-bamboo", !SET.bamboo);
   root.classList.toggle("glass", !!SET.glass);               // ★液态玻璃皮肤：整页开关
   document.body.classList.toggle("no-lyrics-zh", !SET.zh);   // 歌词翻译：关掉就不显示小字译文
   document.documentElement.classList.toggle("spec-sides", !!SET.spectrumSides);
@@ -2142,7 +2144,8 @@ function renderSettings() {
   put("cfg-spec-h", SET.spectrumSidesH, SET.spectrumSidesH + "%");
   put("cfg-spec-gain", SET.spectrumSidesGain, SET.spectrumSidesGain + "%");
   [["cfg-live", SET.live], ["cfg-taskbar", SET.taskbar], ["cfg-spec-sides", SET.spectrumSides],
-   ["cfg-petals", SET.petals], ["cfg-zh", SET.zh], ["cfg-glass", SET.glass],
+   ["cfg-petals", SET.petals], ["cfg-gold", SET.gold], ["cfg-bamboo", SET.bamboo],
+   ["cfg-zh", SET.zh], ["cfg-glass", SET.glass],
    ["cfg-turnsnap", SET.turnSnap]].forEach(([id, on]) => {
     const b = $(id);
     if (!b) return;
@@ -2437,6 +2440,8 @@ function initSettings() {
   $("cfg-spec-h").addEventListener("input", (e) => setSetting("spectrumSidesH", Number(e.target.value)));
   $("cfg-spec-gain").addEventListener("input", (e) => setSetting("spectrumSidesGain", Number(e.target.value)));
   $("cfg-petals").addEventListener("click", () => setSetting("petals", !SET.petals));
+  $("cfg-gold").addEventListener("click", () => setSetting("gold", !SET.gold));
+  $("cfg-bamboo").addEventListener("click", () => setSetting("bamboo", !SET.bamboo));
   $("cfg-glass").addEventListener("click", () => setSetting("glass", !SET.glass));
   $("cfg-turnsnap").addEventListener("click", () => {
     setSetting("turnSnap", !SET.turnSnap);
@@ -2463,6 +2468,17 @@ function initSettings() {
     applySettings();
     renderSettings();
   });
+
+  // 粒子效果清单：可收起；记住上次是开还是收（默认展开）
+  const plist = $("cfg-particle-list");
+  if (plist) {
+    try {
+      if (localStorage.getItem("cocraft.particles.open") === "0") plist.open = false;
+    } catch { /* 隐私模式 */ }
+    plist.addEventListener("toggle", () => {
+      try { localStorage.setItem("cocraft.particles.open", plist.open ? "1" : "0"); } catch { /* ignore */ }
+    });
+  }
 }
 
 async function initLiveBg() {

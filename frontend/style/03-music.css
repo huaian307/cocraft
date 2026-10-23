@@ -22,6 +22,40 @@
   100% { transform: translate3d(var(--drift, 40px), calc(106vh / var(--ui-z)), 0) rotate(420deg); opacity: 0; }
 }
 
+/* 金色光点：烛火边漂浮的金尘 —— 上浮 + 明暗呼吸，不落水 */
+#petals .gold {
+  position: absolute; left: 0; top: 0;
+  border-radius: 50%; opacity: 0; pointer-events: none;
+  background: radial-gradient(circle, #fffbe3 0%, #ffe08a 30%, rgba(255,184,56,0) 72%);
+  box-shadow: 0 0 8px rgba(255,214,110,.72), 0 0 20px rgba(255,170,40,.32);
+  animation: goldFloat var(--gdur, 12s) ease-in-out var(--gdelay, 0s) infinite;
+  will-change: transform, opacity;
+}
+@keyframes goldFloat {
+  0%   { transform: translate3d(0, 0, 0) scale(.55); opacity: 0; }
+  14%  { opacity: .9; }
+  55%  { transform: translate3d(var(--gdx, 20px), var(--gdy, -40px), 0) scale(1); opacity: .8; }
+  82%  { opacity: .45; }
+  100% { transform: translate3d(calc(var(--gdx, 20px) * -.55), calc(var(--gdy, -40px) * 1.9), 0) scale(.4); opacity: 0; }
+}
+
+/* 绿色竹叶：从上方飘落、翻转（不溅水花） */
+#petals .bamboo {
+  position: absolute; left: 0; top: 0;
+  border-radius: 100% 0 100% 0; opacity: 0; pointer-events: none;
+  background: linear-gradient(135deg, #f2ffd9 0%, #b9e77a 30%, #75b84a 62%, #3d7f33 100%);
+  box-shadow: 0 1px 2px rgba(20, 50, 20, .22), 0 0 5px rgba(120, 190, 70, .18);
+  animation: bambooFall var(--bdur, 17s) linear var(--bdelay, 0s) infinite;
+  will-change: transform, opacity;
+}
+@keyframes bambooFall {
+  0%   { transform: translate3d(0, calc(-8vh / var(--ui-z)), 0) rotate(0deg) rotateY(0deg); opacity: 0; }
+  8%   { opacity: .9; }
+  42%  { transform: translate3d(var(--bdrift, 60px), calc(44vh / var(--ui-z)), 0) rotate(180deg) rotateY(160deg); }
+  78%  { opacity: .75; }
+  100% { transform: translate3d(calc(var(--bdrift, 60px) * 1.7), calc(108vh / var(--ui-z)), 0) rotate(520deg) rotateY(380deg); opacity: 0; }
+}
+
 /* 涟漪用色：樱粉掺一点绯红，浅色背景下也看得清 */
 #petals { --ripple: color-mix(in srgb, var(--sakura) 45%, var(--hi)); }
 
@@ -63,7 +97,10 @@
   pointer-events: none;
 }
 
-body.no-petals #petals { display: none; }
+body.no-petals #petals .petal-unit,
+body.no-petals #petals::after { display: none; }
+body.no-gold #petals .gold { display: none; }
+body.no-bamboo #petals .bamboo { display: none; }
 
 @media (prefers-reduced-motion: reduce) {
   #petals { display: none; }

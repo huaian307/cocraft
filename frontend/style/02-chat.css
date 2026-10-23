@@ -330,6 +330,36 @@ html.cfg-resizing #app { transition: none; }
   padding: 9px 2px; border-bottom: 1px solid var(--line-soft);
 }
 .cfg-row:last-child { border-bottom: 0; }
+/* ★单独的「粒子效果」清单：三种粒子各自一行开关，和普通设置分开 */
+.cfg-list {
+  margin: 10px 0 12px; padding: 2px 10px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--paper-2) 45%, transparent);
+}
+.cfg-list-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 9px 2px 7px; border-bottom: 1px solid var(--line-soft);
+}
+.cfg-list-head b {
+  font-family: var(--serif); font-size: 13px;
+  letter-spacing: .1em; color: var(--ink);
+}
+.cfg-list-head .muted { font-size: 10.5px; }
+/* 清单标题 = <summary>：点一下收起 / 展开；箭头跟着转 */
+.cfg-list > summary.cfg-list-head {
+  cursor: pointer; list-style: none; user-select: none;
+}
+.cfg-list > summary.cfg-list-head::-webkit-details-marker { display: none; }
+.cfg-list > summary.cfg-list-head::after {
+  content: "▾"; margin-left: auto; flex: none;
+  font-size: 11px; color: var(--ink-faint);
+  transition: transform .18s ease;
+}
+.cfg-list:not([open]) > summary.cfg-list-head { border-bottom: 0; }
+.cfg-list:not([open]) > summary.cfg-list-head::after { transform: rotate(-90deg); }
+.cfg-list .cfg-row { padding: 8px 2px; }
+.cfg-list .cfg-row:last-child { border-bottom: 0; }
+.cfg-list .cfg-row::before { display: none; }   /* 清单里不用罗马数字，避免挤 */
 .cfg-row[hidden] { display: none; }                  /* [hidden] 要压过 .cfg-row 的 flex */
 .cfg-row.sub {
   padding-left: 16px;

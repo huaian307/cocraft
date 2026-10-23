@@ -285,6 +285,62 @@ function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; 
     if (okBtn) okBtn.click();
     await __s(200);
     step("★「知道了」能关掉兜底框", !!fb && fb.hidden);
+
+    // 5) 三种粒子：金点 / 竹叶可分别开关（落樱关掉也不影响它们）
+    var golds = document.querySelectorAll("#petals .gold");
+    var bamboos = document.querySelectorAll("#petals .bamboo");
+    var petals = document.querySelectorAll("#petals .petal-unit");
+    step("★粒子已生成（金点 / 竹叶 / 落樱）",
+         golds.length >= 30 && bamboos.length >= 14 && petals.length === 16,
+         "gold=" + golds.length + " bamboo=" + bamboos.length + " petal=" + petals.length);
+    step("★设置里有「金色光点 / 绿色竹叶」开关",
+         !!document.getElementById("cfg-gold") && !!document.getElementById("cfg-bamboo"));
+    var plist = document.getElementById("cfg-particle-list");
+    step("★粒子效果是单独清单（三种都在里面）",
+         !!plist
+         && !!plist.querySelector("#cfg-petals")
+         && !!plist.querySelector("#cfg-gold")
+         && !!plist.querySelector("#cfg-bamboo"));
+    var psum = plist && plist.querySelector("summary");
+    step("★清单可收起（details / summary）",
+         !!plist && plist.tagName === "DETAILS" && !!psum);
+    if (psum) psum.click();
+    await __s(160);
+    step("★点标题收起清单", !!plist && plist.open === false);
+    if (psum) psum.click();
+    await __s(160);
+    step("★再点标题展开清单", !!plist && plist.open === true);
+
+    var goldBtn = document.getElementById("cfg-gold");
+    var bambooBtn = document.getElementById("cfg-bamboo");
+    var petalBtn = document.getElementById("cfg-petals");
+    if (goldBtn) goldBtn.click();
+    await __s(120);
+    step("★关掉金色光点：body.no-gold + 光点隐藏",
+         document.body.classList.contains("no-gold") && getComputedStyle(golds[0]).display === "none");
+    if (goldBtn) goldBtn.click();
+    await __s(120);
+    step("★再点开金色光点：恢复显示",
+         !document.body.classList.contains("no-gold") && getComputedStyle(golds[0]).display !== "none");
+
+    if (bambooBtn) bambooBtn.click();
+    await __s(120);
+    step("★关掉绿色竹叶：body.no-bamboo + 竹叶隐藏",
+         document.body.classList.contains("no-bamboo") && getComputedStyle(bamboos[0]).display === "none");
+    if (bambooBtn) bambooBtn.click();
+    await __s(120);
+    step("★再点开绿色竹叶：恢复显示",
+         !document.body.classList.contains("no-bamboo") && getComputedStyle(bamboos[0]).display !== "none");
+
+    if (petalBtn) petalBtn.click();
+    await __s(120);
+    step("★关掉落樱：只停花瓣，金点 / 竹叶仍显示",
+         document.body.classList.contains("no-petals")
+         && getComputedStyle(petals[0]).display === "none"
+         && getComputedStyle(golds[0]).display !== "none"
+         && getComputedStyle(bamboos[0]).display !== "none");
+    if (petalBtn) petalBtn.click();
+    await __s(120);
   } catch (err) {
     out.crash = String(err && err.stack ? err.stack : err);
   }

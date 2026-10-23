@@ -498,6 +498,25 @@ function initHubMenu() {
 
 function initPetals() {
   const box = $("petals");
+  const rnd = (a, b) => a + Math.random() * (b - a);
+
+  /* 金色光点：像烛火边漂浮的金尘 —— 缓慢上浮 + 明暗呼吸（不落水）。 */
+  for (let i = 0; i < 30; i++) {
+    const dot = document.createElement("span");
+    dot.className = "gold";
+    const sz = rnd(2.8, 7.5);
+    const dur = rnd(8, 18);
+    dot.style.width = sz.toFixed(1) + "px";
+    dot.style.height = sz.toFixed(1) + "px";
+    dot.style.left = `calc(${rnd(0, 100).toFixed(1)}vw / var(--ui-z))`;
+    dot.style.top = `calc(${rnd(4, 96).toFixed(1)}vh / var(--ui-z))`;
+    dot.style.setProperty("--gdur", dur.toFixed(1) + "s");
+    dot.style.setProperty("--gdelay", (-Math.random() * dur).toFixed(1) + "s");
+    dot.style.setProperty("--gdx", rnd(-46, 46).toFixed(0) + "px");
+    dot.style.setProperty("--gdy", rnd(-70, -18).toFixed(0) + "px");
+    box.appendChild(dot);
+  }
+
   for (let i = 0; i < 16; i++) {
     const unit = document.createElement("span");
     unit.className = "petal-unit";
@@ -535,7 +554,22 @@ function initPetals() {
     }
     box.appendChild(unit);
   }
-  // 落樱 / 壁纸 已并入设置弹窗（顶栏不再单独放按钮）
+
+  /* 绿色竹叶：从上方飘落、翻转；不溅水花（和樱花分开，像从另一侧吹来的叶子）。 */
+  for (let i = 0; i < 14; i++) {
+    const leaf = document.createElement("span");
+    leaf.className = "bamboo";
+    const w = rnd(10, 18);
+    const dur = rnd(13, 24);
+    leaf.style.width = w.toFixed(1) + "px";
+    leaf.style.height = (w * rnd(0.32, 0.46)).toFixed(1) + "px";
+    leaf.style.left = `calc(${rnd(1, 99).toFixed(1)}vw / var(--ui-z))`;
+    leaf.style.setProperty("--bdur", dur.toFixed(1) + "s");
+    leaf.style.setProperty("--bdelay", (-Math.random() * dur).toFixed(1) + "s");
+    leaf.style.setProperty("--bdrift", rnd(-110, 110).toFixed(0) + "px");
+    box.appendChild(leaf);
+  }
+  // 落樱 / 竹叶 / 金光 / 壁纸 已并入设置弹窗（顶栏不再单独放按钮）
 }
 
 /* ---------------- 侧栏收起 / 展开 ----------------

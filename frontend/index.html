@@ -5,14 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft · 絵梨衣</title>
 <link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style/01-base.css?v=0.2.29">
-<link rel="stylesheet" href="/style/02-chat.css?v=0.2.29">
-<link rel="stylesheet" href="/style/03-music.css?v=0.2.29">
-<link rel="stylesheet" href="/style/04-collab.css?v=0.2.29">
-<link rel="stylesheet" href="/style/05-settings.css?v=0.2.29">
-<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.29">
-<link rel="stylesheet" href="/style/07-code.css?v=0.2.29">
-<link rel="stylesheet" href="/style/08-visual.css?v=0.2.29">
+<link rel="stylesheet" href="/style/01-base.css?v=0.2.30">
+<link rel="stylesheet" href="/style/02-chat.css?v=0.2.30">
+<link rel="stylesheet" href="/style/03-music.css?v=0.2.30">
+<link rel="stylesheet" href="/style/04-collab.css?v=0.2.30">
+<link rel="stylesheet" href="/style/05-settings.css?v=0.2.30">
+<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.30">
+<link rel="stylesheet" href="/style/07-code.css?v=0.2.30">
+<link rel="stylesheet" href="/style/08-visual.css?v=0.2.30">
 </head>
 <body>
 <!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
@@ -739,10 +739,24 @@
         <input type="range" id="cfg-spec-gain" min="20" max="300" step="10">
         <output id="cfg-spec-gain-out"></output>
       </div>
-      <div class="cfg-row">
-        <label>落樱</label>
-        <button id="cfg-petals" class="cfg-toggle">开</button>
-      </div>
+      <details class="cfg-list" id="cfg-particle-list" open>
+        <summary class="cfg-list-head">
+          <b>粒子效果</b>
+          <span class="muted">三种可以分别开关；关掉落樱只停花瓣</span>
+        </summary>
+        <div class="cfg-row">
+          <label>落樱<i>粉色花瓣 + 落水涟漪；关掉只停樱花</i></label>
+          <button id="cfg-petals" class="cfg-toggle">开</button>
+        </div>
+        <div class="cfg-row">
+          <label>金色光点<i>烛火边漂浮的金尘，缓慢上浮 + 明暗呼吸</i></label>
+          <button id="cfg-gold" class="cfg-toggle">开</button>
+        </div>
+        <div class="cfg-row">
+          <label>绿色竹叶<i>从上方飘落、翻转的竹叶；不溅水花</i></label>
+          <button id="cfg-bamboo" class="cfg-toggle">开</button>
+        </div>
+      </details>
       <div class="cfg-row">
         <label>歌词翻译<i>外文歌词自动附一行中文小字（有道），缓存 7 天</i></label>
         <button id="cfg-zh" class="cfg-toggle">开</button>
@@ -1266,17 +1280,17 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/js/00-util.js?v=0.2.29"></script>
-<script src="/js/01-chat.js?v=0.2.29"></script>
-<script src="/js/02-shell.js?v=0.2.29"></script>
-<script src="/js/21-cocraft.js?v=0.2.29"></script>
-<script src="/js/40-music.js?v=0.2.29"></script>
-<script src="/js/12-asks.js?v=0.2.29"></script>
-<script src="/js/11-engine.js?v=0.2.29"></script>
-<script src="/js/41-visual.js?v=0.2.29"></script>
-<script src="/js/30-code.js?v=0.2.29"></script>
-<script src="/js/20-collab.js?v=0.2.29"></script>
-<script src="/app.js?v=0.2.29"></script>
+<script src="/js/00-util.js?v=0.2.30"></script>
+<script src="/js/01-chat.js?v=0.2.30"></script>
+<script src="/js/02-shell.js?v=0.2.30"></script>
+<script src="/js/21-cocraft.js?v=0.2.30"></script>
+<script src="/js/40-music.js?v=0.2.30"></script>
+<script src="/js/12-asks.js?v=0.2.30"></script>
+<script src="/js/11-engine.js?v=0.2.30"></script>
+<script src="/js/41-visual.js?v=0.2.30"></script>
+<script src="/js/30-code.js?v=0.2.30"></script>
+<script src="/js/20-collab.js?v=0.2.30"></script>
+<script src="/app.js?v=0.2.30"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */
