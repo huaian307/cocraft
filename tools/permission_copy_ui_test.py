@@ -104,6 +104,15 @@ STUB = r"""<script>
         { type: "text", text: "再下载模型……" },
         { type: "tool", name: "shell", state: { status: "completed", input: { command: "curl" } } },
         { type: "text", text: "最终：图已经生成好了。" }
+      ] },
+    // 非 Codex（如 dsh）也可能有多段（文字/工具/文字）：界面只显示最终段，复制也只取最终段
+    { id: "a5", type: "assistant", agent: "dsh",
+      model: { id: "mock-fast", providerID: "mock" },
+      time: { created: NOW - 9000, completed: NOW - 8000 },
+      content: [
+        { type: "text", text: "dsh 的过程话" },
+        { type: "tool", name: "shell", state: { status: "completed", input: { command: "dir" } } },
+        { type: "text", text: "dsh 的最终回答" }
       ] }
   ];
   window.fetch = function (u, o) {
@@ -179,6 +188,16 @@ function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; 
     var ctext = (window.__copied || [])[window.__copied.length - 1] || "";
     step("★复制 Codex 回答只取最终一段", /最终：图已经生成好了/.test(ctext) && !/我先看看环境/.test(ctext),
          ctext.slice(0, 120));
+
+    // 非 Codex 的多段：界面隐藏过程，复制也只取最终
+    step("★非 Codex 多段：只显示最终回答", /dsh 的最终回答/.test(boxText) && !/dsh 的过程话/.test(boxText),
+         boxText.slice(-120));
+    var dbtn = document.querySelector('#messages [data-copy="a5"]');
+    if (dbtn) dbtn.click();
+    await __s(300);
+    var dtext = (window.__copied || [])[window.__copied.length - 1] || "";
+    step("★非 Codex 多段：复制只取最终段", /dsh 的最终回答/.test(dtext) && !/dsh 的过程话/.test(dtext),
+         dtext.slice(0, 120));
 
     // 1) 自动放行：请求体必须是合法 JSON
     await pollAsks();

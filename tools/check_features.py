@@ -120,6 +120,8 @@ CHECKS = [
     ("消息", "★Codex 的碎碎念收进「过程」折叠块（允许它碎碎念）", r'class="chatter"'),
     ("消息", "★只有 Codex 特殊处理，其它 agent 仍按旁白规则", r"const isCodex = /codex/i"),
     ("消息", "★复制正文从权威数据取（实时缓冲优先，不靠 DOM）", r"function copyMessageById"),
+    ("消息", "★多段正文复制只取最后一段（所有 agent，不只 codex）",
+     r"if \(parts\.length > 1\) s = parts\[parts\.length - 1\]"),
     ("消息", "★复制后按钮给瞬时反馈", r"function flashCopied"),
     # ---- 消息渲染（重写过的高危区）----
     ("消息", "★按时间升序重排", r"\.sort\(\(a,\s*b\)\s*=>"),

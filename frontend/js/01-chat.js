@@ -774,8 +774,8 @@ function messageCopyText(m) {
     if (typeof m.text === "string") s = m.text;
     else if (typeof m.content === "string") s = m.content;
   }
-  // Codex 的「过程」不是最终回答：复制只取最后一段（与界面一致）
-  if (/codex/i.test(String(m.agent || "")) && parts.length > 1) s = parts[parts.length - 1];
+  // 多段正文 = 按工具切出来的「过程 + 最终」：复制只取最后一段（与界面显示一致）
+  if (parts.length > 1) s = parts[parts.length - 1];
   return stripModelWarning(s).trim();
 }
 
