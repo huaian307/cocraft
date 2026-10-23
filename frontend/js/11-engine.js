@@ -278,7 +278,25 @@ function keyEnvForAgent(a) {
 
 /* ---------------- ★模型凭据（多 Key）：同一家可以有多个账号 ---------------- */
 
-const CRED = { items: [], defaults: {}, envNames: [], editId: "", itemsErr: "" };
+const CRED = { items: [], defaults: {}, envNames: [], editId: "", itemsErr: "", open: {} };
+
+const PROVIDER_LABELS = {
+  deepseek: "DeepSeek", openai: "OpenAI", anthropic: "Anthropic", google: "Google",
+  xai: "xAI", moonshotai: "Moonshot", zhipuai: "智谱", alibaba: "通义",
+  mistral: "Mistral", groq: "Groq",
+};
+
+function credGroupKey(it) {
+  return String((it && (it.provider || it.env)) || "其他");
+}
+
+function credGroupLabel(key, items) {
+  const k = String(key || "");
+  if (PROVIDER_LABELS[k.toLowerCase()]) return PROVIDER_LABELS[k.toLowerCase()];
+  const env = String((items && items[0] && items[0].env) || k);
+  const hit = Object.keys(KEY_NAME_BY_PROVIDER).find((p) => KEY_NAME_BY_PROVIDER[p] === env);
+  return (hit && PROVIDER_LABELS[hit]) || env.replace(/_API_?KEY$|_KEY$|_TOKEN$/, "") || k;
+}
 
 async function loadCredentials() {
   try {
@@ -295,6 +313,22 @@ async function loadCredentials() {
   renderCredList();
 }
 
+function credAccountHtml(it) {
+  const used = (it.usedBy || []).length ? "用于 " + it.usedBy.join("、") : "";
+  return `<div class="cred-row">`
+    + `<b title="${esc(it.label)}">${esc(it.label)}</b>`
+    + `<span class="cred-env" title="${esc(it.env)}">${esc(it.env)}</span>`
+    + `<span class="cred-mask" title="只显示掩码">${esc(it.masked)}</span>`
+    + (it.isDefault ? `<span class="cred-tag def">默认</span>` : "")
+    + `<span class="cred-used" title="${esc(used)}">${esc(used)}</span>`
+    + `<span class="cred-acts">`
+    + (it.isDefault ? "" : `<button type="button" data-cred-def="${esc(it.id)}">设默认</button>`)
+    + `<button type="button" data-cred-edit="${esc(it.id)}">改</button>`
+    + `<button type="button" data-cred-del="${esc(it.id)}">删</button>`
+    + `</span></div>`;
+}
+
+/** 两层清单：厂商（默认收起，显示「N 个账号」）→ 点开看各家账号的掩码。 */
 function renderCredList() {
   const box = $("cred-list");
   if (!box) return;
@@ -302,28 +336,38 @@ function renderCredList() {
     box.innerHTML = `<div class="cred-empty">${esc(CRED.itemsErr || "还没有凭据——点「＋ 添加凭据」")}</div>`;
     return;
   }
-  box.innerHTML = CRED.items.map((it) => {
-    const used = (it.usedBy || []).length ? "用于 " + it.usedBy.join("、") : "";
-    return `<div class="cred-row">`
-      + `<b title="${esc(it.label)}">${esc(it.label)}</b>`
-      + `<span class="cred-env">${esc(it.env)}</span>`
-      + `<span class="cred-mask" title="只显示掩码">${esc(it.masked)}</span>`
-      + (it.isDefault ? `<span class="cred-tag def">默认</span>` : "")
-      + `<span class="cred-used" title="${esc(used)}">${esc(used)}</span>`
-      + `<span class="cred-acts">`
-      + (it.isDefault ? "" : `<button type="button" data-cred-def="${esc(it.id)}">设默认</button>`)
-      + `<button type="button" data-cred-edit="${esc(it.id)}">改</button>`
-      + `<button type="button" data-cred-del="${esc(it.id)}">删</button>`
-      + `</span></div>`;
+  const groups = {};
+  (CRED.items || []).forEach((it) => {
+    const k = credGroupKey(it);
+    (groups[k] = groups[k] || []).push(it);
+  });
+  const keys = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+  if (keys.length === 1) CRED.open[keys[0]] = true;      // 只有一个厂商 → 直接展开（别让用户以为没东西）
+  box.innerHTML = keys.map((k) => {
+    const arr = groups[k];
+    const open = !!CRED.open[k];
+    const def = arr.find((x) => x.isDefault);
+    return `<div class="cred-group">`
+      + `<button type="button" class="cred-prov" data-cred-prov="${esc(k)}" aria-expanded="${open ? "true" : "false"}">`
+      + `<span class="cred-caret">${open ? "▾" : "▸"}</span>`
+      + `<b>${esc(credGroupLabel(k, arr))}</b>`
+      + `<span class="cred-count">${arr.length} 个账号</span>`
+      + (def ? `<span class="cred-defname">默认：${esc(def.label)}</span>` : "")
+      + `</button>`
+      + (open ? `<div class="cred-accts">${arr.map(credAccountHtml).join("")}</div>` : "")
+      + `</div>`;
   }).join("");
 }
 
-function applyCred(r) {
+function applyCred(r, focus) {
   const d = (r && r.data) || {};
   CRED.items = d.items || [];
   CRED.defaults = d.defaults || {};
   CRED.envNames = d.envNames || [];
   CRED.itemsErr = "";
+  if (focus && (focus.env || focus.provider)) {
+    CRED.open[credGroupKey(focus)] = true;               // 刚动过的那家展开，看得见结果
+  }
   renderCredList();
 }
 
@@ -364,13 +408,13 @@ async function saveCred() {
       const body = { action: "update", id: CRED.editId, label, env, provider };
       if (secret) body.secret = secret;          // 留空 = 不修改 Key
       const r = await api("/engine/acp/credentials", { method: "POST", body: JSON.stringify(body) });
-      applyCred(r);
+      applyCred(r, { env, provider });
       setBanner("已更新凭据：" + (label || env));
     } else {
       if (!secret) { $("cred-msg").textContent = "Key 不能为空"; return; }
       const r = await api("/engine/acp/credentials", { method: "POST",
         body: JSON.stringify({ action: "add", label, env, provider, secret }) });
-      applyCred(r);
+      applyCred(r, { env, provider });
       setBanner("已添加凭据：" + (label || env));
     }
     closeCredEdit();
@@ -382,10 +426,11 @@ async function saveCred() {
 }
 
 async function setCredDefault(id) {
+  const it = (CRED.items || []).find((x) => x.id === id) || {};
   try {
     const r = await api("/engine/acp/credentials", { method: "POST",
       body: JSON.stringify({ action: "default", id }) });
-    applyCred(r);
+    applyCred(r, { env: it.env, provider: it.provider });
     setBanner("已设为默认凭据");
   } catch (e) {
     setBanner("设默认失败：" + (e && e.message ? e.message : e), { sticky: true });
@@ -398,7 +443,7 @@ async function deleteCred(id) {
   try {
     const r = await api("/engine/acp/credentials", { method: "POST",
       body: JSON.stringify({ action: "delete", id }) });
-    applyCred(r);
+    applyCred(r, { env: it.env, provider: it.provider });
     setBanner("已删除凭据：" + (it.label || id));
   } catch (e) {
     setBanner("删除失败：" + (e && e.message ? e.message : e), { sticky: true });
@@ -2341,6 +2386,13 @@ function initSettings() {
   $("cred-save").addEventListener("click", saveCred);
   $("cred").addEventListener("click", (e) => { if (e.target === $("cred")) closeCredEdit(); });
   $("cred-list").addEventListener("click", (e) => {
+    const pv = e.target.closest && e.target.closest("[data-cred-prov]");
+    if (pv) {
+      const k = pv.dataset.credProv;
+      CRED.open[k] = !CRED.open[k];
+      renderCredList();
+      return;
+    }
     const d = e.target.closest && e.target.closest("[data-cred-def]");
     if (d) { setCredDefault(d.dataset.credDef); return; }
     const ed = e.target.closest && e.target.closest("[data-cred-edit]");

@@ -560,6 +560,8 @@ CHECKS = [
     ("API Key", "★凭据渲染（同一 env 多条 + 默认标记）", r"function renderCredList"),
     ("API Key", "★添加凭据带 action=add", r'action: "add"'),
     ("API Key", "★行内「设默认 / 改 / 删」委托", r"data-cred-def"),
+    ("API Key", "★两层清单：厂商行可点开（厂商 → 账号）", r"data-cred-prov"),
+    ("API Key", "★厂商行显示「N 个账号」", r"cred-count"),
     ("API Key", "★编辑时留空 Key = 不修改（不误清）", r'if \(secret\) body\.secret = secret'),
     ("API Key", "★Agent 保存时带上 credentials 覆盖", r"body\.credentials = creds"),
     # ---- 智能体 / 模式切换 ----
@@ -1143,6 +1145,8 @@ CSS_CHECKS = [
     ("API Key", "★凭据行（标签 / 变量名 / 掩码 / 默认 / 操作）", r"\.cred-row \{"),
     ("API Key", "★默认标记（金色）", r"\.cred-tag\.def"),
     ("API Key", "★凭据列表纵向排列（窄面板不横向溢出）", r"\.cred-ctl \{[^}]*flex-direction: column"),
+    ("API Key", "★厂商行（整行可点：箭头 / 名称 / 数量 / 默认）", r"\.cred-prov \{"),
+    ("API Key", "★账号区缩进（层级清楚）", r"\.cred-accts \{[^}]*padding"),
     ("设置", "密码框也有样式（不是白框）", r'input\[type="password"\]'),
     ("模式", "★顶栏模式按钮放开 34px 宽度（踩坑 #24）", r"#topbar \.actions #btn-agent"),
     ("消息", "★代码块复制按钮样式", r"\.code-wrap \.copy-code"),

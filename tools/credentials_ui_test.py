@@ -134,9 +134,15 @@ window.addEventListener("error", function (e) { window.__probeErr.push(String(e.
 window.addEventListener("unhandledrejection", function (e) { window.__probeErr.push("rej: " + String(e.reason)); });
 function __s(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; }
-function __rows() { return Array.prototype.slice.call(document.querySelectorAll("#cred-list .cred-row")); }
-function __rowBy(text) {
-  var all = __rows();
+function __providers() { return Array.prototype.slice.call(document.querySelectorAll("#cred-list .cred-prov")); }
+function __accts() { return Array.prototype.slice.call(document.querySelectorAll("#cred-list .cred-row")); }
+function __provBy(text) {
+  var all = __providers();
+  for (var i = 0; i < all.length; i++) if (__t(all[i]).indexOf(text) >= 0) return all[i];
+  return null;
+}
+function __acctBy(text) {
+  var all = __accts();
   for (var i = 0; i < all.length; i++) if (__t(all[i]).indexOf(text) >= 0) return all[i];
   return null;
 }
@@ -148,12 +154,32 @@ function __rowBy(text) {
     await __s(300);
     document.getElementById("btn-cfg").click();
     await __s(600);
-    out.info.rows = __rows().length;
-    step("★设置里列出多条凭据（同一 env 两条也在）", __rows().length === 3, "rows=" + __rows().length);
-    var c1 = __rowBy("DeepSeek · 个人"), c2 = __rowBy("DeepSeek · 公司");
-    step("★只显示掩码（没有明文）", !!(c1 && /…/.test(__t(c1))) && !/sk-[a-z0-9]{8,}/i.test(__t(c1)), c1 ? __t(c1) : "");
-    step("★默认那条有「默认」标记", !!c1 && /默认/.test(__t(c1)), c1 ? __t(c1) : "");
-    step("★非默认那条有「设默认」按钮", !!(c2 && c2.querySelector("[data-cred-def]")));
+
+    out.info.providers = __providers().map(__t);
+    step("★默认只列「厂商」，不铺开账号", __providers().length === 2 && __accts().length === 0,
+         JSON.stringify(out.info.providers));
+    var ds = __provBy("DeepSeek"), an = __provBy("Anthropic");
+    step("★每个厂商显示账号数（DeepSeek 2 个）", !!ds && /2 个账号/.test(__t(ds)), ds ? __t(ds) : "");
+    step("★只有一个账号的厂商标 1 个", !!an && /1 个账号/.test(__t(an)), an ? __t(an) : "");
+    step("★厂商行显示默认账号名", !!ds && /默认：/.test(__t(ds)), ds ? __t(ds) : "");
+
+    if (ds) ds.click();
+    await __s(200);
+    out.info.accts = __accts().map(__t);
+    step("★点厂商 → 展开账号", __accts().length === 2, JSON.stringify(out.info.accts));
+    step("★账号行显示掩码（不是明文）",
+         !!__acctBy("DeepSeek · 个人") && /…/.test(__t(__acctBy("DeepSeek · 个人")))
+         && !/sk-[a-z0-9]{8,}/i.test(__t(__acctBy("DeepSeek · 个人"))),
+         __acctBy("DeepSeek · 个人") ? __t(__acctBy("DeepSeek · 个人")) : "");
+    step("★默认账号有「默认」标记", /默认/.test(__t(__acctBy("DeepSeek · 个人"))));
+
+    var dsCollapse = __provBy("DeepSeek");
+    if (dsCollapse) dsCollapse.click();
+    await __s(150);
+    step("★再点厂商 → 收起账号", __accts().length === 0, "accts=" + __accts().length);
+    var dsReopen = __provBy("DeepSeek");
+    if (dsReopen) dsReopen.click();
+    await __s(150);
 
     // 添加
     document.getElementById("cred-add").click();
@@ -170,21 +196,24 @@ function __rowBy(text) {
          add.action === "add" && add.env === "DEEPSEEK_API_KEY" && !!add.secret,
          JSON.stringify(add));
     await __s(200);
-    step("★添加后列表多一行", __rows().length === 4, "rows=" + __rows().length);
+    var ds2 = __provBy("DeepSeek");
+    step("★添加后厂商账号数变 3", !!ds2 && /3 个账号/.test(__t(ds2)), ds2 ? __t(ds2) : "");
+    step("★添加后自动展开那一家", __accts().length === 3, "accts=" + __accts().length);
 
     // 设默认
-    var c2b = __rowBy("DeepSeek · 公司");
-    var defBtn = c2b ? c2b.querySelector("[data-cred-def]") : null;
+    var comp = __acctBy("DeepSeek · 公司");
+    var defBtn = comp ? comp.querySelector("[data-cred-def]") : null;
     if (defBtn) defBtn.click();
     await __s(400);
     var last = window.__posts[window.__posts.length - 1] || {};
     step("★设默认 → POST default", last.action === "default" && last.id === "c2", JSON.stringify(last));
     await __s(100);
-    var c2c = __rowBy("DeepSeek · 公司");
-    step("★默认标记移到新的那条", !!c2c && /默认/.test(__t(c2c)), c2c ? __t(c2c) : "");
+    step("★默认标记移到新的那条", /默认/.test(__t(__acctBy("DeepSeek · 公司"))),
+         __t(__acctBy("DeepSeek · 公司")));
 
     // 编辑（留空 Key = 不改）
-    var ed = c2c ? c2c.querySelector("[data-cred-edit]") : null;
+    var comp2 = __acctBy("DeepSeek · 公司");
+    var ed = comp2 ? comp2.querySelector("[data-cred-edit]") : null;
     if (ed) ed.click();
     await __s(200);
     document.getElementById("cred-label").value = "DeepSeek · 公司（改）";
@@ -194,16 +223,17 @@ function __rowBy(text) {
     var up = window.__posts[window.__posts.length - 1] || {};
     step("★编辑：留空 Key 时 POST 不带 secret", up.action === "update" && !("secret" in up),
          JSON.stringify(up));
-    step("★编辑后名称已更新", !!__rowBy("公司（改）"));
+    step("★编辑后名称已更新", !!__acctBy("公司（改）"));
 
     // 删除
-    var delRow = __rowBy("DeepSeek · 备用");
+    var delRow = __acctBy("DeepSeek · 备用");
     var delBtn = delRow ? delRow.querySelector("[data-cred-del]") : null;
     if (delBtn) delBtn.click();
     await __s(400);
     var dl = window.__posts[window.__posts.length - 1] || {};
     step("★删除 → POST delete", dl.action === "delete", JSON.stringify(dl));
-    step("★删除后行消失", __rows().length === 3, "rows=" + __rows().length);
+    var ds3 = __provBy("DeepSeek");
+    step("★删除后厂商账号数回到 2", !!ds3 && /2 个账号/.test(__t(ds3)), ds3 ? __t(ds3) : "");
 
     // Agent 编辑：选凭据
     await loadAcpAgents();

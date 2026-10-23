@@ -365,6 +365,25 @@ html.cfg-resizing #app { transition: none; }
 .cred-acts button:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
 .cred-acts button[data-cred-del]:hover { color: #e5534b; border-color: color-mix(in srgb, #e5534b 45%, transparent); }
 .cred-empty { font-size: 11px; color: var(--ink-faint); padding: 2px 0; }
+/* ★两层清单：厂商（点开）→ 账号（掩码） */
+.cred-group { border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+.cred-group:first-child { border-top: 0; }
+.cred-prov {
+  display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
+  padding: 5px 2px; cursor: pointer; background: transparent; border: 0;
+  color: var(--ink); font-size: 12px;
+}
+.cred-prov:hover b { color: var(--hi); }
+.cred-caret { flex: none; width: 10px; font-size: 10px; color: var(--ink-faint); }
+.cred-prov > b { flex: none; }
+.cred-count { flex: none; font-size: 10px; color: var(--ink-faint); }
+.cred-defname {
+  min-width: 0; flex: 1; font-size: 10px; color: #d29922;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cred-accts { display: flex; flex-direction: column; gap: 2px; padding: 0 0 5px 17px; }
+.cred-accts .cred-row { border-top: 1px dashed color-mix(in srgb, var(--line) 45%, transparent); }
+.cred-accts .cred-row:first-child { border-top: 0; }
 #cred-add { align-self: flex-start; }
 /* 自定义素材那一排（头像 / 空会话主图 / 贴纸） */
 .cfg-art { gap: 8px; }
