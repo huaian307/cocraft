@@ -199,6 +199,42 @@ function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; 
     step("★非 Codex 多段：复制只取最终段", /dsh 的最终回答/.test(dtext) && !/dsh 的过程话/.test(dtext),
          dtext.slice(0, 120));
 
+    // 用户提问：可复制 + 可编辑（放回输入框，作为新消息）
+    var ucopy = document.querySelector('#messages [data-copy="u1"]');
+    step("★用户提问也有「复制」", !!ucopy);
+    if (ucopy) ucopy.click();
+    await __s(300);
+    var utext = (window.__copied || [])[window.__copied.length - 1] || "";
+    step("★复制的是提问原文", utext === "帮我复制一段", utext);
+    var ebtn = document.querySelector('#messages [data-edit-msg="u1"]');
+    step("★用户提问有「编辑」", !!ebtn);
+    var inp = document.getElementById("input");
+    // 先在输入框里放一个草稿，验证取消能恢复
+    inp.value = "我的草稿";
+    inp.dispatchEvent(new Event("input", { bubbles: true }));
+    if (ebtn) ebtn.click();
+    await __s(250);
+    step("★编辑：把原问题放回输入框", !!inp && inp.value === "帮我复制一段", inp ? inp.value : "(没有输入框)");
+    var ebar = document.getElementById("edit-bar");
+    step("★编辑态有提示条（可取消）", !!ebar && !ebar.hidden, ebar ? __t(ebar) : "(没有提示条)");
+    step("★提示「会作为新消息」", /新消息/.test(__t(document.getElementById("banner"))),
+         __t(document.getElementById("banner")));
+    var ecancel = document.getElementById("edit-cancel");
+    step("★有「取消」按钮", !!ecancel);
+    if (ecancel) ecancel.click();
+    await __s(250);
+    step("★取消后恢复原草稿", inp.value === "我的草稿", inp.value);
+    step("★取消后提示条收起", !!ebar && ebar.hidden);
+    step("★取消有反馈", /已取消编辑/.test(__t(document.getElementById("banner"))),
+         __t(document.getElementById("banner")));
+
+    // Esc 也能取消
+    if (ebtn) ebtn.click();
+    await __s(200);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await __s(250);
+    step("★Esc 也能取消编辑", inp.value === "我的草稿" && !!ebar && ebar.hidden, inp.value);
+
     // 1) 自动放行：请求体必须是合法 JSON
     await pollAsks();
     for (var k = 0; k < 20; k++) { await __s(50); if (window.__permReply) break; }

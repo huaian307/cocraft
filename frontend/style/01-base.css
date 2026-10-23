@@ -455,6 +455,41 @@ h1#session-title {
 }
 .msg .who .copy-btn.copied { opacity: 1; color: var(--hi); border-color: var(--hi); }
 .msg .who .copy-btn.copy-fail { opacity: 1; color: var(--hi); border-color: var(--hi); }
+/* ★重新编辑之前的提问：输入框上方一条可取消的提示（Esc 也能取消） */
+.edit-bar {
+  display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap;
+  margin-bottom: 6px; padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--hi) 35%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--hi) 8%, transparent);
+  font-size: 11px; color: var(--ink-dim);
+}
+.edit-bar[hidden] { display: none !important; }
+.edit-bar .eb-ico { flex: none; color: var(--hi); }
+.edit-bar .eb-main { flex: none; color: var(--ink); }
+.edit-bar .eb-hint {
+  min-width: 0; flex: 1; color: var(--ink-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.edit-bar button {
+  flex: none; cursor: pointer; padding: 0 8px; font-size: 10.5px;
+  color: var(--ink-faint); background: transparent; border-radius: 999px;
+  border: 1px solid var(--line);
+}
+.edit-bar button:hover { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 45%, transparent); }
+
+/* ★用户提问的「编辑」：和复制同款，跟在复制后面 */
+.msg .who .edit-btn {
+  flex: none; cursor: pointer; margin-left: 4px;
+  border: 1px solid var(--line); border-radius: 999px; background: transparent;
+  color: var(--ink-faint); font-family: var(--serif); letter-spacing: .08em;
+  font-size: 10.5px; padding: 0 8px; line-height: 17px;
+  opacity: .6; transition: opacity .15s ease, color .15s ease, border-color .15s ease;
+}
+.msg .who .edit-btn:hover {
+  opacity: 1; color: var(--hi);
+  border-color: color-mix(in srgb, var(--hi) 40%, transparent);
+}
 
 /* ★ 选中回答里的任意片段 → 浮出的「复制选中」按钮（自由复制片段，不必整条） */
 .sel-copy {

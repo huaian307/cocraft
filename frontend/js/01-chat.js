@@ -723,7 +723,10 @@ function renderMessage(m) {
       ${m.queued ? `<span class="tag run" title="这一轮还在跑；结束后会自动发送。想立刻改用这条：点「■ 中断」，它马上就会发出">已排队</span>` : ""}
       ${m.undelivered ? `<span class="tag warn" title="面板重启时这条还没发出去，请重新发送">未送达</span>` : ""}
       ${streaming ? `<span class="tag run">生成中</span>` : ""}
-      ${!isUser ? `<button type="button" class="copy-btn" data-copy="${esc(m.id)}" title="复制这条回答的正文（不含思考过程）">复制</button>` : ""}
+      <button type="button" class="copy-btn" data-copy="${esc(m.id)}"
+        title="${isUser ? "复制这条提问" : "复制这条回答的正文（不含思考过程）"}">复制</button>
+      ${isUser && !m.pending && !m.queued ? `<button type="button" class="edit-btn" data-edit-msg="${esc(m.id)}"
+        title="把这条提问放回输入框；修改后发送会作为新消息（原提问保留）">编辑</button>` : ""}
     </div>
     <div class="bubble">${thinkChip}${parts}${files}</div>
   </div>`;
@@ -835,10 +838,72 @@ function closeCopyFallback() {
 }
 
 /** 消息级「复制」与代码块级「复制」共用一个委托监听（内容会重建，别绑在按钮上） */
+/** 把之前的一条提问放回输入框（修改后作为**新消息**发送；原提问保留在历史里）。 */
+const EDITQ = { id: "", draft: "" };
+
+function hideEditBar() {
+  const b = $("edit-bar");
+  if (b) b.hidden = true;
+}
+
+function editPreviousQuestion(id) {
+  const m = (state.messages || []).find((x) => String(x.id) === String(id));
+  if (!m) { setBanner("找不到这条提问（可能已被删除）", { ms: 3000 }); return; }
+  const text = String(m.text || messageCopyText(m) || "").trim();
+  if (!text) { setBanner("这条提问没有可编辑的正文", { ms: 3000 }); return; }
+  const inp = $("input");
+  if (!inp) return;
+  if (!EDITQ.id) {
+    // 第一次进入编辑：记住输入框里原本的草稿，取消时恢复
+    EDITQ.draft = inp.value;
+  } else if (inp.value.trim() && inp.value.trim() !== text
+             && !window.confirm("输入框里已经有内容，用这条提问替换吗？")) {
+    return;
+  }
+  EDITQ.id = String(id);
+  inp.value = text;
+  try { inp.dispatchEvent(new Event("input", { bubbles: true })); } catch { /* ignore */ }
+  try { inp.focus(); inp.scrollIntoView({ block: "nearest" }); } catch { /* ignore */ }
+  const bar = $("edit-bar");
+  if (bar) bar.hidden = false;
+  OVERLAY.push("editq", cancelEditQuestion);        // Esc 也能取消
+  setBanner("已放回输入框：修改后按 Enter 会作为**新消息**发送（原提问仍保留在历史里）", { ms: 6000 });
+}
+
+/** 取消编辑：恢复进入编辑前的草稿。 */
+function cancelEditQuestion() {
+  if (!EDITQ.id) { hideEditBar(); return; }
+  const inp = $("input");
+  if (inp) {
+    inp.value = EDITQ.draft || "";
+    try { inp.dispatchEvent(new Event("input", { bubbles: true })); } catch { /* ignore */ }
+    try { inp.focus(); } catch { /* ignore */ }
+  }
+  hideEditBar();
+  EDITQ.id = "";
+  EDITQ.draft = "";
+  OVERLAY.pop("editq");
+  setBanner("已取消编辑（输入框已恢复）", { ms: 3000 });
+}
+
+/** 发送成功（或换会话）时收掉编辑态，不再恢复草稿。 */
+function finishEditQuestion() {
+  if (!EDITQ.id) return;
+  hideEditBar();
+  EDITQ.id = "";
+  EDITQ.draft = "";
+  OVERLAY.pop("editq");
+}
+
 function initCopy() {
   document.addEventListener("click", (e) => {
     const t = e.target;
     if (!t || !t.closest) return;
+    const editBtn = t.closest(".edit-btn");
+    if (editBtn) {
+      editPreviousQuestion(editBtn.dataset.editMsg || "");
+      return;
+    }
     const codeBtn = t.closest(".copy-code");
     if (codeBtn) {
       const wrap = codeBtn.closest(".code-wrap");
@@ -855,6 +920,8 @@ function initCopy() {
   const b1 = $("copy-fb-close"), b2 = $("copy-fb-ok");
   if (b1) b1.addEventListener("click", closeFb);
   if (b2) b2.addEventListener("click", closeFb);
+  const ec = $("edit-cancel");
+  if (ec) ec.addEventListener("click", cancelEditQuestion);
 }
 
 /** 记录折叠块的展开状态（details 的 toggle 不冒泡，用捕获）：重渲染后保留用户的选择。 */
@@ -1778,6 +1845,7 @@ function scheduleLiveRender() {
 /* ---------------- 会话操作 ---------------- */
 
 async function openSession(id) {
+  finishEditQuestion();          // 换会话时收掉「重新编辑」状态，别把上一条会话的草稿带过来
   try {
     state.current = unwrap(await api(`/api/session/${encodeURIComponent(id)}`));
   } catch {
@@ -2047,6 +2115,7 @@ async function send() {
   const typed = input.value.trim();
   const files = outgoingFiles();
   if ((!typed && !files.length) || !state.current) return;
+  finishEditQuestion();          // 真的发出去了 → 收掉编辑态（不再恢复草稿）
 
   const atts = state.attachments.map((a) => ({
     name: a.name, mime: a.mime, size: a.size, dataUrl: a.dataUrl,
