@@ -106,6 +106,7 @@ class AssistantTurn:
         self.completed = None
         self.aborted = False
         self.text_parts = []
+        self.text_segments = []        # ★按工具调用切段：Codex 的「碎碎念」每段单独一条
         self.reason_parts = []
         self.tools = []
         self.plan = None            # agent 的计划（todo）；不进 content，走事件
@@ -123,6 +124,9 @@ class AssistantTurn:
             seq = self._text_seq
             self._text_seq += 1
             self.text_parts.append(text)
+            if not self.text_segments:
+                self.text_segments.append("")
+            self.text_segments[-1] += text
             etype = "session.text.delta"
         else:
             seq = self._reason_seq
@@ -178,6 +182,11 @@ class AssistantTurn:
             self.plan = {"markdown": str(text)}
         return [self._ev("session.plan.update", planId=self.plan_id, plan=self.plan)]
 
+    def break_text_segment(self) -> None:
+        """工具调用开始时切一段：之前的文字算「碎碎念」，之后的算下一段（最终回答通常最后一段）。"""
+        if self.text_segments and self.text_segments[-1].strip():
+            self.text_segments.append("")
+
     def apply(self, update) -> list:
         kind = (update or {}).get("sessionUpdate")
         if kind == "agent_message_chunk":
@@ -191,6 +200,7 @@ class AssistantTurn:
             ev = self._delta("reasoning", content_text(update.get("content")))
             return [ev] if ev else []
         if kind == "tool_call":
+            self.break_text_segment()          # ★文字 → 工具 = 一段结束
             tcid = update.get("toolCallId") or ("t%d" % len(self.tools))
             name = update.get("title") or update.get("name") or update.get("kind") or "tool"
             out = normalize_output(update.get("rawOutput"))
@@ -269,8 +279,11 @@ class AssistantTurn:
         content = []
         if self.reason_parts:
             content.append({"type": "reasoning", "text": "".join(self.reason_parts)})
-        if self.text_parts:
-            content.append({"type": "text", "text": "".join(self.text_parts)})
+        segs = [s for s in (self.text_segments or []) if str(s).strip()]
+        if not segs and self.text_parts:
+            segs = ["".join(self.text_parts)]
+        for seg in segs:
+            content.append({"type": "text", "text": seg})
         for t in self.tools:
             content.append({"type": "tool", "name": t["name"],
                             "state": {"status": t["status"], "input": t["input"], "output": t["output"]}})

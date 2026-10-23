@@ -117,6 +117,8 @@ CHECKS = [
     ("消息", "★剪贴板两条都失败 → 手动复制兜底框", r"function showCopyFallback"),
     ("消息", "★完成后的最后一段正文不被「旁白」规则吞掉（Codex 常见：正文后跟 tool 收尾）",
      r"finishedMsg && !hasTextAfter"),
+    ("消息", "★Codex 的碎碎念收进「过程」折叠块（允许它碎碎念）", r'class="chatter"'),
+    ("消息", "★只有 Codex 特殊处理，其它 agent 仍按旁白规则", r"const isCodex = /codex/i"),
     ("消息", "★复制正文从权威数据取（实时缓冲优先，不靠 DOM）", r"function copyMessageById"),
     ("消息", "★复制后按钮给瞬时反馈", r"function flashCopied"),
     # ---- 消息渲染（重写过的高危区）----
@@ -1158,6 +1160,7 @@ CSS_CHECKS = [
     ("消息", "★代码块复制按钮样式", r"\.code-wrap \.copy-code"),
     ("消息", "★消息复制按钮样式", r"\.msg \.who \.copy-btn"),
     ("消息", "★复制兜底框（等宽、可调高）", r"#copy-fb-text \{"),
+    ("消息", "★Codex「过程」折叠块（缩进 + 弱化颜色）", r"\.msg \.chatter"),
     ("消息", "★「复制选中」浮层按钮样式", r"\.sel-copy \{"),
     ("消息", "★回答内容可选中", r"user-select: text"),
     ("设置", "★会话项项目名右下角样式", r"\.session \.proj"),
@@ -1683,6 +1686,10 @@ PY_CHECKS = [
     # ---- ★权限自动放行下沉到后端（0.2.24）----
     ("权限", "★后端按面板等级自动放行（不依赖前端轮询 / 当前会话）", r"_ca\.allowed_by_level"),
     ("权限", "★破坏性命令后端也不自动（即使 level=all）", r"_ca\._is_destructive"),
+    # ---- ★Codex 碎碎念切段（0.2.25）----
+    ("消息", "★按工具调用切段（text_segments）", r"self\.text_segments"),
+    ("消息", "★工具调用开始新段", r"def break_text_segment"),
+    ("消息", "★message() 输出多个 text part（不再 join 成一大坨）", r"for seg in segs"),
     # ---- 自定义外观（头像 / 空会话素材）----
     ("外观", "★素材状态文件（只记本机路径）", r"APPEARANCE_FILE"),
     ("外观", "允许的图片扩展名白名单", r"IMAGE_EXTS"),
@@ -2151,7 +2158,7 @@ def main() -> int:
               "cross_engine_model_test.py", "perm_audit_test.py", "inbox_queue_test.py",
               "workflow_canvas_ui_test.py", "agent_install_test.py", "agent_update_ui_test.py",
               "credentials_test.py", "credentials_ui_test.py", "permission_copy_ui_test.py",
-              "perm_level_auto_test.py",
+              "perm_level_auto_test.py", "chatter_split_test.py",
               "acp_events_test.py", "acp_api_test.py", "acp_engine_ui_test.py",
               "watch_mode_test.py", "md_render_test.py", "selftest.py",
               "cocraft_agents_check.py", "cocraft_ws_check.py")

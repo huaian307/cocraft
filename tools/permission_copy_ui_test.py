@@ -92,6 +92,18 @@ STUB = r"""<script>
         { type: "reasoning", text: "（思考）" },
         { type: "text", text: "进行中的旁白" },
         { type: "tool", name: "shell", state: { status: "running", input: { command: "echo" } } }
+      ] },
+    // ★Codex：多段「碎碎念」+ 最终回答 → 碎碎念收进「过程」，最终单独显示
+    { id: "a4", type: "assistant", agent: "codex-node",
+      model: { id: "mock-fast", providerID: "mock" },
+      time: { created: NOW - 7000, completed: NOW - 6000 },
+      content: [
+        { type: "reasoning", text: "（思考）" },
+        { type: "text", text: "我先看看环境。" },
+        { type: "tool", name: "shell", state: { status: "completed", input: { command: "dir" } } },
+        { type: "text", text: "再下载模型……" },
+        { type: "tool", name: "shell", state: { status: "completed", input: { command: "curl" } } },
+        { type: "text", text: "最终：图已经生成好了。" }
       ] }
   ];
   window.fetch = function (u, o) {
@@ -155,6 +167,19 @@ function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; 
     step("★完成后的正文（后面跟 tool 状态）仍显示", /完成后的反馈文字/.test(boxText), boxText.slice(-160));
     step("★还在生成时的旁白不显示", !/进行中的旁白/.test(boxText), boxText.slice(-160));
 
+    // Codex 碎碎念：过程进折叠块，最终回答单独显示
+    var ch = document.querySelector("#messages .chatter");
+    step("★Codex 的碎碎念收进「过程」折叠块", !!ch && /过程/.test(__t(ch)) && /2 段/.test(__t(ch)),
+         ch ? __t(ch) : "(没有 .chatter)");
+    step("★折叠块里保留碎碎念原文", !!ch && /我先看看环境/.test(__t(ch)), ch ? __t(ch).slice(0, 120) : "");
+    step("★Codex 最终回答单独显示", /最终：图已经生成好了/.test(boxText), boxText.slice(-160));
+    var cbtn = document.querySelector('#messages [data-copy="a4"]');
+    if (cbtn) cbtn.click();
+    await __s(300);
+    var ctext = (window.__copied || [])[window.__copied.length - 1] || "";
+    step("★复制 Codex 回答只取最终一段", /最终：图已经生成好了/.test(ctext) && !/我先看看环境/.test(ctext),
+         ctext.slice(0, 120));
+
     // 1) 自动放行：请求体必须是合法 JSON
     await pollAsks();
     for (var k = 0; k < 20; k++) { await __s(50); if (window.__permReply) break; }
@@ -168,7 +193,7 @@ function __t(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""; 
     step("★横幅提示已按等级自动放行", /自动放行/.test(out.info.banner), out.info.banner);
 
     // 2) 消息复制：先 execCommand（Clipboard API 一次都不调）
-    var msgBtn = document.querySelector("#messages .copy-btn");
+    var msgBtn = document.querySelector('#messages [data-copy="a1"]');
     out.info.hasCopy = !!msgBtn;
     step("★助手消息有「复制」按钮", !!msgBtn);
     if (msgBtn) msgBtn.click();

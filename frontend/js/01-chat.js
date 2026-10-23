@@ -625,21 +625,27 @@ function renderMessage(m) {
 
   let parts = "";
   let hadReasoning = false;
+  const msgAgent = String(m.agent || (m.metadata && m.metadata.agent) || "");
+  const isCodex = /codex/i.test(msgAgent);
+  const chatter = [];                    // ★Codex 的「过程碎碎念」（除最后一段外的正文）
   const contentArr = Array.isArray(m.content) ? m.content : null;
   if (contentArr && contentArr.length) {
     parts = contentArr.map((p, i) => {
       if (!p || typeof p !== "object") return "";
       const key = `${m.id}:${i}`;
       if (p.type === "text") {
-        // ★"边做边说"的旁白（这一段后面还跟着工具调用）**不是最终输出** → 主界面不显示。
-        //   ⚠ 但**已经结束**的回复里，最后一段正文即使后面还跟着 tool 状态更新，也必须显示 ——
-        //     Codex 常把「最终一段话」发完后再补一条 tool 完成状态；旧逻辑会把整条反馈吞掉
-        //     （用户报："codex 完成工作后不会反馈"）。只有"后面还有别的正文"才算旁白。
         const later = contentArr.slice(i + 1);
         const hasToolAfter = later.some((q) => q && q.type === "tool");
         const hasTextAfter = later.some((q) => q && q.type === "text" && String(q.text || "").trim());
         const finishedMsg = !!(m.time && m.time.completed);
-        if (hasToolAfter && !(finishedMsg && !hasTextAfter)) return "";
+        // ★Codex 特殊处理：它喜欢"边做边说"。前面的文字收进「过程」（可展开），
+        //   最后一段才是最终回答 —— 既允许它碎碎念，又不把整段流水账糊成正文。
+        if (isCodex) {
+          if (hasTextAfter) { chatter.push(String(p.text || "")); return ""; }
+        } else if (hasToolAfter && !(finishedMsg && !hasTextAfter)) {
+          // 其它 agent 仍按原规则：旁白（后面跟工具）不进主界面
+          return "";
+        }
         if (p.live) {
           return `<div class="text"><span data-live-text data-msgid="${esc(m.id)}">`
             + `${renderText(stripModelWarning(p.text))}</span><span class="caret"></span></div>`;
@@ -655,6 +661,14 @@ function renderMessage(m) {
         <div class="body">${esc(JSON.stringify(p, null, 2).slice(0, 8000))}</div>
       </details>`;
     }).filter(Boolean).join("");
+    if (isCodex && chatter.length) {
+      const open = (m.time && m.time.completed) ? "" : " open";
+      parts = `<details class="chatter" data-k="chatter:${esc(m.id)}"${open}>`
+        + `<summary><span class="tag">过程</span> Codex 的碎碎念 · ${chatter.length} 段（点开看）</summary>`
+        + `<div class="body">${chatter.map((t) =>
+          `<div class="text chatter-line">${renderText(stripModelWarning(t))}</div>`).join("")}</div>`
+        + `</details>` + parts;
+    }
   } else if (typeof m.text === "string" && m.text.trim()) {
     parts = `<div class="text">${renderText(m.text)}</div>`;
   } else if (typeof m.content === "string" && m.content.trim()) {
@@ -760,6 +774,8 @@ function messageCopyText(m) {
     if (typeof m.text === "string") s = m.text;
     else if (typeof m.content === "string") s = m.content;
   }
+  // Codex 的「过程」不是最终回答：复制只取最后一段（与界面一致）
+  if (/codex/i.test(String(m.agent || "")) && parts.length > 1) s = parts[parts.length - 1];
   return stripModelWarning(s).trim();
 }
 
