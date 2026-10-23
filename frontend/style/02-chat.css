@@ -198,6 +198,21 @@ details.part .body.stream { max-height: none; overflow: visible; }
     linear-gradient(180deg, rgba(250,247,242,.34) 0%, rgba(250,247,242,.44) 55%, rgba(250,247,242,.58) 100%),
     url("/assets/hiru-bg.jpg");
 }
+/* ★默认壁纸偏暗（烛光 / 深夜）：玻璃模式压一层暗纱，白字才读得清；
+   纸面模式（液态玻璃关掉）仍用上面那层浅纸纱，保证深色字可读。
+   ⚠ 只在**没有用户主题**时生效 —— 主题工坊的 background 不能被这层暗纱压掉。 */
+html.glass:not([data-theme-user]) #static-bg .sb[data-bg="hiru"] {
+  background-image:
+    linear-gradient(180deg, rgba(10,10,14,.34) 0%, rgba(10,10,14,.46) 55%, rgba(10,10,14,.60) 100%),
+    url("/assets/hiru-bg.jpg");
+}
+html.glass .msg .who,
+html.glass .notice,
+html.glass .empty .duck-line1,
+html.glass .empty .duck-line2,
+html.glass .empty .credit {
+  text-shadow: 0 0 5px rgba(0,0,0,.55), 0 0 11px rgba(0,0,0,.42);
+}
 
 /* 背景有了插画，气泡之外的小字加一层纸色柔光，保证可读 */
 .msg .who,
