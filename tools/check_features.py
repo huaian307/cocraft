@@ -112,7 +112,9 @@ CHECKS = [
     ("消息", "★每条回答都有「复制」按钮", r'class="copy-btn" data-copy='),
     ("消息", "★代码块也有「复制」", r'class="copy-code"'),
     ("消息", "★收尾的「生成中」若 id 变了要丢弃（opencode-acp 读库后 id 不同）", r"\.done && !known\.has"),
-    ("消息", "★复制走剪贴板（异步 API + execCommand 兜底）", r"async function copyToClipboard"),
+    ("消息", "★复制走剪贴板（同步 execCommand 优先 + Clipboard API 兜底）", r"async function copyToClipboard"),
+    ("消息", "★复制先走 execCommand（WebView2 点击手势内）", r'const ok = document\.execCommand\("copy"\)'),
+    ("消息", "★剪贴板两条都失败 → 手动复制兜底框", r"function showCopyFallback"),
     ("消息", "★复制正文从权威数据取（实时缓冲优先，不靠 DOM）", r"function copyMessageById"),
     ("消息", "★复制后按钮给瞬时反馈", r"function flashCopied"),
     # ---- 消息渲染（重写过的高危区）----
@@ -659,6 +661,8 @@ CHECKS = [
     # ---- 权限授予等级 ----
     ("权限", "★输入框左下角「权限等级」按钮", r"btn-perm"),
     ("权限", "★按等级自动放行（不弹窗、不需要理由）", r"permAllowedByLevel"),
+    ("权限", "★自动放行必须 JSON.stringify（传对象 → [object Object] → agent 报 aborted）",
+     r'JSON\.stringify\(\{ decision: "once" \}\)'),
     ("权限", "★等级接口 /api/permission/level", r"/api/permission/level"),
     ("权限", "★条件：等级 POST 的 body 必须 JSON.stringify（传对象会变成 [object Object]）", r'body: JSON\.stringify\(\{ level: lv \}\)'),
     # ---- ★信任面板（方向 3 第一块）----
@@ -1151,6 +1155,7 @@ CSS_CHECKS = [
     ("模式", "★顶栏模式按钮放开 34px 宽度（踩坑 #24）", r"#topbar \.actions #btn-agent"),
     ("消息", "★代码块复制按钮样式", r"\.code-wrap \.copy-code"),
     ("消息", "★消息复制按钮样式", r"\.msg \.who \.copy-btn"),
+    ("消息", "★复制兜底框（等宽、可调高）", r"#copy-fb-text \{"),
     ("消息", "★「复制选中」浮层按钮样式", r"\.sel-copy \{"),
     ("消息", "★回答内容可选中", r"user-select: text"),
     ("设置", "★会话项项目名右下角样式", r"\.session \.proj"),
@@ -2140,7 +2145,7 @@ def main() -> int:
               "agent_safety_test.py", "context_estimate_test.py",
               "cross_engine_model_test.py", "perm_audit_test.py", "inbox_queue_test.py",
               "workflow_canvas_ui_test.py", "agent_install_test.py", "agent_update_ui_test.py",
-              "credentials_test.py", "credentials_ui_test.py",
+              "credentials_test.py", "credentials_ui_test.py", "permission_copy_ui_test.py",
               "acp_events_test.py", "acp_api_test.py", "acp_engine_ui_test.py",
               "watch_mode_test.py", "md_render_test.py", "selftest.py",
               "cocraft_agents_check.py", "cocraft_ws_check.py")

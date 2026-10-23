@@ -780,8 +780,10 @@ async function pollAsks() {
         for (const pm of perms) {
           if (permAllowedByLevel(pm)) {
             try {
+              // ⚠ 必须 JSON.stringify：api() 不会替你序列化，传对象会变成 [object Object]
+              //    → 后端读不到 decision → 按 reject → agent 报 "aborted by user"（0.1s 取消）
               await api(`/api/session/${sid}/permission/${encodeURIComponent(pm.id)}/reply`,
-                        { method: "POST", body: { decision: "once" } });
+                        { method: "POST", body: JSON.stringify({ decision: "once" }) });
               setBanner(`已按权限等级「${permLevelLabel(PERM.level)}」自动放行：${pm.action || pm.kind || "权限"}`);
             } catch { keep.push(pm); }
           } else { keep.push(pm); }

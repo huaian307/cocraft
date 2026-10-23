@@ -710,17 +710,13 @@ function renderMessage(m) {
 
 /* ---------------- 复制（回答正文 / 代码块） ---------------- */
 
-/** 写剪贴板：异步 Clipboard API 优先（localhost 属安全上下文），失败再退化到隐藏 textarea。
- *  返回是否成功。 */
+/** 写剪贴板：**先走同步 execCommand**（在点击手势里，WebView2 上最可靠），
+ *  失败再退化到异步 Clipboard API。
+ *  ⚠ 顺序不能反：先 `await navigator.clipboard.writeText` 再 execCommand 会**丢掉用户手势**，
+ *    而 WebView2 里 clipboard API 常因没焦点/没权限 reject → 两步都失败（用户看到"复制失败"）。 */
 async function copyToClipboard(text) {
   const s = String(text ?? "");
   if (!s) return false;
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(s);
-      return true;
-    }
-  } catch { /* 继续走兜底 */ }
   try {
     const ta = document.createElement("textarea");
     ta.value = s;
@@ -732,8 +728,15 @@ async function copyToClipboard(text) {
     ta.select();
     const ok = document.execCommand("copy");
     document.body.removeChild(ta);
-    return ok;
-  } catch { return false; }
+    if (ok) return true;
+  } catch { /* 继续走 Clipboard API */ }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(s);
+      return true;
+    }
+  } catch { /* ignore */ }
+  return false;
 }
 
 /** 一条消息可复制的正文：助手取 text 部分（不要思考 / 工具），用户取顶层 text。 */
@@ -783,7 +786,29 @@ async function doCopy(btn, text) {
   const s = String(text ?? "");
   if (!s.trim()) { flashCopied(btn, "无可复制", false); return; }
   const ok = await copyToClipboard(s);
-  flashCopied(btn, ok ? "已复制" : "复制失败", ok);
+  if (!ok) {
+    // 剪贴板两条路都失败（WebView2 没焦点 / 拒绝权限）→ 兜底：弹一个全选好的文本框
+    showCopyFallback(s);
+    flashCopied(btn, "请手动复制", false);
+    return;
+  }
+  flashCopied(btn, "已复制", true);
+}
+
+/** 剪贴板不可用时的兜底：把内容放进一个已全选的 textarea（Ctrl+C 即可）。 */
+function showCopyFallback(text) {
+  const box = $("copy-fb"), ta = $("copy-fb-text");
+  if (!box || !ta) return;
+  ta.value = String(text || "");
+  box.hidden = false;
+  try { ta.focus(); ta.select(); } catch { /* ignore */ }
+  OVERLAY.push("copy-fb", closeCopyFallback);
+}
+
+function closeCopyFallback() {
+  const box = $("copy-fb");
+  if (box) box.hidden = true;
+  OVERLAY.pop("copy-fb");
 }
 
 /** 消息级「复制」与代码块级「复制」共用一个委托监听（内容会重建，别绑在按钮上） */
@@ -801,6 +826,12 @@ function initCopy() {
     const msgBtn = t.closest(".copy-btn");
     if (msgBtn) doCopy(msgBtn, copyMessageById(msgBtn.dataset.copy || ""));
   });
+  const closeFb = () => closeCopyFallback();
+  const fb = $("copy-fb");
+  if (fb) fb.addEventListener("click", (e) => { if (e.target === fb) closeFb(); });
+  const b1 = $("copy-fb-close"), b2 = $("copy-fb-ok");
+  if (b1) b1.addEventListener("click", closeFb);
+  if (b2) b2.addEventListener("click", closeFb);
 }
 
 /** 记录折叠块的展开状态（details 的 toggle 不冒泡，用捕获）：重渲染后保留用户的选择。 */

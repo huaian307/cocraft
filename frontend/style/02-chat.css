@@ -385,6 +385,16 @@ html.cfg-resizing #app { transition: none; }
 .cred-accts .cred-row { border-top: 1px dashed color-mix(in srgb, var(--line) 45%, transparent); }
 .cred-accts .cred-row:first-child { border-top: 0; }
 #cred-add { align-self: flex-start; }
+/* ★复制兜底（WebView2 剪贴板不可用时）：全选内容 + 提示 Ctrl+C */
+.copy-fb-box { width: min(680px, calc(92vw / var(--ui-z))); }
+.copy-fb-note { font-size: 11.5px; margin-bottom: 6px; }
+#copy-fb-text {
+  width: 100%; height: 38vh; min-height: 160px; resize: vertical;
+  font: 12px/1.5 var(--mono); padding: 8px 10px; border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--ink-faint) 8%, transparent);
+  color: var(--ink);
+}
 /* 自定义素材那一排（头像 / 空会话主图 / 贴纸） */
 .cfg-art { gap: 8px; }
 .cfg-art .cfg-art-k { flex: 0 0 88px; font-size: 11.5px; color: var(--ink-dim); }
