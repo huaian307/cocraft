@@ -49,6 +49,8 @@ frontend/assets/*.jpg
 frontend/assets/*.jpeg
 frontend/assets/*.webp
 frontend/assets/*.ico
+#      例外：官方静态背景图是我们原创素材，要进仓库、也随安装包发（打包从磁盘取 frontend/）
+!frontend/assets/hiru-bg.jpg
 
 # ---- 开发日志 / 个人筛选页：保留在本地，不随仓库发布 ----
 #      （它们含本机路径、进程号、个人项目名等；见 docs/REPRODUCE.md §7）
