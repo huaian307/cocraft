@@ -1,14 +1,13 @@
 /* 01-base.css —— 基础 / 主题变量 / 布局 / 消息区（P4 从 style.css 按物理顺序拆出的第 1 段；拼接后与原文件一致） */
 
 /* ============================================================================
-   OpenCode UI —— 「绘梨衣」主题
-   设计依据（原著/官方设定）：
-     · 巫女服 = 白衣 + 绯袴，红白两色，衣襟袖口编红色丝绳  → 纸白 + 绯红
-     · 暗红色长发、深玫瑰红眼瞳；龙化时「金边红仁」黄金瞳  → 金色点缀
-     · 因言灵·审判（序列111）不能说话，靠写字小本子交流      → 输入框 = 小本子
-     · 会给自己物品贴「絵梨衣の××」标签                    → 会话项命名风格
-     · 初见时黑纹付羽织 + 黑纱遮面                          → 夜主题
-   两套主题：默认「昼」（白衣绯袴）／「夜」（黑纱黄金瞳），右上角可切换。
+   OpenCode UI —— 两套内置主题：默认「圣烛教堂」(chapel) ／「和纸白昼」(hiru)
+   设计依据：
+     · 教堂意象：暖黑石墙 + 米白（白袍）+ 绣线金 + 烛焰橙            → chapel（默认，暗色）
+     · 巫女服 = 白衣 + 绯袴，红白两色，衣襟袖口编红色丝绳            → hiru（和纸白 + 绯红）
+     · 暗红色长发、深玫瑰红眼瞳                                    → 金色点缀
+     · 器物都贴一句自己的落款（「祈祷书」「壁画」…）                → 会话项 / 弹窗题字命名风格
+   切换入口：设置 → 壁纸与外观 → 主题（两张卡）。
    ============================================================================ */
 
 /* 反斜杠全局修正：日文字体（Yu Mincho / Yu Gothic UI 等）按 Shift-JIS 习惯把 U+005C(\) 画成「￥」。
@@ -57,8 +56,35 @@
   --g-blur: 28px;
 }
 
-* { box-sizing: border-box; }
+/* ============================================================================
+   ★ 官方主题「圣烛教堂」(chapel) · 底盘变量（2026-10-25）
+   取色直接来自官方壁纸：白袍兜帽（米白）+ 金线刺绣（绣金）+ 手持蜡烛（烛焰橙金）+ 彩窗（暖红）。
+   ⚠ 仍是「暗色专属」：不做浅色变体；浅色请切回 hiru（和纸白昼）。
+   ⚠ 只给**变量**，组件细节在 `08-visual.css` 的「圣烛教堂 · 细节」一节。
+   ============================================================================ */
+[data-theme="chapel"] {
+  --paper:      #17120f;   /* 暖黑石墙（不是纯黑，烛光下才有温度） */
+  --paper-2:    #201a15;
+  --paper-3:    #2a221b;
+  --ink:        #f6efe3;   /* 白袍米白 */
+  --ink-dim:    #cdbfa9;
+  --ink-faint:  #9c8d79;
+  --hi:         #e0a24a;   /* 烛焰橙金（主强调：主按钮 / 选中 / 焦点） */
+  --hi-deep:    #a86c22;
+  --hi-wash:    rgba(224, 162, 74, .16);
+  --gold:       #d9bd83;   /* 绣线金（描边 / 标签 / 徽章） */
+  --gold-soft:  #f0dcae;
+  --sakura:     #c56a55;   /* 彩窗暖红（只做小面积点缀） */
+  --line:       rgba(246, 239, 227, .16);
+  --line-soft:  rgba(246, 239, 227, .08);
+  --shadow:     0 14px 38px rgba(0, 0, 0, .42);
+  --ok:         #63a97f;
+  --run:        #d9bd83;
+  --err:        #e0645c;
+  --radius:     6px;
+}
 
+* { box-sizing: border-box; }
 html, body {
   margin: 0; height: 100%;
   background: var(--paper);
@@ -513,7 +539,7 @@ h1#session-title {
   border-radius: var(--radius); padding: 12px 15px; overflow-x: auto;
   box-shadow: var(--shadow);
 }
-/* 助手：纸白 + 左侧金线（黄金瞳的边） */
+/* 助手：纸白 + 左侧金线（金色描边） */
 .msg.assistant .bubble { border-left: 2px solid var(--gold-soft); }
 /* 我：绯的淡染 + 左侧绯线（绯袴） */
 .msg.user .bubble {
@@ -608,3 +634,19 @@ details.part .body {
 .tag.ok  { color: var(--ok);  border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
 .tag.run { color: var(--run); border-color: color-mix(in srgb, var(--run) 40%, transparent); }
 .tag.warn { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }.tag.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+
+/* ---- ★老用户「新主题」提示条（0.2.47）：侧栏里一条可点的提示，只出现一次 ---- */
+.theme-hint {
+  margin: 0 12px 10px; padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--gold) 42%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08);
+  font-size: 12px; line-height: 1.5;
+}
+.theme-hint .th-line { display: flex; flex-direction: column; gap: 2px; margin-bottom: 7px; }
+.theme-hint .th-line b { color: var(--gold); font-weight: 600; }
+.theme-hint .th-line span { color: var(--ink-dim); font-size: 11px; }
+.theme-hint .th-acts { display: flex; align-items: center; gap: 6px; }
+.theme-hint .th-acts button { height: 26px; padding: 0 10px; font-size: 12px; }
+.theme-hint .th-x { margin-left: auto; width: 26px; padding: 0; }

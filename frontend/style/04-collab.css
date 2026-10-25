@@ -1,7 +1,7 @@
 /* 04-collab.css —— 本地协作工作台（P4 从 style.css 按物理顺序拆出的第 4 段；拼接后与原文件一致） */
 
 /* ---------- 本地协作工作台（整窗；本机多 agent，不登录）---------- */
-/* ★整窗：盖住侧栏/顶栏/播放条，只给底部输入区（小本子）让位。
+/* ★整窗：盖住侧栏/顶栏/播放条，只给底部输入区（祈祷书）让位。
    `--collab-bottom` 在打开时按 #composer 的实际高度算（见 collabSyncFullscreen）。 */
 .collab-home {
   display: none; flex-direction: column; min-height: 0;
@@ -14,7 +14,7 @@
 #body-stage.collab-open .collab-home,
 html.collab-open .collab-home { display: flex; }
 
-/* ★任务输入条「搬到」小本子的位置：工作台打开时把 .collab-quick 移进 #composer，
+/* ★任务输入条「搬到」祈祷书的位置：工作台打开时把 .collab-quick 移进 #composer，
    原来的聊天输入（textarea / 附件 / 送出 / 权限技能行）先收起来。 */
 #composer.collab-input .composer-label { color: var(--gold); }
 html.collab-open #composer {

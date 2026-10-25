@@ -42,7 +42,8 @@ function migrateLegacyKeys() {
 async function api(path, options = {}) {
   const res = await fetch(path, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    // ★告诉后端"这次是**面板里点的**"（本机接口无鉴权，审计要靠这个区分人 / 脚本）
+    headers: { "X-Cocraft-UI": "1", "Content-Type": "application/json", ...(options.headers || {}) },
   });
   const text = await res.text();
   let body = null;
@@ -51,7 +52,10 @@ async function api(path, options = {}) {
     const detail = body && typeof body === "object"
       ? (body.error || body.message || JSON.stringify(body))
       : String(body || res.statusText);
-    throw new Error(`${res.status} ${detail}`);
+    // ★ 上游 500 经常**没有 body**（OpenCode 的校验失败就是空响应），只显示
+    //   「500 Internal Server Error」等于没说。这里补一句最可能的原因（附件的坑见 AGENTS 踩坑 #53）。
+    const blank5xx = !body && res.status >= 500;
+    throw new Error(`${res.status} ${detail}${blank5xx ? "（服务端内部错误；若刚发过附件，多半是附件太大或格式不支持）" : ""}`);
   }
   return body;
 }

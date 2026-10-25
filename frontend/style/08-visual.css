@@ -512,3 +512,116 @@ html.glass select option { background-color: #17171b; color: #f2f2f2; }
 
 
 
+
+/* ============================================================================
+   ★ 官方主题「圣烛教堂」(chapel)（2026-10-25）—— 默认主题
+   玻璃参数（暖棕黑 tint + 金色 hairline + 顶部烛光汗光）+ 5 处签名细节。
+   ⚠ 只动 tint / alpha / 边线 / 圆角；**不动 `--g-blur`**（模糊程度归设置里的滑块）。
+   ⚠ 危险色（破坏性 / 拒绝）**不许**被主题染成金色 —— 安全语义优先。
+   ============================================================================ */
+
+/* ---- 1. 玻璃材质参数 ---- */
+[data-theme="chapel"] {
+  --g-tint: 30,24,19;                     /* 暖棕黑 */
+  --g-ink:  246,239,227;                  /* 玻璃里的"墨"是浅色（暗底上的线） */
+  --g-a1: .38; --g-a2: .26; --g-a3: .20;  /* 主面 / 第二层 / 第三层 */
+  --g-edge: rgba(232,200,150,.18);        /* 金色 hairline（刺绣边） */
+  --g-top:  rgba(255,214,150,.10);        /* 顶部一道烛光汗光 */
+}
+html.glass[data-theme="chapel"] {
+  --g-scrim: rgba(12,9,7,.58);            /* 区块暗底（更暖） */
+  --radius: 8px;
+  --shadow: 0 14px 38px rgba(0,0,0,.42);
+}
+
+/* ---- 2. 顶栏：底边一线渐隐金线（祭坛边缘） ---- */
+[data-theme="chapel"] #topbar {
+  box-shadow: inset 0 -1px 0 rgba(216,189,131,.20), 0 8px 22px rgba(0,0,0,.28);
+}
+
+/* ---- 3. 图标按钮：金边 + 烛光 hover + 略尖的上圆角 ---- */
+[data-theme="chapel"] #btn-sidebar,
+[data-theme="chapel"] #topbar .actions button {
+  border-color: rgba(216,189,131,.22);
+  border-radius: 8px 8px 6px 6px;
+  color: var(--ink);
+}
+[data-theme="chapel"] #btn-sidebar:hover:not(:disabled),
+[data-theme="chapel"] #topbar .actions button:hover:not(:disabled):not(.danger) {
+  color: var(--hi);
+  border-color: rgba(224,162,74,.55);
+  background: rgba(224,162,74,.10);
+  box-shadow: 0 0 0 1px rgba(224,162,74,.16), 0 0 14px rgba(224,162,74,.20);
+}
+/* ⚠ 顶栏图标按钮的 `color` 会被 `#topbar .actions button`（带 id）盖掉 →
+   危险按钮（停止）要单独再按一遍红，别被主题染成金色（安全语义优先）。 */
+[data-theme="chapel"] #topbar .actions button.danger,
+[data-theme="chapel"] #topbar .actions button.danger:hover:not(:disabled) {
+  color: #ff8f88;
+  border-color: rgba(224,100,92,.45);
+  background: transparent;
+  box-shadow: none;
+}
+
+/* ---- 4. 主按钮：烛焰金渐变 + **深色字**（白字压金对比不够） ---- */
+[data-theme="chapel"] button.primary {
+  background: linear-gradient(180deg, var(--gold-soft) 0%, var(--hi) 55%, var(--hi-deep) 100%);
+  border-color: rgba(224,162,74,.85);
+  color: #1b1410; font-weight: 700;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35), 0 6px 18px rgba(0,0,0,.35);
+}
+[data-theme="chapel"] button.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #ffe9bf 0%, #f0b45c 55%, #c07c26 100%);
+  border-color: var(--gold-soft); color: #17120f;
+}
+
+/* ---- 5. 危险按钮：保持红（小字号用更亮的红，对比度约 7:1） ---- */
+[data-theme="chapel"] button.danger { color: #ff8f88; border-color: rgba(224,100,92,.45); }
+[data-theme="chapel"] button.danger:hover:not(:disabled) {
+  background: rgba(201,74,68,.18); color: #ffb0aa; border-color: #e0645c;
+}
+
+/* ---- 6. 选中项 / 当前档：金色左线 + 金晕（替代绯红高亮） ---- */
+[data-theme="chapel"] .session.active {
+  background: rgba(224,162,74,.10);
+  border-color: rgba(216,189,131,.28);
+}
+[data-theme="chapel"] .session.active::before {
+  background: var(--hi);
+  box-shadow: 0 0 10px rgba(224,162,74,.55);
+}
+
+/* ---- 7. 小圆片 / 标签：金线（状态色保持语义） ---- */
+[data-theme="chapel"] .tag { border-color: rgba(216,189,131,.32); color: var(--gold); }
+[data-theme="chapel"] .tag.ok { color: #8fd9ac; border-color: rgba(99,169,127,.45); }
+[data-theme="chapel"] .tag.run { color: var(--gold-soft); }
+[data-theme="chapel"] .tag.warn,
+[data-theme="chapel"] .tag.err { color: #ff9d95; border-color: rgba(224,100,92,.45); }
+
+/* ---- 8. 滑块圆点 / 滚动条：烛焰 ---- */
+[data-theme="chapel"] input[type="range"]::-webkit-slider-thumb {
+  background: radial-gradient(circle at 35% 30%, rgb(255,233,192), var(--hi) 60%, var(--hi-deep));
+  box-shadow: 0 0 10px rgba(224,162,74,.55);
+}
+
+/* ---- 9. 弹窗圣徽：chapel 用「尖拱窗 + 烛焰」(#mk-chapel)，hiru 仍用世界树标记 ---- */
+.mk-chapel { display: none; }
+[data-theme="chapel"] .mk-tree { display: none; }
+[data-theme="chapel"] .mk-chapel { display: inline-block; }
+
+/* ---- 10. 消息气泡：**暗玻璃**（叠在壁纸亮部不再糊成一块"白色蒙版"） ---- */
+/* 为什么需要：气泡背景是 `--paper` = rgba(30,24,19,.38)（38% 暖黑 + 28px 模糊）。
+   壁纸中间那块是**白袍 + 烛光**（接近纯白），38% 暖黑压不住 → 视觉上是一层浅灰白纱，
+   白字压上去很难读，也不像暗色主题。这里给气泡单独加厚到 ~.72（只动气泡，不动侧栏/输入区）。 */
+html.glass[data-theme="chapel"] .msg .bubble {
+  background: rgba(22,16,12,.72);
+  border-color: rgba(232,200,150,.20);
+  box-shadow: inset 0 1px 0 rgba(255,214,150,.08), 0 14px 38px rgba(0,0,0,.42);
+}
+html.glass[data-theme="chapel"] .msg.user .bubble {
+  background: color-mix(in srgb, var(--hi) 16%, rgba(22,16,12,.72));
+  border-color: rgba(224,162,74,.34);
+}
+html.glass[data-theme="chapel"] .msg .bubble th {
+  background: rgba(216,189,131,.16);
+}

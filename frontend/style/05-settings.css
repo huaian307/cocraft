@@ -1,4 +1,4 @@
-/* 05-settings.css —— 壁纸选择器 / 消息导航 / 弹窗(.wp) / 龙族视觉层（P4 从 style.css 按物理顺序拆出的第 5 段；拼接后与原文件一致） */
+/* 05-settings.css —— 壁纸选择器 / 消息导航 / 弹窗(.wp) / 教堂视觉层（P4 从 style.css 按物理顺序拆出的第 5 段；拼接后与原文件一致） */
 
 /* ---------- 弹窗：动态壁纸选择器 ---------- */
 
@@ -64,6 +64,34 @@
 .wp-meta { min-width: 0; flex: 1; }
 .wp-meta b { display: block; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wp-meta i { font-style: normal; font-size: 11px; color: var(--ink-faint); font-family: var(--mono); }
+/* 壁纸设置独立页（#wpc）：复用 .wp 外壳；里面的行是从设置抽屉**搬**过来的 .cfg-row（id 不变） */
+.wpc-box { width: min(600px, 94vw); }
+#wpc-body { max-height: 66vh; overflow: auto; padding: 2px 2px 0; }
+#wpc-body .cfg-list { margin-top: 6px; }
+.wpc-sec {
+  margin: 16px 0 6px; padding-bottom: 4px;
+  font-size: 12px; letter-spacing: .12em; color: var(--hi);
+  border-bottom: 1px solid var(--line);
+}
+#wpc-body > .wpc-sec:first-child { margin-top: 0; }
+
+/* 壁纸选择器里的拖拽导入区 */
+.wp-drop {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+  margin: 2px 0 10px; padding: 9px 11px;
+  border: 1px dashed var(--line); border-radius: 8px;
+}
+.wp-drop b { font-size: 13px; }
+.wp-drop .muted { font-size: 11.5px; }
+.wp-drop.over { border-color: var(--hi); background: rgba(255, 255, 255, .04); }
+.wp-it .wp-del { font-size: 11.5px; }
+/* 场景（scene）壁纸没有可内联的 <video>，没有 preview 时用一个占位块代替缩略图 */
+.wp-thumb-scene {
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; border: 1px solid var(--line);
+  background: linear-gradient(135deg, rgba(120, 90, 255, .20), rgba(255, 170, 80, .20));
+  color: var(--ink-dim); font-size: 11.5px; letter-spacing: .10em;
+}
 .wp-tag {
   display: inline-block; margin-left: 6px; padding: 0 5px; vertical-align: 1px;
   font-size: 10px; letter-spacing: .08em; border-radius: 999px;
@@ -333,7 +361,7 @@
 .mdl-vars button { padding: 4px 8px; font-size: 11.5px; }
 .mdl-vars button.sel { background: var(--hi); border-color: var(--hi); color: #fff; font-weight: 600; }
 
-/* 模型图标：官方品牌标（本地 SVG，见 tools/fetch_model_icons.py）；没有品牌标就青铜字母徽章 */
+/* 模型图标：官方品牌标（本地 SVG，见 tools/fetch_model_icons.py）；没有品牌标就黄铜字母徽章 */
 .micon { width: 18px; height: 18px; flex: none; display: block; object-fit: contain; }
 .micon.sm { width: 16px; height: 16px; }
 .micon-tree { color: var(--bronze); }
@@ -359,22 +387,22 @@
 }
 
 /* ============================================================================
-   龙族视觉层（2026-09-23）—— 顶栏铭牌 · 设置刻印 · 歌词译文
-   设计依据（江南《龙族》原著设定，公开资料核对后取用，非自创）：
-     · 卡塞尔学院校徽「半朽的世界树」（半枯半荣）  → 弹窗标题旁的内联 SVG（index.html #mk-tree）
-     · 青铜巨门 / 炼金术 / 七宗罪                  → 青铜铭牌质地 + 四角刻线
-     · 「黄金瞳」（龙化·金边红仁）                  → 滑块圆点、悬停辉光
-     · 「言灵周期表」的序列观念                      → 设置项左侧罗马数字序列
-     · 绯袴（项目原有主色）                          → 主按钮 = 绯红 + 金线
+   教堂视觉层（2026-10-25）—— 顶栏铭牌 · 设置刻印 · 歌词译文
+   设计依据（教堂建筑 / 礼仪用器，通用意象）：
+     · 圣徽：尖拱窗 + 烛焰                          → 弹窗标题旁的内联 SVG（index.html #mk-chapel）
+     · 黄铜烛台 / 圣器（sacristy）                    → 按钮＝黄铜边 + 纸/墨底 + 顶面高光，四角刻线
+     · 烛焰（暖金）                                  → 滑块圆点、悬停辉光
+     · 「祷言名录」的序列观念                        → 设置项左侧罗马数字序列
+     · 祭披红（项目原有主色）                        → 主按钮 = 绯红 + 金线
    ============================================================================ */
 
 :root {
-  --bronze:      #8a6a3c;   /* 青铜 */
+  --bronze:      #8a6a3c;   /* 黄铜（烛台 / 圣器） */
   --bronze-soft: #b99a63;
   --mk-cap:      #9a7a3c;   /* 题字金 */
 }
 
-/* ---- 铭牌底：所有按钮＝青铜边 + 纸/墨底 + 顶面高光 ---- */
+/* ---- 铭牌底：所有按钮＝黄铜边 + 纸/墨底 + 顶面高光 ---- */
 button {
   background:
     linear-gradient(180deg,
@@ -393,13 +421,13 @@ button:hover:not(:disabled) {
   color: var(--hi);
   box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 50%, transparent),
               0 0 0 1px color-mix(in srgb, var(--gold) 30%, transparent),
-              0 0 13px color-mix(in srgb, var(--gold) 26%, transparent);   /* 黄金瞳微光 */
+              0 0 13px color-mix(in srgb, var(--gold) 26%, transparent);   /* 烛焰微光 */
 }
 button:active:not(:disabled) {
   box-shadow: inset 0 2px 5px color-mix(in srgb, var(--ink) 20%, transparent);
 }
 
-/* ---- 主按钮：绯袴 + 金线 ---- */
+/* ---- 主按钮：祭披红 + 金线 ---- */
 button.primary {
   background: linear-gradient(180deg, color-mix(in srgb, var(--hi) 90%, #fff 10%), var(--hi-deep));
   border-color: color-mix(in srgb, var(--gold) 62%, var(--hi));
@@ -417,7 +445,7 @@ button.primary:hover:not(:disabled) {
 }
 button.danger:hover:not(:disabled) { border-color: var(--err); }
 
-/* ---- 顶栏按钮：四角刻线（炼金刻印）---- */
+/* ---- 顶栏按钮：四角刻线（鎏金刻印）---- */
 #topbar .actions button, #btn-sidebar { position: relative; }
 #topbar .actions button::before,
 #topbar .actions button::after,
@@ -432,7 +460,7 @@ button.danger:hover:not(:disabled) { border-color: var(--err); }
   right: 3px; bottom: 3px; border-right: 1px solid; border-bottom: 1px solid;
 }
 
-/* ---- 弹窗：炼金双线框 + 极淡网格 ---- */
+/* ---- 弹窗：鎏金双线框 + 极淡网格 ---- */
 .wp-box {
   border-color: color-mix(in srgb, var(--bronze) 48%, transparent);
   box-shadow: var(--shadow),
@@ -452,7 +480,7 @@ button.danger:hover:not(:disabled) { border-color: var(--err); }
   letter-spacing: .2em; color: var(--mk-cap); opacity: .85;
 }
 
-/* ---- 设置项：左侧罗马数字序列（言灵周期表的感觉）---- */
+/* ---- 设置项：左侧罗马数字序列（祷言名录的序列感）---- */
 .cfg-box { counter-reset: rune; }
 .cfg-body { padding-left: 22px; }
 .cfg-row { position: relative; }
@@ -478,7 +506,7 @@ button.danger:hover:not(:disabled) { border-color: var(--err); }
               0 0 10px color-mix(in srgb, var(--hi) 26%, transparent);
 }
 
-/* ---- 滑块：青铜轨 + 黄金瞳 ---- */
+/* ---- 滑块：黄铜轨 + 烛焰 ---- */
 .cfg-row input[type="range"],
 .p-vol input[type="range"] {
   background: linear-gradient(90deg,

@@ -51,6 +51,15 @@ frontend/assets/*.webp
 frontend/assets/*.ico
 #      例外：官方静态背景图是我们原创素材，要进仓库、也随安装包发（打包从磁盘取 frontend/）
 !frontend/assets/hiru-bg.jpg
+#      例外：**官方软件图标**（设计稿 icon.svg + 生成的 ico 与预览图）是项目自有资产 → 进仓库
+!frontend/assets/cocraft.ico
+!frontend/assets/icon-256.png
+# ---- 壁纸大文件：默认不进仓库（需要时单独放行）----
+#      官方内置动态壁纸只有 2.8 MB → 值得进仓库，所以下面单独 ! 放行；
+#      其余用户拖进来的视频 / 大素材不进 git（>100 MB 会被 GitHub 直接拒收）。
+frontend/assets/*.mp4
+frontend/assets/*.webm
+!frontend/assets/videos/official-bg.mp4
 
 # ---- 开发日志 / 个人筛选页：保留在本地，不随仓库发布 ----
 #      （它们含本机路径、进程号、个人项目名等；见 docs/REPRODUCE.md §7）

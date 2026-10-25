@@ -149,9 +149,9 @@ html.collapsed-focus .lyrics-overlay { display: flex; }
   border-top: 1px solid var(--line); background: var(--paper-2);
 }
 .player.on { display: block; }
-.p-bg {                                  /* 背景：从之前挑的图里选一张 */
+.p-bg {                                  /* 背景：用户没自定义时用**随包的官方壁纸** */
   position: absolute; inset: 0; pointer-events: none;
-  background: url("/assets/night.jpg") center 30% / cover no-repeat;
+  background: url("/assets/hiru-bg.jpg") center / cover no-repeat;
   opacity: .32;
 }
 /* 用户自定义了音乐条背景 → 抬高一点，别被纸色蒙层压得看不见 */

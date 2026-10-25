@@ -18,7 +18,7 @@
 /* ================= 面板内终端（ConPTY） =================
    从**底部上滑**的抽屉（类似群聊的右侧抽屉）：fixed 贴底，`.open` 才滑入；
    打开时给 #app 让出底部（padding-bottom）→ 输入框被顶到抽屉之上，抽屉正好在**文本框下面**。
-   配色全部走主题变量（纸色 / 青铜边 / 校徽 / 金色光标）。 */
+   配色全部走主题变量（纸色 / 黄铜边 / 圣徽 / 烛焰金光标）。 */
 #topbar .actions #btn-tools,
 #topbar .actions #btn-hub { display: inline-flex; align-items: center; justify-content: center; }
 .ico-wrench { width: 17px; height: 17px; display: block; }

@@ -1,11 +1,11 @@
 /* 20-collab.js —— 本地协作工作台 + 工作流画布（P1 从 app.js 拆出，纯搬运不改逻辑） */
 
-/* ---------------- ★整窗 + 底部输入区（小本子）当任务框 ---------------- */
+/* ---------------- ★整窗 + 底部输入区（祈祷书）当任务框 ---------------- */
 
 let COLLAB_COMPOSER_DEF = null;
 let COLLAB_QUICK_HOME = null;      // 任务输入条在原工作流视图里的位置（收工时搬回去）
 
-/** 记住小本子的原始占位/按钮文案（第一次打开工作台时记一次）。 */
+/** 记住祈祷书的原始占位/按钮文案（第一次打开工作台时记一次）。 */
 function collabComposerInit() {
   if (COLLAB_COMPOSER_DEF) return;
   const input = $("input");
@@ -29,7 +29,7 @@ function collabSyncFullscreen() {
     "--collab-bottom", Math.max(0, Math.round(h / z)) + "px");
 }
 
-/** 小本子进入 / 退出「工作台任务框」模式：**把任务输入条整条搬进去**。 */
+/** 祈祷书进入 / 退出「工作台任务框」模式：**把任务输入条整条搬进去**。 */
 function collabComposerSync() {
   collabComposerInit();
   const on = collabIsOpen();
@@ -49,7 +49,7 @@ function collabComposerSync() {
     if (label && COLLAB_COMPOSER_DEF) label.textContent = COLLAB_COMPOSER_DEF.label;
     return;
   }
-  // ★搬到小本子的位置：标签 + 任务输入 + ▶ 运行 就是底部这一行
+  // ★搬到祈祷书的位置：标签 + 任务输入 + ▶ 运行 就是底部这一行
   if (quick && wrap && quick.parentNode !== wrap) wrap.appendChild(quick);
   if (comp) comp.classList.add("collab-input");
   if (label) {
@@ -1606,7 +1606,8 @@ function collabRenderActions(run) {
   const pendN = (run.permissions || []).filter((p) => p.status === "pending").length;
   parts.push(`<button type="button" data-collab-perm-open="1" title="成员权限 + 待批申请（位置更宽）">`
     + `权限${pendN ? ` · ${pendN}` : ""}</button>`);
-  parts.push(`<button type="button" data-collab-export="1" title="导出这次任务的时间线 + 审批记录（JSON，不含成员正文）">导出审计</button>`);
+  parts.push(`<button type="button" data-collab-export="1" title="导出审计链（服务端权威记录 + 哈希链，可离线校验；不含成员正文）">导出审计</button>`);
+  parts.push(`<button type="button" data-collab-run-export="1" title="导出这次任务的运行记录（成员 / 活动 / 结论）—— 不是审计">导出记录</button>`);
   parts.push(`<span class="collab-sp"></span><span class="collab-hint">本地运行 · 不经过云端</span>`);
   box.innerHTML = parts.join("");
 }
@@ -1985,8 +1986,33 @@ function collabJumpPick(pick) {
   setBanner(`已跳到「${hit.name}」那一列`);
 }
 
-/** 导出审计（JSON）：时间线 + 谁批准了哪条 + 命令原文；**不含成员正文**（正文可能很大/敏感）。 */
-function collabExport() {
+/** 导出**审计链**（服务端权威记录）：只导哈希链里的那条记录流（谁批准了哪条、命令原文、隔离 id）。
+ *  ⚠ 数据源是 `runtime/state/_audit.jsonl`（append-only + 哈希链），**不是**页面内存里拼的 ——
+ *  这样导出的东西别人能离线校验（`tools\cocraft_audit_verify.py`）。 */
+async function collabExport() {
+  const run = COLLAB.run;
+  if (!run) { setBanner("先把任务打开再导出"); return; }
+  try {
+    const data = unwrap(await api(`/audit/export?run=${encodeURIComponent(run.id)}`)) || {};
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cocraft-audit-" + String(run.id || "run") + ".json";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
+    const n = Number(data.records || 0);
+    setBanner(n
+      ? ("已导出审计链：" + n + " 条（带哈希链，可离线校验）")
+      : "这次任务还没有进审计链（没有需要批准的操作）—— 导出的是空链");
+  } catch (e) {
+    setBanner("导出审计失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+/** 导出这次任务的**运行记录**（成员 / 活动 / 结论）：不是审计，不含成员正文。 */
+function collabExportRun() {
   const run = COLLAB.run;
   if (!run) { setBanner("先把任务打开再导出"); return; }
   const data = {
@@ -2007,11 +2033,11 @@ function collabExport() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "cocraft-audit-" + String(run.id || "run") + ".json";
+    a.download = "cocraft-run-" + String(run.id || "run") + ".json";
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
-    setBanner("已导出审计（JSON）");
+    setBanner("已导出运行记录（JSON）");
   } catch (e) {
     setBanner("导出失败：" + ((e && e.message) || e), { sticky: true });
   }

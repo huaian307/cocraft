@@ -88,14 +88,26 @@ function renderWallpapers() {
     const on = (t) => (pick[t] === it.id ? " on-" + t : "");
     const sel = (t) => (pick[t] === it.id ? ' class="sel"' : "");
     // 缩略图优先用壁纸自带的 preview（gif/jpg，稳）；没有才退回 <video> 取第 1 秒那帧
+    // 场景（scene）壁纸的 url 是**目录**，不能塞进 <video>，没有 preview 就给个占位块
     const thumb = it.preview
       ? `<img class="wp-thumb" src="${esc(it.preview)}" alt="" loading="lazy">`
-      : `<video class="wp-thumb" muted preload="metadata" playsinline src="${esc(it.url)}#t=1"></video>`;
+      : (it.kind === "scene"
+        ? `<div class="wp-thumb wp-thumb-scene">场景</div>`
+        : `<video class="wp-thumb" muted preload="metadata" playsinline src="${esc(it.url)}#t=1"></video>`);
+    const isBuiltin = !!it.builtin || String(it.id).indexOf("builtin:") === 0;
+    const isCustom = String(it.id).indexOf("custom:") === 0;
+    const tags = [];
+    if (isBuiltin) tags.push("官方 · 内置");
+    if (it.kind === "scene") tags.push("场景 · WebGL");
+    else if (isCustom) tags.push("自定义");
+    const tag = tags.length ? (tags.join(" · ") + " · ") : "";
+    const del = isCustom ? `<button class="wp-del" data-del="${esc(it.id)}">删除</button>` : "";
     return `<div class="wp-it${on("hiru")}">` + thumb
       + `<div class="wp-meta"><b>${esc(it.title || it.id)}</b>`
-      + `<i>${it.size_mb} MB · ${esc(String(it.file).slice(0, 26))}</i></div>`
+      + `<i>${tag}${it.size_mb} MB · ${esc(String(it.file).slice(0, 26))}</i></div>`
       + `<div class="wp-act">`
       + `<button data-slot="hiru" data-id="${esc(it.id)}"${sel("hiru")}>用这张</button>`
+      + del
       + `</div></div>`;
   }).join("");
 }
@@ -117,6 +129,52 @@ async function pickWallpaper(theme, id) {
   if (liveReload) await liveReload();            // 立刻换片，不用等 5 分钟
 }
 
+/** 拖拽 / 选择文件导入自定义壁纸（图片当静态背景、视频当动态背景）。
+ *  ⚠ 走 **原始字节** POST（不是 multipart、不是 JSON）：`/wallpaper/upload?name=…`。 */
+async function uploadWallpapers(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  let ok = 0, lastId = "";
+  const bad = [];
+  for (const f of list) {
+    try {
+      const r = await fetch("/wallpaper/upload?name=" + encodeURIComponent(f.name), {
+        method: "POST", body: f,
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.ok) { ok++; lastId = (j.item && j.item.id) || lastId; }
+      else bad.push(f.name + "：" + ((j && j.error) || ("HTTP " + r.status)));
+    } catch (e) {
+      bad.push(f.name + "：" + (e && e.message ? e.message : e));
+    }
+  }
+  await loadWallpaperList();
+  renderWallpapers();
+  if (ok === 1 && lastId) {                     // 只导入了一个 → 直接应用，省一次点击
+    try { await pickWallpaper("hiru", lastId); } catch { /* 下面横幅会说 */ }
+    setBanner("已导入并应用：" + (list[0] ? list[0].name : lastId) + "（随时可在壁纸列表里换回来）");
+  } else if (ok) {
+    setBanner("已导入 " + ok + " 个壁纸" + (bad.length ? "（失败 " + bad.length + " 个）" : "")
+      + "：在下面列表里点「用这张」即可生效");
+  } else {
+    setBanner("导入失败：" + (bad[0] || "未知原因"), { sticky: true });
+  }
+}
+
+async function deleteWallpaper(id) {
+  if (!confirm("删掉这个自定义壁纸？文件会一起从本机删除（不影响 Wallpaper Engine 工坊）。")) return;
+  try {
+    const r = await api("/wallpaper/delete", { method: "POST", body: JSON.stringify({ id }) });
+    if (!r || !r.ok) throw new Error("删除失败");
+    if (WALL.data) WALL.data.items = (WALL.data.items || []).filter((x) => x.id !== id);
+    renderWallpapers();
+    if (liveReload) await liveReload();         // 删的是当前这张 → 回落到默认
+    setBanner("已删除自定义壁纸");
+  } catch (err) {
+    setBanner("删除失败：" + (err && err.message ? err.message : err));
+  }
+}
+
 function initWallpaperPicker() {
   const close = () => closeWallpapers();
   // 入口改到设置弹窗里的「选壁纸…」（cfg-wall）；顶栏不再单独放按钮
@@ -124,11 +182,60 @@ function initWallpaperPicker() {
   $("wp").addEventListener("click", (e) => { if (e.target === $("wp")) close(); });
   $("wp-q").addEventListener("input", (e) => { WALL.q = e.target.value; renderWallpapers(); });
   $("wp-list").addEventListener("click", (e) => {
+    const del = e.target.closest("button[data-del]");
+    if (del) { deleteWallpaper(del.dataset.del); return; }
     const b = e.target.closest("button[data-slot]");    // ⚠ 别用 data-theme：那会套上主题变量
     if (!b) return;
     pickWallpaper(b.dataset.slot, b.dataset.id)
       .catch((err) => alert("设置壁纸失败：" + err.message));
   });
+  // ★拖拽导入（也可以点「选择文件…」）
+  const drop = $("wp-drop");
+  const finput = $("wp-file");
+  if (drop && finput) {
+    drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", (e) => {
+      e.preventDefault();
+      drop.classList.remove("over");
+      const fs = e.dataTransfer && e.dataTransfer.files;
+      if (fs && fs.length) uploadWallpapers(fs);
+    });
+    $("wp-drop-pick").addEventListener("click", () => finput.click());
+    finput.addEventListener("change", () => {
+      if (finput.files && finput.files.length) uploadWallpapers(finput.files);
+      finput.value = "";
+    });
+  }
+  // ★选择器开着时整页接收拖拽：聊天区有一个 **window 级** drop（`drop-veil` + addFiles）会抢文件，
+  //   所以这里用**捕获阶段**先吃下并 stopPropagation —— 否则拖进来的图会变成聊天附件（用户实测踩到）。
+  const pickerOpen = () => !$("wp").hidden;
+  const hasFiles = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || []).indexOf("Files") >= 0;
+  document.addEventListener("dragenter", (e) => {
+    if (!pickerOpen() || !hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (drop) drop.classList.add("over");        // 整页拖入都点亮虚线区
+  }, true);
+  document.addEventListener("dragover", (e) => {
+    if (!pickerOpen() || !hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try { e.dataTransfer.dropEffect = "copy"; } catch { /* 忽略 */ }
+    if (drop) drop.classList.add("over");
+  }, true);
+  document.addEventListener("dragleave", (e) => {
+    if (!pickerOpen()) return;
+    if (!e.relatedTarget && drop) drop.classList.remove("over");
+  }, true);
+  document.addEventListener("drop", (e) => {
+    if (!pickerOpen() || !hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (drop) drop.classList.remove("over");
+    const fs = e.dataTransfer && e.dataTransfer.files;
+    if (fs && fs.length) uploadWallpapers(fs);
+  }, true);
   $("wp-reset").addEventListener("click", () => {
     pickWallpaper("hiru", null)
       .catch((err) => alert("恢复默认失败：" + err.message));
@@ -762,7 +869,7 @@ function modelRefUsable(ref) {
 }
 
 /* 模型官方图标（本地素材，由 tools/fetch_model_icons.py 下载；OpenCode 接口本身没有图标字段）。
-   解析顺序：模型 id → family → family(去掉 -free) → providerID；都没有就用「青铜字母徽章」。
+   解析顺序：模型 id → family → family(去掉 -free) → providerID；都没有就用「黄铜字母徽章」。
    muse-spark / big-pickle 没有公开品牌标 → 走字母徽章。 */
 const MODEL_ICONS = {
   "deepseek": "deepseek", "deepseek-flash": "deepseek", "deepseek-thinking": "deepseek",
@@ -796,7 +903,7 @@ function iconKeyFor(ref) {
 /** 图标 HTML：有官方图标用图标；没有就用字母徽章（都不显示模型名，名字在 tooltip / 列表里） */
 function modelIconHtml(ref, small) {
   const cls = "micon" + (small ? " sm" : "");
-  if (!ref) {   // 还没选模型 → 用龙族校徽占位
+  if (!ref) {   // 还没选模型 → 用圣徽占位
     return `<svg class="${cls} micon-tree" aria-hidden="true"><use href="#mk-tree"></use></svg>`;
   }
   const key = iconKeyFor(modelFull(ref));

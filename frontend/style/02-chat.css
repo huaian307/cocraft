@@ -175,6 +175,17 @@ details.part .body.stream { max-height: none; overflow: visible; }
   border: 1px solid var(--line); border-radius: 6px; background: #fff;
   box-shadow: var(--shadow);
 }
+/* ★默认主图 = 圣徽（尖拱窗 + 烛焰）—— 不用任何同人图；用户自己塞图后就换成图片 */
+.empty .hero-card.hero-mk {
+  display: flex; align-items: center; justify-content: center;
+  aspect-ratio: 1 / 1; width: 40%; max-width: 168px;
+  background: color-mix(in srgb, var(--gold) 6%, transparent);
+  border-color: color-mix(in srgb, var(--gold) 26%, transparent);
+  border-radius: 50% 50% 4px 4px;
+  color: var(--gold);
+  filter: drop-shadow(0 6px 22px rgba(224, 162, 74, .22));
+}
+.empty .hero-card.hero-mk svg { width: 58%; height: 58%; }
 .empty .stickers { display: flex; gap: 10px; justify-content: center; margin-top: 18px; }
 .empty .stickers img {
   height: 84px; width: auto; border-radius: 4px; background: #fff;
@@ -182,12 +193,22 @@ details.part .body.stream { max-height: none; overflow: visible; }
 }
 .empty .stickers img:nth-child(1) { transform: rotate(-3.5deg); }
 .empty .stickers img:nth-child(2) { transform: rotate(2.5deg); }
-.empty .credit { margin-top: 16px; font-size: 10.5px; color: var(--ink-faint); }
+.empty .credit { margin-top: 16px; font-size: 10.5px; color: var(--ink-faint);
+  text-shadow: 0 0 6px rgba(0,0,0,.72), 0 0 14px rgba(0,0,0,.55); }
 
 /* ---------- 昼主题：背景插画（你指定的壁纸）---------- */
 /* 想更明显 → 把下面三个 rgba 的透明度调小；想更淡就调大。当前值让插画约占 4~6 成。 */
 /* ---------- 静态背景：两层交叉淡入（换主题只动 opacity，不重新解码/光栅化） ---------- */
 #static-bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+/* 自定义静态背景（用户拖进来的图片）：和 #static-bg 同层；动态壁纸/场景在时会自动藏起来 */
+#custom-bg {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none; display: none;
+  background-position: center; background-size: cover; background-repeat: no-repeat;
+  filter: brightness(var(--bg-dim, 1));
+}
+html.has-custom-bg #custom-bg { display: block; }
+html.has-custom-bg #static-bg,
+html.has-custom-bg #live-bg { display: none !important; }
 #static-bg .sb {
   position: absolute; inset: 0; opacity: 0; transition: opacity .5s ease;
   background-position: center 16%; background-size: cover; background-repeat: no-repeat;
@@ -205,6 +226,15 @@ html.glass:not([data-theme-user]) #static-bg .sb[data-bg="hiru"] {
   background-image:
     linear-gradient(180deg, rgba(10,10,14,.34) 0%, rgba(10,10,14,.46) 55%, rgba(10,10,14,.60) 100%),
     url("/assets/hiru-bg.jpg");
+}
+/* ★「圣烛教堂」(chapel) 的静态背景：同一张官方壁纸（白袍修女 + 蜡烛），
+   压一层暖黑纱 + 底部一团烛光余晖 + 轻微降亮，跟暗色底盘配套。 */
+#static-bg .sb[data-bg="chapel"] {
+  background-image:
+    radial-gradient(58% 42% at 50% 88%, rgba(230,165,72,.12), rgba(230,165,72,0) 72%),
+    linear-gradient(180deg, rgba(10,8,6,.30) 0%, rgba(10,8,6,.22) 55%, rgba(10,8,6,.50) 100%),
+    url("/assets/hiru-bg.jpg");
+  filter: brightness(.92) saturate(1.05);
 }
 html.glass .msg .who,
 html.glass .notice,
@@ -273,6 +303,18 @@ html.has-live #static-bg { display: none; }
   opacity: 0;
 }
 .lb-video.ready { opacity: 1; transition: opacity .25s ease; }
+
+/* 场景壁纸（WebWallGL）：渲染到 canvas 上，**只在收起侧栏时跑**（展开即 pause，保留最后一帧）。
+   默认 opacity:0，等第一次真的挂上（.ready）才淡入 —— 挂载期间由 #live-bg 的静态图顶着，不黑屏。 */
+.lb-scene {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  display: block; z-index: 2; opacity: 0; pointer-events: none;
+  transition: opacity .35s ease;
+}
+.lb-scene.ready { opacity: 1; }
+/* 定格层：展开侧栏时把 WebGL 最后一帧画进 2D 画布，盖在 GL 画布上（和视频"暂停那一帧"同一观感） */
+.lb-freeze { z-index: 3; }
+html.has-scene .lb-video { display: none !important; }
 
 /* 纸色蒙层：跟静态壁纸用同一组渐变 —— 保证读字清楚、浓淡一致 */
 #live-bg .lb-wash {
@@ -502,7 +544,7 @@ html.cfg-resizing #app { transition: none; }
 .cfg-foot { display: flex; align-items: center; gap: 10px;
             border-top: 1px solid var(--line-soft); padding-top: 10px; font-size: 11.5px; }
 .cfg-foot button { margin-left: auto; }
-/* ---------- 输入区：绘梨衣的小本子 ---------- */
+/* ---------- 输入区：祈祷书 ---------- */
 
 #composer {
   position: relative;
@@ -552,7 +594,7 @@ html.cfg-resizing #app { transition: none; }
   background: var(--paper); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius);
   padding: 10px 13px; font: inherit; outline: none; line-height: 26px;
-  /* 横线格：小本子的书写线 */
+  /* 横线格：祈祷书的书写线 */
   background-image: repeating-linear-gradient(
     to bottom, transparent 0 25px, var(--line-soft) 25px 26px);
   background-attachment: local;
@@ -639,7 +681,7 @@ button:hover:not(:disabled) {
   background: var(--hi-wash);
 }
 button:disabled { opacity: .4; cursor: not-allowed; }
-/* 主按钮：绯袴 —— 实心绯红 */
+/* 主按钮：祭披红 —— 实心绯红 */
 button.primary {
   background: var(--hi); border-color: var(--hi); color: #fff; font-weight: 600;
 }
@@ -668,12 +710,31 @@ button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 1
   font-size: 13px;
 }
 
-/* ---------- 空状态：小黄鸭（Sakura & 絵梨衣 のDuck） ---------- */
+/* ---------- 空状态：烛光首屏（主图 / 贴纸 / 三行文案都可在「壁纸与外观」里换） ---------- */
 
 .empty {
   max-width: 880px; margin: 0 auto; padding: 48px 20px; text-align: center;
   color: var(--ink-faint);
 }
+/* 首屏文案：垫一块很淡的暖黑玻璃牌 —— 壁纸亮部（白袍 / 烛光）上白字才读得清 */
+.empty .empty-copy {
+  display: inline-block; margin: 2px auto 0; padding: 10px 18px;
+  border-radius: 10px;
+  background: rgba(14, 10, 8, .46);
+  border: 1px solid color-mix(in srgb, var(--gold) 20%, transparent);
+  backdrop-filter: blur(6px) saturate(1.05);
+  -webkit-backdrop-filter: blur(6px) saturate(1.05);
+  box-shadow: inset 0 1px 0 rgba(255, 214, 150, .08);
+}
 .empty .duck { display: block; margin: 0 auto 14px; }
 .empty .duck-line1 { font-family: var(--serif); font-size: 14px; color: var(--ink-dim); letter-spacing: .06em; }
 .empty .duck-line2 { font-size: 11px; margin-top: 5px; font-family: var(--mono); letter-spacing: .06em; }
+
+/* ★ chapel：把那张**纸白蒙层**（`.lb-wash`）换成**暖黑暗纱**。
+   为什么：`.lb-wash` 是给浅色主题写的 rgba(250,247,242,.34~.58) 白纱，`z-index: 3` 盖在
+   视频/场景**整屏**之上；以前只有 `[data-theme="hiru"]` 会隐藏它 → chapel 下整块壁纸被糊成灰白
+   （用户报「全部的白色蒙版都不要」就是这个）。暗色主题要的是暗纱，不是白纱。 */
+html[data-theme="chapel"] #live-bg .lb-wash {
+  background: linear-gradient(180deg,
+    rgba(10,8,6,.30) 0%, rgba(10,8,6,.22) 55%, rgba(10,8,6,.50) 100%);
+}

@@ -1,11 +1,13 @@
 /* 11-engine.js —— 设置 / 引擎 / 模式 / 技能 / 可逆执行 / 向导 / ACP agent / 安装 / 编辑（P1 从 app.js 拆出，纯搬运不改逻辑） */
 
-/* ---------------- 动态壁纸：Wallpaper Engine 的 mp4 原片 ----------------
- * 收起侧栏 → **缓慢启动**：转速由静止慢慢加上去；
+/* ---------------- 动态壁纸：Wallpaper Engine 的 mp4 原片 / Scene 场景 ----------------
+ * 收起侧栏 → **缓慢启动**：转速由静止慢慢加上去（场景壁纸则开始渲染）。
  * 展开会话 → **缓慢停止**：转速慢慢减到停 —— **停住的那一帧就是会话界面的静态背景**
- *            （直接把视频暂停在那里，不再抓帧、不再有 #bg-freeze 层）。
+ *            （直接把视频暂停在那里，不再抓帧、不再有 #bg-freeze 层；场景壁纸直接 pause）。
  * 没有可用原片（没装 WE / 没订阅 / 系统要求减少动态）→ 两侧都用主题自带的静态壁纸，不做动画。
- * 素材与选择由 server.py 提供：/live/wallpapers（生效清单）、/live/list + /live/pick（选择器）。 */
+ * 素材与选择由 server.py 提供：/live/wallpapers（生效清单）、/live/list + /live/pick（选择器）。
+ * ⚠ scene 壁纸走 **WebWallGL**（第三方 MIT 构建产物，见 frontend/vendor/webwallgl/NOTICE.md）：
+ *   浏览器 WebGL2 实时渲染 scene.pkg，**不需要 Wallpaper Engine 在后台跑**、不抓帧。 */
 
 let liveRate = 0.8;             // 正常播放速度（1 = 原速）。可在设置面板里调（SET.rate）
 const LIVE_RAMP_IN = 600;       // 缓慢启动：从静止加到 liveRate 用多久（ms）
@@ -15,6 +17,7 @@ const LIVE_RAMP_OUT = 1100;     // 缓慢停止：从当前速度减到静止用
 const LIVE_START_RATE = 0.3;
 let liveReload = null;          // initLiveBg 里赋值，供壁纸选择器选完立刻换片
 let liveApply = null;           // initLiveBg 里赋值：设置一变就立刻作用到动态壁纸
+const SCENE_LIB = "/vendor/webwallgl/webwallgl.global.min.js";   // 懒加载，不进首屏
 
 /* ---------------- 界面设置（顶栏「设」按钮）----------------
  * 存在 localStorage，改完立刻生效。以后新增的可调项也往这里放。
@@ -25,6 +28,8 @@ const SET_DEFAULT = {
   dimHiru: 100, blur: 28, rate: 80,
   zoom: 100,                         // ★界面缩放（%）：整页等比放大/缩小（文字/间距/图标一起）
   live: true, taskbar: true, spectrumSides: true, spectrumSidesH: 100, spectrumSidesGain: 120,
+  // ★「会话界面也动」：开启后**展开侧栏也继续渲染/播放**（视频与场景壁纸都适用）；关掉 = 只有收起侧栏才动
+  liveAlways: false,
   petals: true, gold: true, bamboo: true, zh: true,
   glass: true,                       // ★液态玻璃皮肤（面板半透明磨砂 + 壁纸透出）
   // ★可逆执行：每轮工作区快照（发消息前留底 → 「撤销这一轮」）。
@@ -42,12 +47,14 @@ const SET = Object.assign({}, SET_DEFAULT);
 const APPE = { images: {}, version: 0 };
 const HERO_DEFAULT = {
   l1: "这个会话还是一张白纸。",
-  l2: "Sakura ＆ 絵梨衣 のDuck",
-  credit: "同人图 · 仅本地自用，版权归原作者所有",
+  l2: "烛火未熄，静候你的话",
+  credit: "烛在暗处，光在其中",
 };
 
 function loadSettings() {
   try { Object.assign(SET, JSON.parse(localStorage.getItem(SET_KEY) || "{}")); } catch { /* 隐私模式 */ }
+  // ★老默认文案迁移：以前默认那句带「絵梨衣」（已经整体去掉）→ 存着旧默认的当"没设过"
+  if (String(SET.heroL2 || "").trim() === "Sakura ＆ 絵梨衣 のDuck") SET.heroL2 = "";
 }
 
 function saveSettings() {
@@ -178,6 +185,18 @@ async function loadEngineStatus() {
 }
 
 /** 切换引擎：POST /engine，再清空当前会话并重载列表（不同引擎的会话不通用） */
+/** 能不能把「上一条会话」接续进 ACP？
+ *  ★只有 `opencode-acp` 与 OpenCode **共用同一个历史库**；codex / dsh 之类根本不认识那条 sessionId
+ *    → 以前硬接会在列表里多出一条**同名空会话**（用户报过）。 */
+async function setupCanContinueFromOpenCode() {
+  try {
+    const r = await api("/engine/acp/agents");
+    const active = String((r && r.active) || "");
+    if (active) { ACP.active = active; ACP.list = (r && r.agents) || ACP.list; }
+    return active === "opencode-acp";
+  } catch { return false; }
+}
+
 async function setEngine(id) {
   if (!id || id === ENGINE.active) return;
   // ★ 跨引擎接续：记下当前这条会话在 **agent 侧**的 id（ACP 用 agentSessionId，OpenCode 就是 id 本身），
@@ -230,7 +249,7 @@ async function setEngine(id) {
         await openSession(same.id);
         resumed = true;
         setBanner(`已切换对话引擎：${id}（已接续当前会话）`);
-      } else if (id === "acp") {
+      } else if (id === "acp" && await setupCanContinueFromOpenCode()) {
         try {
           const r = await api("/api/session/import", { method: "POST",
             body: JSON.stringify({ id: prev.agent, title: prev.title }) });
@@ -1367,7 +1386,7 @@ async function doImport(remoteId) {
 const SETUP_KEY = "cocraft.setup.v1";
 const SETUP = { open: false, engine: "", models: [] };
 
-/** 首次启动 / 手动重跑：选默认引擎与 agent，并把模型清单拉出来 */
+/** 首次启动 / 手动重跑：**一页填完**（引擎 / Agent / Key / 默认模型） */
 async function openSetup() {
   const box = $("setup");
   if (!box || SETUP.open) return;
@@ -1375,12 +1394,11 @@ async function openSetup() {
   SETUP.models = [];
   box.hidden = false;
   OVERLAY.push("setup", closeSetup);
-  $("setup-model-row").hidden = true;
   $("setup-agent-row").hidden = true;
-  $("setup-done").hidden = true;
-  $("setup-next").hidden = false;
-  $("setup-next").disabled = false;
-  $("setup-note").textContent = "首次设置只做一次；可随时在设置里重跑。";
+  $("setup-key-row").hidden = true;
+  const done = $("setup-done");
+  if (done) { done.hidden = false; done.disabled = false; }
+  $("setup-note").textContent = "填完点「完成并重启」；只做一次，之后在设置里可重跑。";
   let st = null;
   try { st = await api("/engine/status"); } catch { st = null; }
   const avail = (st && st.available) || ["opencode", "acp"];
@@ -1398,106 +1416,136 @@ async function openSetup() {
     if (ok) $("setup-engine").value = ok.id;
     $("setup-cur").textContent = `当前引擎「${byId[cur].label || cur}」未就绪`
       + `${byId[cur].error ? "：" + byId[cur].error : ""}`
-      + (ok ? `；已先帮你选到可用的「${ok.label || ok.id}」。` : "；下面没有可用的引擎，可先「跳过」。");
-  } else {
-    $("setup-cur").textContent = "选一个引擎；以后可在设置里重跑这个向导。";
+      + (ok ? `；已先帮你选到可用的「${ok.label || ok.id}」。` : "；下面没有可用的引擎，可先「稍后再说」。");
   }
   await setupEngineChanged();
 }
 
-/** 引擎变化：ACP 才需要选 agent（和填模型 Key） */
+/** 引擎变化：ACP 才需要 agent + Key；选完立刻套用（否则模型清单还是旧引擎的） */
 async function setupEngineChanged() {
   const engine = $("setup-engine").value;
   SETUP.engine = engine;
-  const row = $("setup-agent-row");
-  const keyRow = $("setup-key-row");
-  if (engine !== "acp") {
-    row.hidden = true;
-    if (keyRow) keyRow.hidden = true;
-    return;
+  const isAcp = engine === "acp";
+  $("setup-agent-row").hidden = !isAcp;
+  $("setup-key-row").hidden = !isAcp;
+  if (isAcp) {
+    await setupFillAgents();
+    await loadApiKeyRow("setup");            // 只更新变量名 / 说明，**不动已输入的值**
   }
-  row.hidden = false;
-  if (keyRow) keyRow.hidden = false;
+  // ★说明跟着引擎变：OpenCode 只用它自己的登录/配置，不需要在这里填 Key
+  if (!SETUP.curDefault) SETUP.curDefault = $("setup-cur").textContent;
+  if (isAcp) {
+    $("setup-cur").textContent = "对话引擎 / Agent / 模型 Key / 默认模型 —— 一页填完，点「完成并重启」即可。";
+  } else {
+    $("setup-cur").textContent = "OpenCode 引擎：只需要选好默认模型（模型 Key 走 OpenCode 自己的登录/配置，不在这里填）。";
+  }
+  await setupApplyChoice(isAcp);
+  await setupLoadModels();
+  $("setup-note").textContent = isAcp
+    ? "Key 留空 = 稍后再填；模型清单拉不到也能先完成。"
+    : "选好默认模型后点「完成并重启」。";
+}
+
+/** 列 agent（保留当前选择，别把用户刚选的冲掉） */
+async function setupFillAgents() {
   const sel = $("setup-agent");
+  const prev = sel.value;
   sel.innerHTML = `<option value="">加载中…</option>`;
   try {
     await loadAcpAgents();
-    await loadApiKeyRow("setup");       // Key 的变量名按当前 agent 的 provider 猜
     const list = (ACP.list || []).filter((a) => a.available);
     if (!list.length) {
       sel.innerHTML = `<option value="">没有可用 agent</option>`;
-      $("setup-note").textContent = "没有检测到可用的 ACP agent；可以跳过，之后到设置 → ACP 代理里添加。";
+      $("setup-note").textContent = "没有检测到可用的 ACP agent；可以「稍后再说」，之后到设置 → ACP 代理里添加。";
       return;
     }
     sel.innerHTML = list.map((a) =>
       `<option value="${esc(a.id)}">${esc(a.label || a.id)}</option>`).join("");
+    const keep = prev || ACP.active;
+    if (keep && list.some((a) => a.id === keep)) sel.value = keep;
   } catch {
     sel.innerHTML = `<option value="">拿不到 agent 列表</option>`;
   }
 }
 
-/** 下一步：应用引擎 / agent，并尝试把模型清单取回来 */
-async function setupNext() {
+/** 把「引擎 / agent」套到后端（幂等；已经一致就什么都不做） */
+async function setupApplyChoice(withAgent) {
   const engine = $("setup-engine").value;
-  const btn = $("setup-next");
-  btn.disabled = true;
-  $("setup-note").textContent = "正在应用…";
-  try {
-    if (ENGINE.active !== engine) await setEngine(engine);
-    if (engine === "acp") {
-      const aid = $("setup-agent").value;
-      if (aid && aid !== ACP.active) {
-        const r = await api("/engine/acp/agents", { method: "POST", body: JSON.stringify({ id: aid }) });
-        ACP.active = (r && r.active) || aid;
-        ACP.list = (r && r.agents) || ACP.list;
-        if (typeof updateAcpRow === "function") updateAcpRow();
-      }
-    }
-    let list = [];
-    try { list = unwrap(await api("/api/model")) || []; } catch { list = []; }
-    if (!list.length && engine === "acp") {
-      // ACP 的模型清单挂在会话上：一条都没有就先建一条，把 agent 拉起来
-      try {
-        const existing = unwrap(await api("/api/session?limit=1")) || [];
-        if (!existing.length) await api("/api/session", { method: "POST", body: "{}" });
-        list = unwrap(await api("/api/model")) || [];
-      } catch { list = []; }
-    }
-    SETUP.models = list;
-    $("setup-model-row").hidden = false;
-    const msel = $("setup-model");
-    if (list.length) {
-      msel.innerHTML = list.map((m) =>
-        `<option value="${esc(m.id)}">${esc(m.name || m.id)}</option>`).join("");
-      $("setup-note").textContent = "选好默认模型后点「完成」。";
-    } else {
-      msel.innerHTML = `<option value="">（暂时拿不到模型清单）</option>`;
-      $("setup-note").textContent = "没拿到模型清单，也可以先完成；之后打开模型弹窗会再拉。";
-    }
-    $("setup-next").hidden = true;
-    $("setup-done").hidden = false;
-  } catch (err) {
-    $("setup-note").textContent = "应用失败：" + (err && err.message ? err.message : err);
-  } finally {
-    btn.disabled = false;
+  if (engine && ENGINE.active !== engine) {
+    try { await setEngine(engine); } catch { /* 失败留给「完成」再报 */ }
+  }
+  if (!withAgent) return;
+  const aid = $("setup-agent").value;
+  if (aid && aid !== ACP.active) {
+    try {
+      const r = await api("/engine/acp/agents", { method: "POST", body: JSON.stringify({ id: aid }) });
+      ACP.active = (r && r.active) || aid;
+      ACP.list = (r && r.agents) || ACP.list;
+      if (typeof updateAcpRow === "function") updateAcpRow();
+    } catch { /* 同上 */ }
   }
 }
 
-/** 完成：记住默认模型 + 可选保存 Key + 标记已设置，然后刷新 */
-async function setupDone() {
-  const mid = $("setup-model").value;
-  if (mid) {
-    const m = (SETUP.models || []).find((x) => String(x.id) === String(mid)) || {};
-    saveDefaultModel({ id: mid, providerID: m.providerID || "", variant: "default" });
+/** 拉模型清单填进 ④（拿不到就留一句人话，不挡着完成） */
+async function setupLoadModels() {
+  const engine = $("setup-engine").value;
+  const msel = $("setup-model");
+  if (!msel) return;
+  msel.innerHTML = `<option value="">加载中…</option>`;
+  let list = [];
+  try { list = unwrap(await api("/api/model")) || []; } catch { list = []; }
+  if (!list.length && engine === "acp") {
+    // ACP 的清单挂在会话上：一条都没有就先建一条，把 agent 拉起来
+    try {
+      const existing = unwrap(await api("/api/session?limit=1")) || [];
+      if (!existing.length) await api("/api/session", { method: "POST", body: "{}" });
+      list = unwrap(await api("/api/model")) || [];
+    } catch { list = []; }
   }
-  // 向导里填了 Key 就顺手保存（留空则不动现有的）
+  SETUP.models = list;
+  if (!list.length) {
+    msel.innerHTML = `<option value="">（暂时拿不到模型清单，可以先完成）</option>`;
+    return;
+  }
+  msel.innerHTML = list.map((m) =>
+    `<option value="${esc(m.id)}">${esc(m.name || m.id)}</option>`).join("");
+  // 优先选本地记着的默认模型，没有就第一个
+  let want = "";
+  try { want = (defaultModel() || {}).id || ""; } catch { want = ""; }
+  if (want && list.some((m) => String(m.id) === String(want))) msel.value = want;
+}
+
+/** 完成：存 Key + 默认模型 → 标记已设置 → 重启页面（一次搞定，不再「下一步」） */
+async function setupDone() {
+  const btn = $("setup-done");
+  if (btn) btn.disabled = true;
+  const engine = $("setup-engine").value;
+  let mid = "";
   try {
+    await setupApplyChoice(engine === "acp");
+    // 填了 Key 才保存；留空 = 不动现有凭据
     const kv = String(($("setup-key-value") || {}).value || "").trim();
-    if (kv) await saveApiKey("setup");
-  } catch { /* 存不上也不拦着走完向导 */ }
+    if (kv) {
+      const ok = await saveApiKey("setup");
+      if (!ok) {
+        if (btn) btn.disabled = false;
+        $("setup-note").textContent = "Key 没存上（" + (($("setup-key-note") || {}).textContent || "") + "）；改一下再试，或留空跳过。";
+        return;
+      }
+    }
+    mid = $("setup-model").value || "";
+    if (mid) {
+      const m = (SETUP.models || []).find((x) => String(x.id) === String(mid)) || {};
+      saveDefaultModel({ id: mid, providerID: m.providerID || "", variant: "default" });
+    }
+  } catch (err) {
+    if (btn) btn.disabled = false;
+    $("setup-note").textContent = "保存失败：" + (err && err.message ? err.message : err);
+    return;
+  }
   setupMarkDone();
   closeSetup();
-  setBanner(`首次设置完成：引擎 ${SETUP.engine || $("setup-engine").value}${mid ? " · 模型 " + mid : ""}`);
+  setBanner(`首次设置完成：引擎 ${engine}${mid ? " · 模型 " + mid : ""}`);
   try { reloading = true; } catch { /* 旧版没有这个变量 */ }
   setTimeout(() => { try { location.reload(); } catch { /* ignore */ } }, 400);
 }
@@ -2144,6 +2192,7 @@ function renderSettings() {
   put("cfg-spec-h", SET.spectrumSidesH, SET.spectrumSidesH + "%");
   put("cfg-spec-gain", SET.spectrumSidesGain, SET.spectrumSidesGain + "%");
   [["cfg-live", SET.live], ["cfg-taskbar", SET.taskbar], ["cfg-spec-sides", SET.spectrumSides],
+   ["wpc-always", SET.liveAlways],
    ["cfg-petals", SET.petals], ["cfg-gold", SET.gold], ["cfg-bamboo", SET.bamboo],
    ["cfg-zh", SET.zh], ["cfg-glass", SET.glass],
    ["cfg-turnsnap", SET.turnSnap]].forEach(([id, on]) => {
@@ -2191,6 +2240,22 @@ function cfgClose() {
   document.documentElement.classList.remove("cfg-open");
   syncDrawerOverlap();
   OVERLAY.pop("cfg");
+}
+
+/** ★壁纸与外观独立页（`#wpc`）：那些行**静态就写在 `#wpc-body` 里**（背景 / 外观 / 身份与素材 /
+ *  空会话首屏 / 主题）。不再运行时 appendChild 搬 —— 早先那套（`WPC_ROWS` + `wpcBuild()`）必须在
+ *  "正确时机"搬一次，否则每次页面重载后设置抽屉里又会冒出整套壁纸设置（`0.2.52` 的 bug）。
+ *  ⚠ 以后加新的外观项：**直接写进 `#wpc-body`**（分节用 `.wpc-sec`），别再回到搬节点那条路。 */
+
+function wpcOpen() {
+  $("wpc").hidden = false;
+  renderSettings();
+  OVERLAY.push("wpc", wpcClose);
+}
+
+function wpcClose() {
+  $("wpc").hidden = true;
+  OVERLAY.pop("wpc");
 }
 
 /** ★设置项里的「说明」收进 tooltip：面板上只留标题，**鼠标悬停那一行**才显示（别把面板塞满碎碎念）。
@@ -2268,7 +2333,6 @@ function initSettings() {
   $("cfg-acp-btn").addEventListener("click", openAgents);
   $("cfg-setup").addEventListener("click", () => { close(); openSetup(); });
   $("setup-engine").addEventListener("change", setupEngineChanged);
-  $("setup-next").addEventListener("click", setupNext);
   $("setup-done").addEventListener("click", setupDone);
   $("setup-skip").addEventListener("click", setupSkip);
   $("setup-close").addEventListener("click", setupSkip);
@@ -2381,7 +2445,6 @@ function initSettings() {
     const row = e.target.closest("[data-upath]");
     if (row) undoToggleFile(row);
   });
-  $("setup-key-save").addEventListener("click", () => saveApiKey("setup"));
   // ★模型凭据（多 Key）：添加 / 编辑 / 删除 / 设默认
   $("cred-add").addEventListener("click", () => openCredEdit(""));
   $("cred-close").addEventListener("click", closeCredEdit);
@@ -2456,7 +2519,11 @@ function initSettings() {
   });
   $("cfg-wall-root-pick").addEventListener("click", pickWallpaperRoot);
   $("cfg-wall-root-auto").addEventListener("click", () => saveWallpaperRoot(""));
-  $("cfg-wall").addEventListener("click", () => { close(); openWallpapers(); });
+  $("cfg-wall").addEventListener("click", () => { wpcClose(); openWallpapers(); });
+  $("cfg-wallpaper").addEventListener("click", () => { close(); wpcOpen(); });
+  $("wpc-close").addEventListener("click", () => wpcClose());
+  $("wpc").addEventListener("click", (e) => { if (e.target === $("wpc")) wpcClose(); });
+  $("wpc-always").addEventListener("click", () => setSetting("liveAlways", !SET.liveAlways));
   $("cfg-ck-netease").addEventListener("click", () => pasteCookie("netease"));
   $("cfg-ck-qq").addEventListener("click", () => pasteCookie("qq"));
   $("cfg-reset").addEventListener("click", () => {
@@ -2487,6 +2554,11 @@ async function initLiveBg() {
   const A = $("live-video"), B = $("live-video2");
   if (!box || !A || !B) return;
   const vids = [A, B];
+  const customBg = $("custom-bg");
+  const hideCustomBg = () => {
+    root.classList.remove("has-custom-bg");
+    if (customBg) customBg.style.backgroundImage = "";
+  };
   const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
   let urls = null;
   try { urls = await api("/live/wallpapers"); } catch { urls = null; }
@@ -2499,6 +2571,7 @@ async function initLiveBg() {
 
   const themeNow = () => "hiru";      // 夜主题已删除
   const urlOf = (t) => ((urls && urls[t]) || "");
+  const kindOf = (t) => ((urls && urls[t + "Kind"]) || "video");   // video | scene
   const other = (v) => (v === A ? B : A);
 
   /** 量当前帧的平均亮度（只在判"是不是片头黑场"时才算：**不截图、不编码**） */
@@ -2575,6 +2648,7 @@ async function initLiveBg() {
 
   const hideAll = () => {
     root.classList.remove("has-live");
+    sceneDrop();
     clearInterval(rampTimer); rampTimer = null;
     clearTimeout(fadeTimer); fadeTimer = null;
     vids.forEach((v) => { try { v.pause(); } catch { /* 忽略 */ } v.classList.remove("ready"); });
@@ -2612,22 +2686,201 @@ async function initLiveBg() {
     }
   };
 
+  /* ---------- 场景（scene）壁纸：WebWallGL 实时渲染 ----------
+   * 只在**收起重侧栏**时跑（和视频壁纸同一套节奏）；展开即 pause（保留最后一帧）。
+   * 挂载失败 / WebGL2 不可用 / 渲染报错 → 扣掉 has-live，退回主题静态图（只提示一次）。 */
+  let sceneLibP = null;            // 懒加载 vendor 脚本（失败可重试）
+  let sceneInst = null;            // WebWallGL 实例
+  let sceneBase = "";              // 当前挂载的目录 URL
+  let sceneBusy = false;           // 正在挂载（防重入）
+  let sceneBad = "";               // 已知挂不上的目录（同一张不反复重试）
+
+  const loadSceneLib = () => {
+    if (window.WebWallGL) return Promise.resolve(window.WebWallGL);
+    if (sceneLibP) return sceneLibP;
+    sceneLibP = new Promise((done, fail) => {
+      const s = document.createElement("script");
+      s.src = SCENE_LIB;
+      s.async = true;
+      s.onload = () => (window.WebWallGL ? done(window.WebWallGL) : fail(new Error("WebWallGL 未挂到 window")));
+      s.onerror = () => fail(new Error("vendor 脚本加载失败"));
+      document.head.appendChild(s);
+    });
+    sceneLibP.catch(() => { sceneLibP = null; });   // 失败不固化，下次还能重试
+    return sceneLibP;
+  };
+
+  const sceneCanvas = () => {
+    let c = box.querySelector(".lb-scene");
+    if (!c) {
+      c = document.createElement("canvas");
+      c.className = "lb-scene";
+      box.appendChild(c);
+    }
+    return c;
+  };
+
+  /** 定格层：把 WebGL 最后一帧画进 2D 画布（展开侧栏时当静态背景，和视频"暂停在那一帧"对齐）。
+   *  ⚠ WebGL 画布的绘制缓冲默认在合成后被清空 → **必须和库的绘制同一帧里 drawImage**，
+   *  所以这里用 rAF（库的循环先注册 → 同帧里我们先画完再 pause）。抓不到就退回静态图。 */
+  const freezeCanvas = () => {
+    let c = box.querySelector(".lb-freeze");
+    if (!c) {
+      c = document.createElement("canvas");
+      c.className = "lb-scene lb-freeze";
+      box.appendChild(c);
+    }
+    return c;
+  };
+
+  const sceneFreeze = (inst) => {
+    const gl = inst && inst.canvas;
+    if (!gl) return;
+    requestAnimationFrame(() => {
+      const fz = freezeCanvas();
+      try {
+        const r = gl.getBoundingClientRect();
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.max(1, Math.round((r.width || 1280) * dpr));
+        const h = Math.max(1, Math.round((r.height || 800) * dpr));
+        if (fz.width !== w) fz.width = w;
+        if (fz.height !== h) fz.height = h;
+        const g = fz.getContext("2d");
+        g.clearRect(0, 0, w, h);
+        g.drawImage(gl, 0, 0, w, h);          // 同帧读：此刻缓冲还在
+        // 抓没抓到：缩到 16×9 看一眼，全黑当失败（别把黑帧当背景）
+        const t = document.createElement("canvas");
+        t.width = 16; t.height = 9;
+        const tg = t.getContext("2d");
+        tg.drawImage(fz, 0, 0, 16, 9);
+        const d = tg.getImageData(0, 0, 16, 9).data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
+        if (!sum) throw new Error("blank frame");
+        fz.classList.add("ready");
+        gl.classList.remove("ready");
+      } catch {
+        fz.classList.remove("ready");
+        gl.classList.remove("ready");        // 抓不到 → 交回主题静态图（不会黑）
+        root.classList.remove("has-scene");
+      } finally {
+        try { inst.pause(); } catch { /* 忽略 */ }
+      }
+    });
+  };
+
+  const sceneDrop = () => {
+    if (sceneInst) {
+      try { sceneInst.pause(); } catch { /* 忽略 */ }
+      try { sceneInst.destroy({ releasePkgCache: true }); } catch { /* 忽略 */ }
+      sceneInst = null;
+    }
+    sceneBase = "";
+    [".lb-scene", ".lb-freeze"].forEach((sel) => {
+      const c = box.querySelector(sel);
+      if (c) { c.classList.remove("ready"); c.remove(); }   // 连画布一起撤：下次重挂拿干净上下文
+    });
+    root.classList.remove("has-scene");
+  };
+
+  const sceneApply = (base, collapsed, mine) => {
+    if (sceneBad === base) { hideAll(); return; }        // 这张已知挂不上 → 退回静态图
+    if (sceneInst) {
+      if (sceneBase !== base) { sceneDrop(); }            // 换片
+      else {                                             // 已经挂好：只切播放状态
+        const gl = box.querySelector(".lb-scene");
+        const fz = box.querySelector(".lb-freeze");
+        if (collapsed) {
+          if (fz) fz.classList.remove("ready");
+          try { sceneInst.resume(); } catch { /* 忽略 */ }
+          if (gl) gl.classList.add("ready");
+        } else {
+          // 展开：把**最后一帧**抓进定格层再 pause —— 和视频"暂停在那一帧"同一观感
+          sceneFreeze(sceneInst);
+        }
+        return;
+      }
+    }
+    if (sceneBusy) return;
+    sceneBusy = true;
+    sceneBase = base;
+    (async () => {
+      try {
+        const lib = await loadSceneLib();
+        if (mine !== seq || sceneBase !== base) return;
+        const inst = await lib.mount(sceneCanvas(), {
+          source: lib.httpSource(base),
+          fit: "cover",
+          // 只做背景：DPR 封到 1.5、30fps 封顶，省显存与电（场景壁纸比视频吃 GPU）
+          renderDpr: Math.min(window.devicePixelRatio || 1, 1.5),
+          fps: 30,
+          volume: 0,
+          autoplay: true,         // 先跑起来：展开状态也要先出一帧才能"定格"
+          scripts: false,        // ⚠ 默认不执行壁纸自带脚本：它是同源 eval，能直接调本机 API
+        });
+        if (mine !== seq || sceneBase !== base) {
+          try { inst.destroy({ releasePkgCache: true }); } catch { /* 忽略 */ }
+          return;
+        }
+        sceneInst = inst;
+        inst.on("error", (err) => {
+          sceneBad = base;
+          sceneDrop();
+          root.classList.remove("has-live");
+          setBanner("场景壁纸渲染出错，已回退静态背景：" + ((err && err.message) || err));
+        });
+        root.classList.add("has-scene");
+        if (collapsed) {
+          box.querySelector(".lb-scene").classList.add("ready");
+        } else {
+          sceneFreeze(inst);                  // 展开状态挂载：抓一帧定格，再 pause
+        }
+      } catch (e) {
+        sceneBad = base;
+        sceneDrop();
+        root.classList.remove("has-live");
+        setBanner("场景壁纸渲染失败，已回退静态背景：" + ((e && e.message) || e));
+      } finally {
+        sceneBusy = false;
+      }
+    })();
+  };
+
   const sync = () => {
     const t = themeNow();
     const url = urlOf(t);
+    const kind = kindOf(t);
     const collapsed = root.dataset.sidebar === "closed";
+    // ★「会话界面也动」：开着时展开侧栏也继续渲染/播放（视频与场景都适用）
+    const playing = collapsed || !!SET.liveAlways;
     const mine = ++seq;
 
-    if (!url || reduce.matches || !SET.live) { hideAll(); return; }
+    if (!url) { hideCustomBg(); hideAll(); return; }
+    if (kind === "image") {              // ★自定义静态图：不受「动态壁纸」开关 / reduce-motion 影响
+      hideAll();
+      if (customBg) customBg.style.backgroundImage = 'url("' + url + '")';
+      root.classList.add("has-custom-bg");
+      return;
+    }
+    hideCustomBg();
+    if (reduce.matches || !SET.live) { hideAll(); return; }
     box.style.backgroundImage = "";
     root.classList.add("has-live");
 
-    if (active.dataset.src === url) {    // 已经是这张：只调播放状态
-      if (active.readyState >= 2) active.classList.add("ready");
-      play(t, collapsed, mine);
+    if (kind === "scene") {              // 场景：视频层让位，交给 WebWallGL
+      clearInterval(rampTimer); rampTimer = null;
+      vids.forEach((v) => { try { v.pause(); } catch { /* 忽略 */ } v.classList.remove("ready"); });
+      sceneApply(url, playing, mine);
       return;
     }
-    swap(t, url, collapsed, mine);
+    sceneDrop();                         // 换回视频：销毁场景、释放 GL
+
+    if (active.dataset.src === url) {    // 已经是这张：只调播放状态
+      if (active.readyState >= 2) active.classList.add("ready");
+      play(t, playing, mine);
+      return;
+    }
+    swap(t, url, playing, mine);
   };
 
   // 加载失败（文件被删 / Steam 换盘）：撤掉那一层；若它是当前层就退回静态壁纸
@@ -2652,7 +2905,8 @@ async function initLiveBg() {
 function initStaticBg() {
   const root = document.documentElement;
   const apply = () => {
-    const t = "hiru";                    // 夜主题已删除：静态背景只有一个槽
+    // ★静态背景槽跟着**内置主题**走：chapel → 暗调版（同一张官方壁纸），hiru → 和纸浅纱
+    const t = root.dataset.theme === "hiru" ? "hiru" : "chapel";
     document.querySelectorAll("#static-bg .sb").forEach((el) => el.classList.toggle("on", el.dataset.bg === t));
   };
   new MutationObserver(apply).observe(root, { attributes: true, attributeFilter: ["data-theme"] });

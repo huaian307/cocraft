@@ -40,7 +40,7 @@ function collabTypingTarget(e) {
 function initCollab() {
   const btn = $("btn-collab");
   if (btn) btn.addEventListener("click", () => collabOpen(!collabIsOpen()));
-  // ★整窗 / 底部任务框：记下任务输入条原来的位置，并监听小本子高度变化
+  // ★整窗 / 底部任务框：记下任务输入条原来的位置，并监听祈祷书高度变化
   collabComposerInit();
   const quickHome = $("collab-quick");
   if (quickHome) {
@@ -227,6 +227,8 @@ function initCollab() {
     if (pick) { collabJumpPick(pick.dataset.collabPick); return; }
     const exp = e.target.closest("[data-collab-export]");
     if (exp) { collabExport(); return; }
+    const expRun = e.target.closest("[data-collab-run-export]");
+    if (expRun) { collabExportRun(); return; }
     const rerun = e.target.closest("[data-collab-rerun]");
     if (rerun) { collabRerun(); return; }
   });

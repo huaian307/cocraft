@@ -309,6 +309,8 @@ const TRUST = { open: false, busy: false, pend: [], pendErr: "",
                 always: null, alwaysErr: "", group: null,
                 quar: null, quarErr: "", snaps: null, snapsErr: "",
                 permLog: null, permLogErr: "", acts: null, actsErr: "",
+                audit: null, auditErr: "", auditVerify: null,
+                files: null, filesErr: "",
                 dec: [],
                 orch: null, orchErr: "" };
 
@@ -320,6 +322,15 @@ function trustWhen(ts) {
   const n = Number(ts || 0);
   if (!n) return "";
   return fmtTime(n < 1e12 ? n * 1000 : n);
+}
+
+/** 数字时间戳、ISO 字符串（审计链里的 `ts`）、空值都认 —— 显示不出来就返回空，不乱写。 */
+function trustWhenAny(v) {
+  if (v === null || v === undefined || v === "") return "";
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 0) return trustWhen(n);
+  const d = new Date(String(v));
+  return Number.isNaN(d.getTime()) ? "" : fmtTime(d.getTime());
 }
 
 /** 活动状态 → 中文（与活动卡同口径）。 */
@@ -419,6 +430,83 @@ function trustRender() {
           + `</div>`;
       }).join("")
         + `<div class="trust-alw-foot"><button type="button" data-alw-clear="1" title="只清当前 agent 的全部「始终允许」记忆">清空全部「始终允许」</button></div>`;
+    }
+  }
+  // ★审计链（append-only + 哈希链）：谁批准了什么、能不能证明没被改过
+  const aubox = $("trust-audit");
+  const aunote = $("trust-audit-note");
+  if (aubox) {
+    if (!TRUST.audit) {
+      aubox.innerHTML = `<div class="trust-empty">${esc(TRUST.auditErr || "拿不到审计链")}</div>`;
+      if (aunote) aunote.textContent = TRUST.auditErr ? "不可用" : "";
+    } else {
+      const st = TRUST.audit || {};
+      const vf = TRUST.auditVerify || {};
+      const n = Number(st.records || 0);
+      const arch = st.archived || {};
+      const broken = trustList(vf.broken);
+      const okNow = n ? vf.ok === true : true;
+      const head = !n ? `<i class="v-auto">空链</i>`
+        : (okNow ? `<i class="v-allow">链完整</i>` : `<i class="v-deny">断裂 ${broken.length || 1} 处</i>`);
+      const last = st.last || {};
+      const first = st.first || {};
+      const rows = [];
+      rows.push(`<div class="trust-row">${head}`
+        + `<b>${esc(String(n))} 条</b>`
+        + `<span title="${esc(String(last.hash || ""))}">`
+        + (n
+          ? `seq ${esc(String(first.seq || 0))}..${esc(String(last.seq || 0))}`
+            + (trustWhenAny(last.ts) ? ` · 最后 ${esc(trustWhenAny(last.ts))}` : "")
+          : "还没有审批记录 —— 你批准/拒绝一次就记一条（按等级自动放行的不记）")
+        + `</span>`
+        + `<em>${esc(String(st.badLines || 0))} 坏行</em>`
+        + `<button type="button" data-audit-verify="1" title="逐条重算哈希，确认没被改过">重新校验</button>`
+        + `<button type="button" data-audit-export="1" title="导出带文件头与链尾的 JSON（别人可用 tools\\cocraft_audit_verify.py 离线复核）">导出 JSON</button>`
+        + `<button type="button" data-audit-csv="1" title="导出 CSV（Excel 能直接开；每行仍带 prev/hash，可逐行复核）">导出 CSV</button>`
+        + `<button type="button" data-audit-report="1" title="一页报告（Markdown）：结论分布 + 破坏性逐条 + 明细，可交给同事/甲方">导出报告</button>`
+        + `</div>`);
+      broken.slice(0, 3).forEach((b) => {
+        rows.push(`<div class="trust-row"><i class="v-deny">断裂</i>`
+          + `<b>第 ${esc(String(b.index || 0))} 条</b>`
+          + `<span title="${esc(b.reason || "")}">${esc(b.reason || "")}</span>`
+          + `<em>seq ${esc(String(b.seq || 0))}</em></div>`);
+      });
+      aubox.innerHTML = rows.join("");
+      if (aunote) {
+        aunote.textContent = n
+          ? ((okNow ? `链完整 · ${n} 条` : `第 ${String((broken[0] || {}).index || "?")} 条断裂`)
+             + (arch && arch.records
+               ? `（含归档 ${arch.records} 条 / ${arch.files} 个文件）` : ""))
+          : "0 条 · 还没有人批准过";
+      }
+    }
+  }
+  // ★C3：AI 成员「到底改了什么」（文件级；数据来自审计链，刷新/重启后仍在）
+  const fbox2 = $("trust-files");
+  const fnote = $("trust-files-note");
+  if (fbox2) {
+    if (TRUST.files === null) {
+      fbox2.innerHTML = `<div class="trust-empty">${esc(TRUST.filesErr || "拿不到文件改动记录")}</div>`;
+      if (fnote) fnote.textContent = TRUST.filesErr ? "不可用" : "";
+    } else if (!TRUST.files.length) {
+      fbox2.innerHTML = `<div class="trust-empty">还没有文件改动记录 —— AI 成员在它的工作目录里改了文件才会记一条（只记文件名 + 增删改计数，不存内容）。</div>`;
+      if (fnote) fnote.textContent = "0 条";
+    } else {
+      fbox2.innerHTML = TRUST.files.slice(0, 12).map((r) => {
+        const m = r.action || {};
+        const who = (r.actor || {}).name || (r.actor || {}).id || "成员";
+        const paths = trustList(m.targets);
+        const head = paths.slice(0, 2).join("、")
+          + (paths.length > 2 ? (" 等 " + paths.length + " 个") : "");
+        return `<div class="trust-row">`
+          + `<i class="v-allow">改动</i>`
+          + `<b title="${esc(who)}">${esc(who)}</b>`
+          + `<span title="${esc(paths.join("\n"))}">${esc(head || m.title || "改了文件")}</span>`
+          + `<em>${esc(r.note || "")}</em>`
+          + `<em>${esc(trustWhenAny(r.ts))}</em>`
+          + `</div>`;
+      }).join("");
+      if (fnote) fnote.textContent = TRUST.files.length + " 条（最近 12 次派活）";
     }
   }
   // ★群聊审批时间线（落盘审计：谁批准/拒绝了哪条、命令原文、什么时候）
@@ -621,6 +709,31 @@ async function trustRefresh() {
         TRUST.snaps = trustList(r && r.items);
       } catch (e) { TRUST.snapsErr = (e && e.message) || String(e); }
     } else TRUST.snaps = [];
+    // ★审计链（哈希链；stats 给条数/时间，verify 逐条重算）
+    TRUST.audit = null; TRUST.auditErr = ""; TRUST.auditVerify = null;
+    try {
+      const [st, vf] = await Promise.all([
+        api("/audit/stats"),
+        api("/audit/verify", { method: "POST", body: "{}" }),
+      ]);
+      TRUST.audit = unwrap(st) || {};
+      TRUST.auditVerify = vf || {};
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      TRUST.auditErr = /^404/.test(msg)
+        ? "当前版本还没有审计链接口（需要带审计链的后端；重启面板服务）"
+        : ("拿不到审计链：" + msg);
+    }
+    // ★C3：AI 成员改了什么（审计链里 kind=files 的记录；刷新/重启后仍在）
+    TRUST.files = null; TRUST.filesErr = "";
+    try {
+      const r = await api("/audit/list?source=ccagent&kind=files&limit=12");
+      TRUST.files = trustList(r && r.items);
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      TRUST.filesErr = /^404/.test(msg)
+        ? "当前版本还没有审计链接口（重启面板服务）" : ("拿不到文件改动记录：" + msg);
+    }
     // ★群聊审批时间线（落盘审计；没有就是还没发生过）
     TRUST.permLog = null; TRUST.permLogErr = "";
     try {
@@ -678,6 +791,84 @@ async function trustForgetAll() {
   } catch (e) { setBanner("清空失败：" + ((e && e.message) || e), { sticky: true }); }
 }
 
+/** 重新校验审计链（逐条重算哈希；不通过就常驻横幅，别让人以为"只是慢"）。 */
+async function trustAuditVerify() {
+  try {
+    const v = await api("/audit/verify", { method: "POST", body: "{}" }) || {};
+    TRUST.auditVerify = v;
+    const n = Number(v.count || 0);
+    if (v.ok) {
+      setBanner("审计链完整：" + n + " 条，哈希逐条对得上");
+    } else {
+      const first = (trustList(v.broken)[0]) || {};
+      setBanner("⚠ 审计链有断裂：" + Number(v.brokenCount || 0) + " 处 · "
+        + (first.index ? ("第 " + first.index + " 条（" + (first.reason || "") + "）") : "见信任面板"),
+        { sticky: true });
+    }
+    trustRender();
+  } catch (e) {
+    setBanner("校验失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+/** 导出审计链（服务端权威记录 + 文件头 + 链尾）；别人可用 tools\cocraft_audit_verify.py 离线复核。 */
+async function trustAuditExport() {
+  try {
+    const data = unwrap(await api("/audit/export")) || {};
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = String(data.exported || "").replace(/[:.]/g, "-") || String(Date.now());
+    a.href = url;
+    a.download = "cocraft-audit-" + stamp + ".json";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
+    setBanner("已导出审计链：" + Number(data.records || 0) + " 条（带哈希链，可离线校验）");
+  } catch (e) {
+    setBanner("导出审计失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+/** 导出 CSV（Excel 留档用）；每行仍带 prev/hash，照样能逐行复核。 */async function trustAuditExportCsv() {
+  try {
+    const res = await fetch("/audit/export?format=csv");
+    if (!res.ok) throw new Error(res.status + " " + (await res.text()).slice(0, 120));
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cocraft-audit-" + String(Date.now()) + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
+    setBanner("已导出 CSV：" + (res.headers.get("X-Audit-Records") || "0")
+      + " 条（Excel 可直接打开）");
+  } catch (e) {
+    setBanner("导出 CSV 失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+/** 导出**一页报告**（Markdown）：结论分布 + 破坏性逐条 + 明细；给人看，不是给机器校验的。 */
+async function trustAuditReport() {
+  try {
+    const r = await api("/audit/report");
+    const md = (unwrap(r) || {}).markdown || "";
+    if (!md) throw new Error("后端没返回报告内容");
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cocraft-audit-report-" + String(Date.now()) + ".md";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
+    setBanner("已导出审计报告（Markdown，可交同事/甲方）");
+  } catch (e) {
+    setBanner("导出报告失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
 function initTrust() {
   // 入口统一收在「权限 ▾」菜单底部（顶栏盾牌已按用户要求删除）
   const close = $("trust-close");
@@ -717,6 +908,10 @@ function initTrust() {
       const del = e.target.closest("[data-alw-del]");
       if (del) { trustForget(del.dataset.alwDel); return; }
       if (e.target.closest("[data-alw-clear]")) { trustForgetAll(); return; }
+      if (e.target.closest("[data-audit-verify]")) { trustAuditVerify(); return; }
+      if (e.target.closest("[data-audit-export]")) { trustAuditExport(); return; }
+      if (e.target.closest("[data-audit-csv]")) { trustAuditExportCsv(); return; }
+      if (e.target.closest("[data-audit-report]")) { trustAuditReport(); return; }
       const orch = e.target.closest("[data-orch-run]");
       if (orch) {
         trustClose();

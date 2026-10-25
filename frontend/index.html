@@ -1,21 +1,22 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="hiru" class="glass">
+<html lang="zh-CN" data-theme="chapel" class="glass">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cocraft · 絵梨衣</title>
-<link rel="icon" href="/assets/cocraft.ico" type="image/x-icon">
-<link rel="stylesheet" href="/style/01-base.css?v=0.2.31">
-<link rel="stylesheet" href="/style/02-chat.css?v=0.2.31">
-<link rel="stylesheet" href="/style/03-music.css?v=0.2.31">
-<link rel="stylesheet" href="/style/04-collab.css?v=0.2.31">
-<link rel="stylesheet" href="/style/05-settings.css?v=0.2.31">
-<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.31">
-<link rel="stylesheet" href="/style/07-code.css?v=0.2.31">
-<link rel="stylesheet" href="/style/08-visual.css?v=0.2.31">
+<title>cocraft</title>
+<link rel="icon" href="/assets/icon.svg?v=0.2.62" type="image/svg+xml">
+<link rel="icon" href="/assets/cocraft.ico?v=0.2.62" type="image/x-icon">
+<link rel="stylesheet" href="/style/01-base.css?v=0.2.62">
+<link rel="stylesheet" href="/style/02-chat.css?v=0.2.62">
+<link rel="stylesheet" href="/style/03-music.css?v=0.2.62">
+<link rel="stylesheet" href="/style/04-collab.css?v=0.2.62">
+<link rel="stylesheet" href="/style/05-settings.css?v=0.2.62">
+<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.62">
+<link rel="stylesheet" href="/style/07-code.css?v=0.2.62">
+<link rel="stylesheet" href="/style/08-visual.css?v=0.2.62">
 </head>
 <body>
-<!-- 半朽的世界树（卡塞尔学院校徽）：左半枯枝、右半生叶 —— 龙族的标志性意象，纯内联 SVG -->
+<!-- 世界树标记（hiru「和纸白昼」用）：左半枯枝、右半生叶 —— 纯内联 SVG，单色描边 -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <symbol id="mk-tree" viewBox="0 0 24 24">
     <circle cx="12" cy="12" r="10.4" fill="none" stroke="currentColor" stroke-width=".9" opacity=".5"/>
@@ -29,13 +30,24 @@
           stroke="currentColor" stroke-width=".95" fill="none" opacity=".65" stroke-linecap="round"/>
     <path d="M6.8 20.2h10.4" stroke="currentColor" stroke-width=".9" opacity=".45"/>
   </symbol>
+  <!-- 「圣烛教堂」的圣徽：尖拱窗 + 中央一点烛焰（同样是纯内联 SVG、单色描边） -->
+  <symbol id="mk-chapel" viewBox="0 0 24 24">
+    <path d="M12 2.6c3.3 2.5 5.1 5.6 5.1 9v9.2H6.9V11.6c0-3.4 1.8-6.5 5.1-9z"
+          fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+    <path d="M12 6.4v14.4M6.9 12.4h10.2" stroke="currentColor" stroke-width=".85" opacity=".55"/>
+    <path d="M12 13.2c1.5 1.3 2.1 2.3 2.1 3.3 0 1.2-.95 2.05-2.1 2.05s-2.1-.85-2.1-2.05c0-1 .6-2 2.1-3.3z"
+          fill="currentColor" opacity=".9"/>
+  </symbol>
 </svg>
 <div id="petals" aria-hidden="true"></div>
 
 <!-- 动态壁纸：收起侧栏时缓慢启动、展开时缓慢停下；
      停住的那一帧**就是**会话界面的静态背景（直接暂停视频，不再截图） -->
+<div id="custom-bg" aria-hidden="true"></div>
+
 <div id="static-bg" aria-hidden="true">
   <div class="sb" data-bg="hiru"></div>
+  <div class="sb" data-bg="chapel"></div>
 </div>
 
 <div id="live-bg" aria-hidden="true">
@@ -49,17 +61,26 @@
   <aside id="sidebar">
     <div class="brand">
       <div class="name">
-        <img class="avatar-brand" src="/assets/badge.jpg" alt="絵梨衣"
-             title="絵梨衣 · 同人图，仅本地自用">
-        <span id="brand-name" title="点一下可以改名字（回车保存，Esc 取消）">絵梨衣</span>
+        <img class="avatar-brand" src="/assets/icon-256.png" alt="cocraft"
+             title="cocraft · 可在「壁纸与外观」里换图">
+        <span id="brand-name" title="点一下可以改名字（回车保存，Esc 取消）">cocraft</span>
       </div>
-      <div class="sub" id="brand-sub" title="设置里可修改小标签">落尽红樱君不见，轻绘梨花泪沾衣</div>
+      <div class="sub" id="brand-sub" title="设置里可修改小标签">愿此烛长明，照见归途</div>
     </div>
 
     <div class="side-head">
       <button id="btn-new" class="primary" title="新建会话">＋ 新会话</button>
       <button id="btn-import" title="接续这个 agent 那边已有的会话（不是复制历史）" hidden>接续…</button>
       <input id="search" type="search" placeholder="搜索会话…" autocomplete="off">
+    </div>
+
+    <!-- ★老用户提示：新增了「圣烛教堂」主题（默认）→ 点一下就能换；不换就关掉（只提示一次） -->
+    <div id="theme-hint" class="theme-hint" hidden>
+      <div class="th-line"><b>✦ 新主题「圣烛教堂」</b><span>暖黑石墙 · 米白 · 烛焰金</span></div>
+      <div class="th-acts">
+        <button type="button" data-theme-hint-go="1">换成圣烛教堂</button>
+        <button type="button" class="th-x" data-theme-hint-x="1" title="不再提示">×</button>
+      </div>
     </div>
 
     <nav id="session-list" aria-label="会话列表"></nav>
@@ -156,8 +177,8 @@
 
       <section id="mus-home" class="mus-home" aria-label="音乐主页">
         <div class="mus-head">
-          <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-          <b>音楽</b><i class="mk-cap">言灵 · 音乐</i>
+          <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+          <b>音楽</b><i class="mk-cap">圣咏 · 音乐</i>
           <div class="mus-plat">
             <button class="wp-pb" data-p="netease">网易云</button>
             <button class="wp-pb" data-p="qq">QQ音乐</button>
@@ -184,7 +205,7 @@
            轮询只在任务还在跑时进行（1.5s），完成即停。 -->
       <section id="collab" class="collab-home" aria-label="本地协作工作台">
         <div class="collab-head">
-          <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+          <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
           <b>协作</b><i class="mk-cap">本机 · 多智能体</i>
           <span id="collab-sub" class="muted">不登录、不上云 —— 每个成员一个独立 agent 进程，可同时开多个任务</span>
           <span class="collab-sp"></span>
@@ -332,7 +353,7 @@
 
     <form id="composer">
       <div class="composer-wrap">
-        <div class="composer-label">絵梨衣の小本子</div>
+        <div class="composer-label">祈祷书</div>
         <div id="edit-bar" class="edit-bar" hidden>
           <span class="eb-ico">✎</span>
           <span class="eb-main">正在重新编辑之前的提问</span>
@@ -356,12 +377,12 @@
 </div>
 
 <!-- 面板内终端：从底部上滑的抽屉（像群聊那样「分屏」——给 #app 让出底部空间），
-     风格跟主题一致（纸色/青铜边/校徽）。顶边缘可拖动改高度（--term-h）。 -->
+     风格跟主题一致（纸色/黄铜边/圣徽）。顶边缘可拖动改高度（--term-h）。 -->
 <aside id="term" class="term" aria-label="终端" aria-hidden="true">
   <div id="term-resize" class="term-resize" title="拖动调整高度"></div>
   <div class="term-head">
-    <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-    <span class="wp-kind">终端</span><b>面板内终端</b><i class="mk-cap">言灵 · ConPTY</i>
+    <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+    <span class="wp-kind">终端</span><b>面板内终端</b><i class="mk-cap">祷言 · ConPTY</i>
     <span id="term-meta" class="term-meta"></span>
     <span class="term-spacer"></span>
     <button type="button" id="term-ext" title="在外部终端打开这个目录">外部</button>
@@ -530,7 +551,7 @@
 <aside id="code" class="code" aria-label="编码模式" aria-hidden="true">
   <div id="code-resize" class="code-resize" title="拖动调整宽度"></div>
   <div class="code-head">
-    <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+    <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
     <span class="wp-kind">编码</span><b>编码模式</b><i class="mk-cap">project</i>
     <span id="code-root" class="code-root" title="当前会话的工作目录"></span>
     <span id="code-status" class="code-status"></span>
@@ -563,7 +584,7 @@
 <aside id="trace" class="trace" aria-label="轨迹" aria-hidden="true">
   <div id="trace-resize" class="trace-resize" title="拖动调整宽度"></div>
   <div class="trace-head">
-    <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+    <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
     <span class="tr-cap">轨迹</span><b>思考 · 工具 · 系统通知</b>
     <span class="tr-spacer"></span>
     <button type="button" id="trace-all" class="trace-x" title="展开 / 收起全部">展开全部</button>
@@ -576,8 +597,8 @@
   <div id="cfg-resize" class="cfg-resize" title="拖动调整宽度"></div>
   <div class="cfg-box">
     <div class="cfg-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">设置</span><b>界面设置</b><i class="mk-cap">装备部</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">设置</span><b>界面设置</b><i class="mk-cap">圣器室</i>
       <button id="cfg-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="cfg-body">
@@ -617,101 +638,12 @@
         </div>
       </div>
       <div class="cfg-row">
-        <label>左上角名字<i>留空则恢复默认「絵梨衣」</i></label>
-        <input type="text" id="cfg-brand" maxlength="24" placeholder="絵梨衣">
-      </div>
-      <div class="cfg-row">
-        <label>名字下小标签<i>留空则恢复默认题词</i></label>
-        <input type="text" id="cfg-brand-sub" maxlength="40" placeholder="落尽红樱君不见，轻绘梨花泪沾衣">
-      </div>
-      <div class="cfg-row wide">
-        <label>头像 / 素材 / 气泡球<i>都能换成本机图片；「默认」= 用自带素材（只记路径，存在本机 runtime/state）</i></label>
-        <div class="cfg-ctl cfg-art">
-          <span class="cfg-art-k">左上角头像</span>
-          <button type="button" class="cfg-img-pick" data-img="brand">选择…</button>
-          <button type="button" class="cfg-img-clear" data-img="brand" title="恢复自带素材">默认</button>
-          <span class="cfg-img-name" data-img-name="brand">默认</span>
-        </div>
-        <div class="cfg-ctl cfg-art">
-          <span class="cfg-art-k">对话头像</span>
-          <button type="button" class="cfg-img-pick" data-img="avatar">选择…</button>
-          <button type="button" class="cfg-img-clear" data-img="avatar" title="恢复自带素材">默认</button>
-          <span class="cfg-img-name" data-img-name="avatar">默认</span>
-        </div>
-        <div class="cfg-ctl cfg-art">
-          <span class="cfg-art-k">空会话主图</span>
-          <button type="button" class="cfg-img-pick" data-img="hero">选择…</button>
-          <button type="button" class="cfg-img-clear" data-img="hero" title="恢复自带素材">默认</button>
-          <span class="cfg-img-name" data-img-name="hero">默认</span>
-        </div>
-        <div class="cfg-ctl cfg-art">
-          <span class="cfg-art-k">空会话贴纸·左</span>
-          <button type="button" class="cfg-img-pick" data-img="sticker1">选择…</button>
-          <button type="button" class="cfg-img-clear" data-img="sticker1" title="恢复自带素材">默认</button>
-          <span class="cfg-img-name" data-img-name="sticker1">默认</span>
-        </div>
-        <div class="cfg-ctl cfg-art">
-          <span class="cfg-art-k">空会话贴纸·右</span>
-          <button type="button" class="cfg-img-pick" data-img="sticker2">选择…</button>
-          <button type="button" class="cfg-img-clear" data-img="sticker2" title="恢复自带素材">默认</button>
-          <span class="cfg-img-name" data-img-name="sticker2">默认</span>
-        </div>
-        <div class="cfg-ctl cfg-art">
-          <span class="cfg-art-k">歌词气泡球图标</span>
-          <button type="button" class="cfg-img-pick" data-img="lyricball">选择…</button>
-          <button type="button" class="cfg-img-clear" data-img="lyricball" title="恢复默认图标">默认</button>
-          <span class="cfg-img-name" data-img-name="lyricball">默认</span>
-        </div>
-        <div class="cfg-ctl cfg-art">
-          <span class="cfg-art-k">音乐条背景</span>
-          <button type="button" class="cfg-img-pick" data-img="playerbg">选择…</button>
-          <button type="button" class="cfg-img-clear" data-img="playerbg" title="恢复自带背景">默认</button>
-          <span class="cfg-img-name" data-img-name="playerbg">默认</span>
-        </div>
-      </div>
-      <div class="cfg-row">
-        <label>空会话文案 · 第一行<i>留空 = 用默认那句</i></label>
-        <input type="text" id="cfg-hero-l1" maxlength="40" placeholder="这个会话还是一张白纸。">
-      </div>
-      <div class="cfg-row">
-        <label>空会话文案 · 第二行<i>留空 = 用默认那句</i></label>
-        <input type="text" id="cfg-hero-l2" maxlength="40" placeholder="Sakura ＆ 絵梨衣 のDuck">
-      </div>
-      <div class="cfg-row">
-        <label>空会话署名<i>留空 = 用默认那句</i></label>
-        <input type="text" id="cfg-hero-credit" maxlength="60" placeholder="同人图 · 仅本地自用，版权归原作者所有">
-      </div>
-      <div class="cfg-row">
-        <label>背景亮度<i>会话 / 听歌界面的壁纸亮度，100 = 原样</i></label>
-        <input type="range" id="cfg-dim-hiru" min="40" max="100" step="1">
-        <output id="cfg-dim-hiru-out"></output>
-      </div>
-      <div class="cfg-row">
-        <label>模糊程度<i>会话界面 / 消息气泡 / 群聊界面共用这一个模糊；0 = 全透明不模糊，越大越磨砂</i></label>
-        <input type="range" id="cfg-blur" min="0" max="100" step="2">
-        <output id="cfg-blur-out"></output>
-      </div>
-      <div class="cfg-row">
-        <label>界面缩放<i>整个界面等比放大/缩小（文字、间距、图标一起），像浏览器缩放；100% = 原样</i></label>
-        <input type="range" id="cfg-zoom" min="50" max="150" step="5">
-        <output id="cfg-zoom-out"></output>
-      </div>
-      <div class="cfg-row">
-        <label>动态壁纸速度<i>收起侧栏时的播放速度（100 = 原速）</i></label>
-        <input type="range" id="cfg-rate" min="50" max="130" step="5">
-        <output id="cfg-rate-out"></output>
-      </div>
-      <div class="cfg-row">
-        <label>液态玻璃<i>面板变成半透明磨砂玻璃、壁纸从后面透出（关掉 = 回到纸面面板）</i></label>
-        <button id="cfg-glass" class="cfg-toggle">开</button>
+        <label>壁纸与外观<i>壁纸 / 雾化 / 粒子 / 音频条 / 液态玻璃 / 缩放 / 名字 / 素材 / 首屏文案 / 主题 —— 点开是独立的一页</i></label>
+        <button id="cfg-wallpaper">壁纸设置…</button>
       </div>
       <div class="cfg-row">
         <label>每轮工作区快照<i>每发一条消息前给会话工作目录留一次底，之后可「撤销这一轮」。默认关 —— 只保留破坏性操作的隔离区（那一条不受此开关影响）</i></label>
         <button id="cfg-turnsnap" class="cfg-toggle">关</button>
-      </div>
-      <div class="cfg-row">
-        <label>收起时播放动态壁纸<i>关掉就用静态壁纸</i></label>
-        <button id="cfg-live" class="cfg-toggle">开</button>
       </div>
       <div class="cfg-row">
         <label>任务栏自动隐藏<i>面板打开且未最小化时隐藏；最小化或关掉开关就恢复显示</i></label>
@@ -726,54 +658,8 @@
         </select>
       </div>
       <div class="cfg-row">
-        <label>对话两侧音频条<i>在消息区左右各显示一条真频谱（随系统声音跳动）</i></label>
-        <button id="cfg-spec-sides" class="cfg-toggle">开</button>
-      </div>
-      <div class="cfg-row sub" id="cfg-spec-sides-h" hidden>
-        <label>音频条高度<i>两根柱子占多高；100% = 顶到会话记录顶部（展开/收起音乐条会自动适应）</i></label>
-        <input type="range" id="cfg-spec-h" min="20" max="100" step="5">
-        <output id="cfg-spec-h-out"></output>
-      </div>
-      <div class="cfg-row sub" id="cfg-spec-sides-gain" hidden>
-        <label>音频条起伏<i>柱子从两侧伸出的幅度，越大起伏越明显（100% = 基础幅度）</i></label>
-        <input type="range" id="cfg-spec-gain" min="20" max="300" step="10">
-        <output id="cfg-spec-gain-out"></output>
-      </div>
-      <details class="cfg-list" id="cfg-particle-list" open>
-        <summary class="cfg-list-head">
-          <b>粒子效果</b>
-          <span class="muted">三种可以分别开关；关掉落樱只停花瓣</span>
-        </summary>
-        <div class="cfg-row">
-          <label>落樱<i>粉色花瓣 + 落水涟漪；关掉只停樱花</i></label>
-          <button id="cfg-petals" class="cfg-toggle">开</button>
-        </div>
-        <div class="cfg-row">
-          <label>金色光点<i>烛火边漂浮的金尘，缓慢上浮 + 明暗呼吸</i></label>
-          <button id="cfg-gold" class="cfg-toggle">开</button>
-        </div>
-        <div class="cfg-row">
-          <label>绿色竹叶<i>从上方飘落、翻转的竹叶；不溅水花</i></label>
-          <button id="cfg-bamboo" class="cfg-toggle">开</button>
-        </div>
-      </details>
-      <div class="cfg-row">
         <label>歌词翻译<i>外文歌词自动附一行中文小字（有道），缓存 7 天</i></label>
         <button id="cfg-zh" class="cfg-toggle">开</button>
-      </div>
-      <div class="cfg-row">
-        <label>动态壁纸目录<i>点「选择…」挑文件夹；留空或点「自动」= 本机创意工坊 431960</i></label>
-        <input type="text" id="cfg-wall-root" placeholder="自动" readonly>
-        <button type="button" id="cfg-wall-root-pick">选择…</button>
-        <button type="button" id="cfg-wall-root-auto" title="恢复自动查找创意工坊 431960">自动</button>
-      </div>
-      <div class="cfg-row">
-        <label>动态壁纸<i>选哪张播（昼/夜各自指定）</i></label>
-        <button id="cfg-wall">选壁纸…</button>
-      </div>
-      <div class="cfg-row">
-        <label>主题工坊<i>浏览 / 安装社区主题（按钮图标 + 界面样式）；也能从这里切回内置主题</i></label>
-        <button id="cfg-themes">打开主题工坊…</button>
       </div>
       <div class="cfg-row">
         <label>音乐登录 · 网易云<i>粘贴 music.163.com 的 Cookie（含 MUSIC_U）</i></label>
@@ -791,20 +677,177 @@
   </div>
 </div>
 
+<div id="wpc" class="wp" hidden>
+  <div class="wp-box wpc-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">壁纸</span><b>壁纸与外观</b><i class="mk-cap">壁画</i>
+      <button id="wpc-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="wp-cur muted">背景 / 外观 / 身份与素材 / 空会话首屏 / 主题 —— 所有和「看起来什么样」有关的开关都收在这里（其余设置在「设置」里）。</div>
+    <div class="wpc-body" id="wpc-body">
+      <div class="wpc-sec">背景</div>
+<div class="cfg-row">
+        <label>动态壁纸<i>总开关；关掉就用静态壁纸（展开时是否也动见下面「会话界面也动」）</i></label>
+        <button id="cfg-live" class="cfg-toggle">开</button>
+      </div>
+<div class="cfg-row">
+        <label>会话界面也动<i>开启后展开侧栏也继续渲染（视频 / 场景都适用）；关掉则收起侧栏才动，省电</i></label>
+        <button id="wpc-always" class="cfg-toggle">关</button>
+      </div>
+<div class="cfg-row">
+        <label>选择壁纸<i>视频 / 场景都能挑；选中立刻生效</i></label>
+        <button id="cfg-wall">选壁纸…</button>
+      </div>
+<div class="cfg-row">
+        <label>背景亮度<i>会话 / 听歌界面的壁纸亮度，100 = 原样</i></label>
+        <input type="range" id="cfg-dim-hiru" min="40" max="100" step="1">
+        <output id="cfg-dim-hiru-out"></output>
+      </div>
+<div class="cfg-row">
+        <label>模糊程度<i>会话界面 / 消息气泡 / 群聊界面共用这一个模糊；0 = 全透明不模糊，越大越磨砂</i></label>
+        <input type="range" id="cfg-blur" min="0" max="100" step="2">
+        <output id="cfg-blur-out"></output>
+      </div>
+<div class="cfg-row">
+        <label>动态壁纸速度<i>收起侧栏时的播放速度（100 = 原速）</i></label>
+        <input type="range" id="cfg-rate" min="50" max="130" step="5">
+        <output id="cfg-rate-out"></output>
+      </div>
+<details class="cfg-list" id="cfg-particle-list" open>
+        <summary class="cfg-list-head">
+          <b>粒子效果</b>
+          <span class="muted">三种可以分别开关；关掉落樱只停花瓣</span>
+        </summary>
+        <div class="cfg-row">
+          <label>落樱<i>粉色花瓣 + 落水涟漪；关掉只停樱花</i></label>
+          <button id="cfg-petals" class="cfg-toggle">开</button>
+        </div>
+        <div class="cfg-row">
+          <label>金色光点<i>烛火边漂浮的金尘，缓慢上浮 + 明暗呼吸</i></label>
+          <button id="cfg-gold" class="cfg-toggle">开</button>
+        </div>
+        <div class="cfg-row">
+          <label>绿色竹叶<i>从上方飘落、翻转的竹叶；不溅水花</i></label>
+          <button id="cfg-bamboo" class="cfg-toggle">开</button>
+        </div>
+      </details>
+<div class="cfg-row">
+        <label>动态壁纸目录<i>点「选择…」挑文件夹；留空或点「自动」= 本机创意工坊 431960</i></label>
+        <input type="text" id="cfg-wall-root" placeholder="自动" readonly>
+        <button type="button" id="cfg-wall-root-pick">选择…</button>
+        <button type="button" id="cfg-wall-root-auto" title="恢复自动查找创意工坊 431960">自动</button>
+      </div>
+      <div class="wpc-sec">外观</div>
+<div class="cfg-row">
+        <label>对话两侧音频条<i>在消息区左右各显示一条真频谱（随系统声音跳动）</i></label>
+        <button id="cfg-spec-sides" class="cfg-toggle">开</button>
+      </div>
+<div class="cfg-row sub" id="cfg-spec-sides-h" hidden>
+        <label>音频条高度<i>两根柱子占多高；100% = 顶到会话记录顶部（展开/收起音乐条会自动适应）</i></label>
+        <input type="range" id="cfg-spec-h" min="20" max="100" step="5">
+        <output id="cfg-spec-h-out"></output>
+      </div>
+<div class="cfg-row sub" id="cfg-spec-sides-gain" hidden>
+        <label>音频条起伏<i>柱子从两侧伸出的幅度，越大起伏越明显（100% = 基础幅度）</i></label>
+        <input type="range" id="cfg-spec-gain" min="20" max="300" step="10">
+        <output id="cfg-spec-gain-out"></output>
+      </div>
+<div class="cfg-row">
+        <label>液态玻璃<i>面板变成半透明磨砂玻璃、壁纸从后面透出（关掉 = 回到纸面面板）</i></label>
+        <button id="cfg-glass" class="cfg-toggle">开</button>
+      </div>
+<div class="cfg-row">
+        <label>界面缩放<i>整个界面等比放大/缩小（文字、间距、图标一起），像浏览器缩放；100% = 原样</i></label>
+        <input type="range" id="cfg-zoom" min="50" max="150" step="5">
+        <output id="cfg-zoom-out"></output>
+      </div>
+      <div class="wpc-sec">身份与素材</div>
+<div class="cfg-row">
+        <label>左上角名字<i>留空则恢复默认「cocraft」</i></label>
+        <input type="text" id="cfg-brand" maxlength="24" placeholder="cocraft">
+      </div>
+<div class="cfg-row">
+        <label>名字下小标签<i>留空则恢复默认题词</i></label>
+        <input type="text" id="cfg-brand-sub" maxlength="40" placeholder="愿此烛长明，照见归途">
+      </div>
+<div class="cfg-row wide">
+        <label>头像 / 素材 / 气泡球<i>都能换成本机图片；「默认」= 用自带素材（只记路径，存在本机 runtime/state）</i></label>
+        <div class="cfg-ctl cfg-art">
+          <span class="cfg-art-k">左上角头像</span>
+          <button type="button" class="cfg-img-pick" data-img="brand">选择…</button>
+          <button type="button" class="cfg-img-clear" data-img="brand" title="恢复自带素材">默认</button>
+          <span class="cfg-img-name" data-img-name="brand">默认</span>
+        </div>
+        <div class="cfg-ctl cfg-art">
+          <span class="cfg-art-k">对话头像</span>
+          <button type="button" class="cfg-img-pick" data-img="avatar">选择…</button>
+          <button type="button" class="cfg-img-clear" data-img="avatar" title="恢复自带素材">默认</button>
+          <span class="cfg-img-name" data-img-name="avatar">默认</span>
+        </div>
+        <div class="cfg-ctl cfg-art">
+          <span class="cfg-art-k">歌词气泡球图标</span>
+          <button type="button" class="cfg-img-pick" data-img="lyricball">选择…</button>
+          <button type="button" class="cfg-img-clear" data-img="lyricball" title="恢复默认图标">默认</button>
+          <span class="cfg-img-name" data-img-name="lyricball">默认</span>
+        </div>
+        <div class="cfg-ctl cfg-art">
+          <span class="cfg-art-k">音乐条背景</span>
+          <button type="button" class="cfg-img-pick" data-img="playerbg">选择…</button>
+          <button type="button" class="cfg-img-clear" data-img="playerbg" title="恢复自带背景">默认</button>
+          <span class="cfg-img-name" data-img-name="playerbg">默认</span>
+        </div>
+      </div>
+      <div class="wpc-sec">空会话首屏</div>
+<div class="cfg-row">
+        <label>空会话文案 · 第一行<i>留空 = 用默认那句</i></label>
+        <input type="text" id="cfg-hero-l1" maxlength="40" placeholder="这个会话还是一张白纸。">
+      </div>
+<div class="cfg-row">
+        <label>空会话文案 · 第二行<i>留空 = 用默认那句</i></label>
+        <input type="text" id="cfg-hero-l2" maxlength="40" placeholder="烛火未熄，静候你的话">
+      </div>
+<div class="cfg-row">
+        <label>空会话署名<i>留空 = 用默认那句</i></label>
+        <input type="text" id="cfg-hero-credit" maxlength="60" placeholder="同人图 · 仅本地自用，版权归原作者所有">
+      </div>
+      <div class="wpc-sec">主题</div>
+<div class="cfg-row wide">
+        <label>内置主题<i>「圣烛教堂」是默认（暗色：暖黑石墙 + 米白 + 绣线金 + 烛焰）；「和纸白昼」是原来的浅色</i></label>
+        <div class="cfg-ctl" id="cfg-theme-builtin">
+          <button type="button" data-theme-pick="chapel">圣烛教堂</button>
+          <button type="button" data-theme-pick="hiru">和纸白昼</button>
+        </div>
+      </div>
+<div class="cfg-row">
+        <label>主题工坊<i>浏览 / 安装社区主题（按钮图标 + 界面样式）；也能从这里切回内置主题</i></label>
+        <button id="cfg-themes">打开主题工坊…</button>
+      </div>
+    </div>
+    <div class="wp-foot"><span class="muted">视频壁纸直接播；场景壁纸由 WebGL 实时渲染（MIT · WebWallGL）</span></div>
+  </div>
+</div>
+
 <div id="wp" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">动态壁纸</span><b id="wp-title">选一张</b><i class="mk-cap">尼伯龙根</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">动态壁纸</span><b id="wp-title">选一张</b><i class="mk-cap">彩窗</i>
       <button id="wp-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="wp-cur muted" id="wp-cur"></div>
     <div class="wp-filters">
       <input id="wp-q" type="search" placeholder="搜索标题 / 文件名…" autocomplete="off">
     </div>
+    <div class="wp-drop" id="wp-drop">
+      <b>把图片 / 视频拖进来（选择器开着时整页都能放）</b>
+      <span class="muted">图片（JPG/PNG/WebP/GIF）→ 静态背景；视频（MP4/WebM）→ 动态背景</span>
+      <button type="button" id="wp-drop-pick">选择文件…</button>
+      <input type="file" id="wp-file" accept=".jpg,.jpeg,.png,.webp,.gif,.avif,.bmp,.mp4,.webm,.m4v" multiple hidden>
+    </div>
     <div class="wp-list" id="wp-list"></div>
     <div class="wp-foot">
-      <span class="muted">「白昼 / 夜晚」＝用在哪套主题；收起侧栏时播放，展开秒停</span>
+      <span class="muted">「白昼 / 夜晚」＝用在哪套主题；默认收起侧栏时才动，要展开也动去「壁纸设置」</span>
       <button id="wp-reset">恢复默认</button>
     </div>
   </div>
@@ -815,8 +858,8 @@
 <div id="mdl" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">模型</span><b id="mdl-title">选择模型</b><i class="mk-cap">言灵周期表</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">模型</span><b id="mdl-title">选择模型</b><i class="mk-cap">祷言名录</i>
       <button id="mdl-close" class="wp-x" title="关闭">×</button>
     </div>
     <input id="mdl-q" class="mdl-q" type="search" placeholder="搜索模型 / 提供方…" autocomplete="off">
@@ -832,8 +875,8 @@
 <div id="mode" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">模式</span><b id="mode-title">选择智能体 / 模式</b><i class="mk-cap">言灵周期表</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">模式</span><b id="mode-title">选择智能体 / 模式</b><i class="mk-cap">祷言名录</i>
       <button id="mode-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="wp-cur muted" id="mode-cur"></div>
@@ -848,8 +891,8 @@
 <div id="skill" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">技能</span><b>技能 / 斜杠命令</b><i class="mk-cap">言灵</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">技能</span><b>技能 / 斜杠命令</b><i class="mk-cap">祷言</i>
       <button id="skill-close" class="wp-x" title="关闭">×</button>
     </div>
     <div id="skill-main">
@@ -899,7 +942,7 @@
 <div id="themes" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">主题</span><b>主题工坊</b><i class="mk-cap">Workshop</i>
       <button id="th-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -933,7 +976,7 @@
 <div id="import" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">会话</span><b>从这个 agent 接续会话</b><i class="mk-cap">attach</i>
       <button id="imp-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -954,7 +997,7 @@
 <div id="quar" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">可逆执行</span><b>隔离区</b><i class="mk-cap">quarantine</i>
       <button id="quar-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -971,7 +1014,7 @@
 <div id="cmp" class="wp" hidden>
   <div class="wp-box cmp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">主动编排</span><b>多方案对比</b><i class="mk-cap">compare</i>
       <button id="cmp-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -991,7 +1034,7 @@
 <div id="trust" class="wp" hidden>
   <div class="wp-box trust-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">信任</span><b>权限与批准</b><i class="mk-cap">trust</i>
       <button id="trust-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -1003,6 +1046,12 @@
 
       <div class="trust-sec"><b>待你批准</b><span class="muted" id="trust-pend-note"></span></div>
       <div id="trust-pend" class="trust-list"></div>
+
+      <div class="trust-sec"><b>审计链</b><span class="muted" id="trust-audit-note">谁批准了什么 · 哈希链可校验</span></div>
+      <div id="trust-audit" class="trust-list"></div>
+
+      <div class="trust-sec"><b>AI 成员改了什么</b><span class="muted" id="trust-files-note">文件级 · 落盘可追溯</span></div>
+      <div id="trust-files" class="trust-list"></div>
 
       <div class="trust-sec"><b>最近「始终允许」</b><span class="muted">只对 ACP 引擎 · 逐条可撤销</span></div>
       <div id="trust-always" class="trust-list"></div>
@@ -1033,7 +1082,7 @@
 <div id="undo" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">可逆执行</span><b>撤销这一轮</b><i class="mk-cap">undo</i>
       <button id="undo-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -1050,8 +1099,8 @@
 <div id="newsess" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">新会话</span><b>选择工作目录</b><i class="mk-cap">场所</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">新会话</span><b>选择工作目录</b><i class="mk-cap">堂区</i>
       <button id="ns-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="cfg-body">
@@ -1094,7 +1143,7 @@
 <div id="agents" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">ACP</span><b>选择 Agent</b><i class="mk-cap">agentlist</i>
       <button id="agents-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -1113,8 +1162,8 @@
 <div id="agent-edit" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">ACP</span><b id="ae-title">编辑 Agent</b><i class="mk-cap">装备部</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">ACP</span><b id="ae-title">编辑 Agent</b><i class="mk-cap">圣器室</i>
       <button id="ae-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="cfg-body">
@@ -1172,8 +1221,8 @@
 <div id="cred" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">Key</span><b id="cred-title">添加凭据</b><i class="mk-cap">装备部</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">Key</span><b id="cred-title">添加凭据</b><i class="mk-cap">圣器室</i>
       <button id="cred-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="cfg-body">
@@ -1205,7 +1254,7 @@
 <div id="agents-new" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
       <span class="wp-kind">ACP</span><b>扫描本机 Agent</b><i class="mk-cap">扫描 / 选文件夹</i>
       <button id="anew-close" class="wp-x" title="关闭">×</button>
     </div>
@@ -1229,38 +1278,36 @@
 <div id="setup" class="wp" hidden>
   <div class="wp-box">
     <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use href="#mk-tree"></use></svg>
-      <span class="wp-kind">首次设置</span><b>选择默认对话引擎</b><i class="mk-cap">装备部</i>
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">首次设置</span><b>填完这几项就能用</b><i class="mk-cap">圣器室</i>
       <button id="setup-close" class="wp-x" title="稍后再说">×</button>
     </div>
-    <div class="wp-cur muted" id="setup-cur">选一个引擎；以后可在设置里重跑这个向导。</div>
+    <div class="wp-cur muted" id="setup-cur">对话引擎 / Agent / 模型 Key / 默认模型 —— 一页填完，点「完成并重启」即可；以后可在设置里重跑。</div>
     <div class="cfg-body">
       <div class="cfg-row">
         <label>对话引擎<i>OpenCode 需要本机已安装；ACP 需要可用的 agent 适配器</i></label>
         <select id="setup-engine"></select>
       </div>
       <div class="cfg-row" id="setup-agent-row" hidden>
-        <label>ACP Agent<i>选一个能用的 agent；没有就先「跳过」，在设置里添加</i></label>
+        <label>ACP Agent<i>选一个能用的 agent；一个都没有就先「稍后再说」，之后到设置 → ACP 代理里添加</i></label>
         <select id="setup-agent"></select>
       </div>
-      <div class="cfg-row" id="setup-model-row" hidden>
-        <label>默认模型<i>新会话默认使用它；ACP 没有会话时先建一条会话来取清单</i></label>
-        <select id="setup-model"></select>
-      </div>
       <div class="cfg-row wide" id="setup-key-row" hidden>
-        <label>模型 API Key<i id="setup-key-note" data-live>没有 Key 时 agent 会回「Missing environment variable」。只存本机，不进安装包</i></label>
+        <label>模型 API Key<i id="setup-key-note" data-live>没有 Key 时 agent 会回「Missing environment variable」。只存本机、不进安装包；留空 = 稍后再填</i></label>
         <div class="cfg-ctl">
           <span class="cfg-key-var mono" id="setup-key-var" title="变量名按当前 agent 的品牌自动决定（不用手填）">DEEPSEEK_API_KEY</span>
-          <input type="password" id="setup-key-value" placeholder="sk-…（可留空，稍后在设置里填）" autocomplete="off">
-          <button id="setup-key-save">保存</button>
+          <input type="password" id="setup-key-value" placeholder="sk-…（留空也能完成）" autocomplete="off">
         </div>
+      </div>
+      <div class="cfg-row" id="setup-model-row">
+        <label>默认模型<i>新会话默认用它；清单暂时拉不到就先完成，之后点顶栏「模型」再选</i></label>
+        <select id="setup-model"><option value="">加载中…</option></select>
       </div>
     </div>
     <div class="wp-foot">
-      <span class="muted" id="setup-note">首次设置只做一次；可随时在设置里重跑。</span>
-      <button id="setup-next">下一步</button>
-      <button id="setup-done" hidden>完成</button>
-      <button id="setup-skip">跳过</button>
+      <span class="muted" id="setup-note">填完点右边「完成并重启」；只做一次，之后在设置里可重跑。</span>
+      <button id="setup-done" class="primary">完成并重启</button>
+      <button id="setup-skip">稍后再说</button>
     </div>
   </div>
 </div>
@@ -1280,17 +1327,17 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/js/00-util.js?v=0.2.31"></script>
-<script src="/js/01-chat.js?v=0.2.31"></script>
-<script src="/js/02-shell.js?v=0.2.31"></script>
-<script src="/js/21-cocraft.js?v=0.2.31"></script>
-<script src="/js/40-music.js?v=0.2.31"></script>
-<script src="/js/12-asks.js?v=0.2.31"></script>
-<script src="/js/11-engine.js?v=0.2.31"></script>
-<script src="/js/41-visual.js?v=0.2.31"></script>
-<script src="/js/30-code.js?v=0.2.31"></script>
-<script src="/js/20-collab.js?v=0.2.31"></script>
-<script src="/app.js?v=0.2.31"></script>
+<script src="/js/00-util.js?v=0.2.62"></script>
+<script src="/js/01-chat.js?v=0.2.62"></script>
+<script src="/js/02-shell.js?v=0.2.62"></script>
+<script src="/js/21-cocraft.js?v=0.2.62"></script>
+<script src="/js/40-music.js?v=0.2.62"></script>
+<script src="/js/12-asks.js?v=0.2.62"></script>
+<script src="/js/11-engine.js?v=0.2.62"></script>
+<script src="/js/41-visual.js?v=0.2.62"></script>
+<script src="/js/30-code.js?v=0.2.62"></script>
+<script src="/js/20-collab.js?v=0.2.62"></script>
+<script src="/app.js?v=0.2.62"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

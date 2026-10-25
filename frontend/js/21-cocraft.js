@@ -97,7 +97,7 @@ function ccSyncUnreadUI() {
       面板就在眼前时不弹系统通知（页面里的横幅 / 小弹窗已经够用），顺便天然节流。
       ⚠ 浏览器窗口模式（Edge --app）没有托盘进程 → 只写文件不弹气泡，标题栏计数照常。 */
 var SYNC_TITLE_BASE = "";
-const TITLE_FALLBACK = "cocraft · 絵梨衣";
+const TITLE_FALLBACK = "cocraft";
 const CC_PERM_ALERT_KEY = "cocraft.cc.permAlert";     // 已强提醒过的申请 id
 
 /** 需要用户注意的数量：群聊未读 + 待批准权限（各算 1）。 */
@@ -2318,25 +2318,31 @@ function initAttachments() {
 
   // 拖拽到窗口任意位置
   const isFileDrag = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes("Files");
+  // ⚠ 壁纸选择器（#wp）开着时**让路**：那边有自己的拖拽导入（图片/视频 → 背景）。
+  //   以前不判断 → 拖进壁纸选择器的图被当成聊天附件塞进输入框（用户实测踩到）。
+  const wallPickerOpen = () => {
+    const w = document.getElementById("wp");
+    return !!(w && !w.hidden);
+  };
   let depth = 0;
   window.addEventListener("dragenter", (e) => {
-    if (!isFileDrag(e)) return;
+    if (wallPickerOpen() || !isFileDrag(e)) return;
     e.preventDefault();
     depth += 1;
     $("drop-veil").hidden = false;
   });
   window.addEventListener("dragover", (e) => {
-    if (!isFileDrag(e)) return;
+    if (wallPickerOpen() || !isFileDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
   });
   window.addEventListener("dragleave", (e) => {
-    if (!isFileDrag(e)) return;
+    if (wallPickerOpen() || !isFileDrag(e)) return;
     depth = Math.max(0, depth - 1);
     if (!depth) $("drop-veil").hidden = true;
   });
   window.addEventListener("drop", (e) => {
-    if (!isFileDrag(e)) return;
+    if (wallPickerOpen() || !isFileDrag(e)) return;
     e.preventDefault();
     depth = 0;
     $("drop-veil").hidden = true;

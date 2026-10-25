@@ -105,7 +105,7 @@ $("messages").addEventListener("scroll", () => {
 });
 // 「↑ 加载更早的消息」按钮（内容会被重建，所以用事件委托挂在容器上）
 $("msg-more").addEventListener("click", (e) => {
-  if (e.target.closest(".mm-btn")) loadHistory();
+  if (e.target.closest(".mm-btn")) loadHistoryMore();
 });
 
 /* ============================================================================

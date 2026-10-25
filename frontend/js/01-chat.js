@@ -714,7 +714,7 @@ function renderMessage(m) {
 
   return `<div class="msg ${isUser ? "user" : "assistant"}${m.pending ? " pending" : ""}" data-mid="${esc(m.id)}">
     <div class="who">
-      ${isUser ? "" : `<img class="avatar" src="${appearanceUrl("avatar", "/assets/avatar.png")}" alt="">`}
+      ${isUser ? "" : `<img class="avatar" src="${appearanceUrl("avatar", "/assets/icon-256.png")}" alt="">`}
       <strong>${isUser ? "我" : "助手"}</strong>
       ${agent ? `<span class="badge">${esc(agent)}</span>` : ""}
       ${modelID ? `<span class="badge">${esc(modelID)}</span>` : ""}
@@ -1101,7 +1101,7 @@ function appearanceUrl(key, fallback) {
 /** 左上角头像（对话里那个头像在 renderMessage 里，会跟消息重建一起换） */
 function applyAppearance() {
   const img = document.querySelector(".avatar-brand");
-  if (img) img.src = appearanceUrl("brand", "/assets/badge.jpg");
+  if (img) img.src = appearanceUrl("brand", "/assets/icon-256.png");
 }
 
 /** 气泡球图标 / 音乐条背景（也走自定义素材；没设就回自带） */
@@ -1123,13 +1123,13 @@ function heroHtml() {
   const l1 = String(SET.heroL1 || "").trim() || HERO_DEFAULT.l1;
   const l2 = String(SET.heroL2 || "").trim() || HERO_DEFAULT.l2;
   const credit = String(SET.heroCredit || "").trim() || HERO_DEFAULT.credit;
+  // ★空会话首屏：**只留一个圣徽**（尖拱窗 + 烛焰，内联 SVG）—— 不显示主图、不显示贴纸。
+  //   想放自己的图请用「壁纸」那一套（背景），别再加回首屏大图。
   return `<div class="empty">
-    <img class="hero-card" src="${appearanceUrl("hero", "/assets/hero.jpg")}" alt="絵梨衣">
-    <div class="duck-line1">${esc(l1)}</div>
-    <div class="duck-line2">${esc(l2)}</div>
-    <div class="stickers">
-      <img src="${appearanceUrl("sticker1", "/assets/sticker-duck.jpg")}" alt="">
-      <img src="${appearanceUrl("sticker2", "/assets/sticker-couple.jpg")}" alt="">
+    <div class="hero-card hero-mk" aria-hidden="true"><svg viewBox="0 0 24 24"><use href="#mk-chapel"></use></svg></div>
+    <div class="empty-copy">
+      <div class="duck-line1">${esc(l1)}</div>
+      <div class="duck-line2">${esc(l2)}</div>
     </div>
     <div class="credit">${esc(credit)}</div>
   </div>`;
@@ -1883,6 +1883,11 @@ async function openSession(id) {
 const MSG_PAGE = 80;            // 每页条数（首屏与翻页共用）
 const MSG_TOP_TRIGGER = 120;    // 距顶多少像素内就自动取下一页
 const MSG_MAX = 2000;           // 上翻的总上限（超长会话保护，别把内存撑爆）
+// ★一页 80 条是**原始消息**数，而工具调用 / 思考 / 系统通知**在主界面不渲染**（只进轨迹页）
+//   → 工具密集的一轮就能吃掉整页，上一轮的内容一上来就掉进「加载更早」。
+//   所以按"**看得见**的消息条数"补页：首屏/刷新后至少留这么多条，最多自动补这么多页。
+const MSG_MIN_VISIBLE = 12;
+const MSG_ENSURE_PAGES = 6;
 
 /** 从响应里的 cursor 取出「更早一页」的游标。
  *  ⚠ 两个引擎形状不同：
@@ -1949,13 +1954,14 @@ function resetMsgPaging() {
   renderHistoryHint();
 }
 
-/** 往上翻一页：接更早的消息，并保持当前视口不动。 */
-async function loadHistory() {
+/** 往上翻一页：接更早的消息，并保持当前视口不动。
+ *  `opts.initial` = 首屏/刷新后自动补页：**不**停跟随、也**不**做视口锚定（反正在底部）。 */
+async function loadHistory(opts = {}) {
   if (!state.current || state.msgLoading || state.msgDone || !state.msgCursor) return;
   if (state.messages.length >= MSG_MAX) { state.msgDone = true; renderHistoryHint(); return; }
   const sid = state.current.id;
   state.msgLoading = true;
-  state.follow = false;          // 用户在往上读历史 → 明确停止跟随（别被 paintLiveSlot 拽回底部）
+  if (!opts.initial) state.follow = false;   // 用户在往上读历史 → 明确停止跟随（别被拽回底部）
   renderHistoryHint();
   const box = $("messages");
   const beforeTop = box ? box.scrollTop : 0;
@@ -1984,14 +1990,51 @@ async function loadHistory() {
         if (!b) return;
         b.scrollTop = beforeTop + (b.scrollHeight - beforeH);
       };
-      fix();
-      requestAnimationFrame(fix);                               // 字体/图片就位后高度还会变，再补一次
+      if (!opts.initial) fix();
+      if (!opts.initial) requestAnimationFrame(fix);             // 字体/图片就位后高度还会变，再补一次
     }
   } catch (err) {
     setBanner("加载更早的消息失败：" + (err && err.message ? err.message : err));
   } finally {
     state.msgLoading = false;
     renderHistoryHint();
+  }
+}
+
+/** 主界面**看得见**的消息条数（工具 / 思考 / 系统通知都不渲染 → 不能拿 state.messages 的长度算）。 */
+function visibleMsgCount() {
+  const box = $("msg-static");
+  return box ? box.querySelectorAll(".msg").length : 0;
+}
+
+/** ★补页：打开会话 / 刷新后，若"看得见的消息"太少（工具密集的一轮就能吃掉整页 80 条原始消息），
+ *  自动再翻几页，别让上一轮的内容一上来就落进「↑ 加载更早的消息」。
+ *  最多 `MSG_ENSURE_PAGES` 页；到底 / 没新内容就停（不死循环）。 */
+async function ensureVisibleHistory() {
+  if (!state.current) return 0;
+  let pages = 0;
+  while (pages < MSG_ENSURE_PAGES
+         && visibleMsgCount() < MSG_MIN_VISIBLE
+         && !state.msgDone && !!state.msgCursor && !state.msgLoading) {
+    const before = state.messages.length;
+    pages += 1;
+    await loadHistory({ initial: true });
+    if (state.messages.length === before) break;      // 没有新内容（到底 / 整页都是已有的）
+  }
+  return pages;
+}
+
+/** 用户点按钮 / 滚到顶：**保证这一次至少看得见一条新内容**（一页里全是工具时自动再补，最多 3 页）。 */
+async function loadHistoryMore() {
+  let pages = 0;
+  while (pages < 3) {
+    const wasVisible = visibleMsgCount();
+    const wasCount = state.messages.length;
+    pages += 1;
+    await loadHistory();
+    if (state.messages.length === wasCount) break;    // 没有新内容 → 到底了
+    if (visibleMsgCount() > wasVisible) break;        // 看见东西了，停
+    if (state.msgDone) break;
   }
 }
 
@@ -2002,7 +2045,7 @@ function maybeLoadHistory() {
   if (state.msgDone || state.msgLoading || !state.msgCursor) return;
   if (b.scrollTop > MSG_TOP_TRIGGER) return;
   if (b.scrollHeight - b.clientHeight < 200) return;            // 内容还没超出一屏，翻了也没意义
-  loadHistory();
+  loadHistoryMore();
 }
 
 async function refreshMessages() {
@@ -2051,6 +2094,13 @@ async function refreshMessages() {
       liveShellSig = null;
     }
     renderMessages();
+    // ★工具密集的会话：刷新后自动补页（保持"看得见"的历史，别一上来就掉进「加载更早」）。
+    //   只在你正跟着底部时补 —— 在往上读历史时不打扰。
+    if (!state.msgOlder && state.follow) {
+      await ensureVisibleHistory();
+      const b = $("messages");
+      if (b && state.follow) b.scrollTop = b.scrollHeight;
+    }
   } catch (err) {
     // ⚠ 不要动 $("messages") 的 innerHTML —— 那会把 #msg-static / #live-slot 一起抹掉，
     //   之后每次渲染都拿不到容器，界面永久卡死。只覆盖内容区。

@@ -88,11 +88,80 @@ function clearUserTheme() {
   } catch { /* ignore */ }
 }
 
-/** 应用内置主题（并清掉任何用户主题）—— **只有一个「昼」底盘**（夜主题已删除）。 */
-function applyTheme(_theme) {
+/* ---------------- 内置主题（0.2.47） ----------------
+ * `chapel` = 「圣烛教堂」（**默认**，暗色）；`hiru` = 「和纸白昼」（原来的浅色，保留）。
+ * ⚠ 夜主题 `yoru` 早已删除，别再当底盘用。 */
+const BUILTIN_THEMES = ["chapel", "hiru"];
+const BUILTIN_THEME_NAMES = { chapel: "圣烛教堂", hiru: "和纸白昼" };
+const THEME_SEEN_KEY = "cocraft.themeSeen";
+
+function normThemeId(id) {
+  const t = String(id || "").trim();
+  return BUILTIN_THEMES.includes(t) ? t : BUILTIN_THEMES[0];
+}
+
+/** 应用内置主题（并清掉任何用户主题注入）。 */
+function applyTheme(theme) {
+  const id = normThemeId(theme);
   clearUserTheme();
-  _setBaseTheme("hiru");
+  _setBaseTheme(id);
   syncThemesActive();
+  syncThemeCards();
+  syncThemeActiveBackend(id);      // 让后端 `_themes.json` 也跟着（主题工坊顶部"当前"要准）
+  return id;
+}
+
+/** 把「当前主题」同步给后端（`POST /themes/apply`）。
+ *  为什么要同步：前端用 localStorage 决定外观，而后端的 `_themes.json` 只用于
+ *  **主题工坊列表顶部的"当前"** 与卸载时的回落；不同步就会显示成旧主题。失败就算了。 */
+function syncThemeActiveBackend(id) {
+  try {
+    api("/themes/apply", { method: "POST", body: JSON.stringify({ id: String(id || "") }) })
+      .catch(() => {});
+  } catch { /* 启动早期 api 还没就绪 → 忽略 */ }
+}
+
+/** 设置里那两张内置主题卡片：高亮当前、点一下就切。 */
+function syncThemeCards() {
+  const box = $("cfg-theme-builtin");
+  if (!box) return;
+  const cur = document.documentElement.dataset.theme || BUILTIN_THEMES[0];
+  box.querySelectorAll("[data-theme-pick]").forEach((b) => {
+    b.classList.toggle("on", String(b.dataset.themePick) === cur);
+  });
+}
+
+function pickBuiltinTheme(id) {
+  const t = applyTheme(id);
+  setBanner("已切换到「" + (BUILTIN_THEME_NAMES[t] || t) + "」");
+}
+
+function initThemeCards() {
+  const box = $("cfg-theme-builtin");
+  if (!box || box.__bound) return;
+  box.__bound = true;
+  box.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-theme-pick]");
+    if (b) pickBuiltinTheme(b.dataset.themePick);
+  });
+  syncThemeCards();
+}
+
+/** 老用户提示：以前存的是 `hiru` → 侧栏一条可点的小提示（"换成圣烛教堂"），只提示一次。
+ *  为什么不用顶部横幅：横幅是**单槽**，启动时会被"已连接 / 更新"这类提示顶掉；侧栏这条能一直挂着直到点掉/关掉。 */
+function themeHintOnce(saved) {
+  const box = $("theme-hint");
+  if (!box) return;
+  let seen = "";
+  try { seen = localStorage.getItem(THEME_SEEN_KEY) || ""; } catch { /* ignore */ }
+  if (!seen) { try { localStorage.setItem(THEME_SEEN_KEY, "1"); } catch { /* ignore */ } }
+  if (seen || (saved && saved !== "hiru")) { box.hidden = true; return; }
+  box.hidden = false;
+  const hide = () => { box.hidden = true; };
+  const go = box.querySelector("[data-theme-hint-go]");
+  if (go) go.addEventListener("click", () => { hide(); pickBuiltinTheme("chapel"); });
+  const x = box.querySelector("[data-theme-hint-x]");
+  if (x) x.addEventListener("click", hide);
 }
 
 /** 应用一个用户主题（从后端取变量 / CSS / 图标 / 背景）；`mode` 指定明或暗。 */
@@ -117,13 +186,16 @@ async function applyUserTheme(id, mode) {
 }
 
 function initTheme() {
-  let user = "", umode = "";
+  let user = "", umode = "", saved = "";
   try {
     user = localStorage.getItem(THEME_USER_KEY) || "";
     umode = localStorage.getItem(THEME_USER_MODE_KEY) || "";
+    saved = localStorage.getItem(THEME_KEY) || "";
   } catch { /* ignore */ }
-  applyTheme("hiru");                     // 夜主题已删除：只有昼
+  applyTheme(saved || BUILTIN_THEMES[0]);      // 没存过 → 圣烛教堂（新默认）
   if (user) applyUserTheme(user, umode).catch(() => { clearUserTheme(); });
+  initThemeCards();
+  themeHintOnce(saved);
 }
 
 /* ---------------- 主题工坊（浏览 / 安装 / 套用 / 卸载） ---------------- */
@@ -601,25 +673,42 @@ function initSidebar() {
 
 /* ---------------- 左上角名字 / 小标签（点击名字可改，设置里也能改） ---------------- */
 
+// ★老默认值（带「絵梨衣」）→ 视为"没设过"，否则老浏览器里改名不生效
+const BRAND_LEGACY = ["絵梨衣", "守烛人"];
+const BRAND_SUB_LEGACY = ["落尽红樱君不见，轻绘梨花泪沾衣"];
+
 const BRAND_KEY = "cocraft.brandName";
 const BRAND_SUB_KEY = "cocraft.brandSub";
-const BRAND_DEFAULT = "絵梨衣";
-const BRAND_SUB_DEFAULT = "落尽红樱君不见，轻绘梨花泪沾衣";
+const BRAND_DEFAULT = "cocraft";
+const BRAND_SUB_DEFAULT = "愿此烛长明，照见归途";
 
 function readBrand(key) {
   try { return localStorage.getItem(key) || ""; } catch { return ""; }
 }
 
-/** 名字：空值 = 恢复默认「絵梨衣」，并删掉本机记录 */
+/** 名字：空值 = 恢复默认「cocraft」，并删掉本机记录 */
 function applyBrandName(name) {
   const v = String(name ?? "").trim().slice(0, 24);
   const use = v || BRAND_DEFAULT;
   $("brand-name").textContent = use;
-  syncTitle(`${use} · OpenCode`);          // ★B3：标题栏计数（未读 / 待批准）会加在它前面
+  // ★窗口标题 = `cocraft · <名字>`（原生窗口的标题由守护进程 SetWindowTextW 维护；
+  //   浏览器模式跟着 document.title —— 两边用同一个字符串，别打架）。
+  // ★名字就是产品名时不再重复一遍（`cocraft · cocraft` 很蠢）
+  const docTitle = use.toLowerCase() === "cocraft" ? "cocraft" : "cocraft · " + use;
+  syncTitle(docTitle);                     // ★B3：标题栏计数（未读 / 待批准）会加在它前面
+  pushPanelTitle(docTitle);                // 让守护 / 托盘也改成这个（它们读不到 localStorage）
   try {
     if (v) localStorage.setItem(BRAND_KEY, v);
     else localStorage.removeItem(BRAND_KEY);
   } catch { /* 隐私模式忽略 */ }
+}
+
+/** 把成品标题交给后端（写 `_panel_title.json`）；失败就算了，标题保持默认 `cocraft`。 */
+function pushPanelTitle(title) {
+  try {
+    api("/panel/title", { method: "POST", body: JSON.stringify({ title: String(title || "") }) })
+      .catch(() => {});
+  } catch { /* 启动早期 api 还没就绪 → 忽略 */ }
 }
 
 /** 小标签：空值 = 恢复默认题词，并删掉本机记录 */
@@ -636,8 +725,11 @@ function applyBrandSub(sub) {
 
 function initBrandName() {
   const el = $("brand-name");
-  applyBrandName(readBrand(BRAND_KEY));                 // 没有记录时就是 BRAND_DEFAULT
-  applyBrandSub(readBrand(BRAND_SUB_KEY));
+  const savedName = readBrand(BRAND_KEY);
+  const savedSub = readBrand(BRAND_SUB_KEY);
+  // ★老默认值（带「絵梨衣」）当"没设过" → 否则老浏览器里永远显示旧名字
+  applyBrandName(BRAND_LEGACY.includes(savedName) ? "" : savedName);
+  applyBrandSub(BRAND_SUB_LEGACY.includes(savedSub) ? "" : savedSub);
 
   el.addEventListener("click", () => {
     if (el.isContentEditable) return;
@@ -667,8 +759,9 @@ function initBrandName() {
 /* ---------------- 附件：粘贴 / 拖拽 / 选择文件 ----------------
  * prompt 接口的 files[].uri 接受 data: URL，服务端会规范化成 inline 附件。 */
 
-const MAX_ATTACH_BYTES = 12 * 1024 * 1024;
-const DOWNSCALE_OVER = 1.2 * 1024 * 1024;
+const MAX_ATTACH_BYTES = 4 * 1024 * 1024;   // ★ 4 MB：上游对**单个**附件有上限（实测 5.0 MB 通、5.5 MB → 500），留余量
+const MAX_ATTACH_B64 = 5.6 * 1024 * 1024;   // base64 后再兜一道（1.33 倍膨胀）
+const DOWNSCALE_OVER = 0.8 * 1024 * 1024;
 const MAX_EDGE = 1600;
 const MAX_ATTACH_COUNT = 8;
 
@@ -695,21 +788,36 @@ const readAsDataURL = (blob) => new Promise((res, rej) => {
   fr.readAsDataURL(blob);
 });
 
-/** 大图先缩到 MAX_EDGE 内再编码 —— 否则粘贴一张全屏截图就是十几 MB 的 base64 */
+/** 大图先缩到 MAX_EDGE 内再编码 —— 否则粘贴一张全屏截图就是十几 MB 的 base64。
+ *
+ * ★ 2026-10-25 修「发图 500」：原来只压一次、目标是 JPEG；若第一次压完还超过上游上限
+ *   （单附件实测 5.0 MB 通 / 5.5 MB → 500），或者 createImageBitmap 解不了（AVIF / HEIC /
+ *   某些 CMYK）×  就原样发出去 → 上游 `Prompt.Base64` 校验失败 → **500 + 空 body**（面板只显示
+ *   「500 Internal Server Error」）。现在**逐级再压**（1600→1200→900，质量 0.86→0.8→0.75），
+ *   压到 MAX_ATTACH_BYTES 的 90% 以内为止。
+ */
 async function shrinkImage(file) {
   const needDownscale = file.size > DOWNSCALE_OVER;
   const bmp = await createImageBitmap(file);
   const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
   if (!needDownscale && scale === 1) return file;
-  const w = Math.max(1, Math.round(bmp.width * scale));
-  const h = Math.max(1, Math.round(bmp.height * scale));
-  const canvas = document.createElement("canvas");
-  canvas.width = w; canvas.height = h;
-  canvas.getContext("2d").drawImage(bmp, 0, 0, w, h);
-  const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.86));
-  if (!blob) return file;
+  const tries = [[MAX_EDGE, 0.86], [1200, 0.8], [900, 0.75]];
+  let best = null;
+  for (const [edge, q] of tries) {
+    const s = Math.min(1, edge / Math.max(bmp.width, bmp.height));
+    const w = Math.max(1, Math.round(bmp.width * s));
+    const h = Math.max(1, Math.round(bmp.height * s));
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(bmp, 0, 0, w, h);
+    const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", q));
+    if (!blob) continue;
+    best = blob;
+    if (blob.size <= MAX_ATTACH_BYTES * 0.9) break;     // 够小就停
+  }
+  if (!best) return file;
   const base = (file.name || "image").replace(/\.[^.]+$/, "");
-  return new File([blob], `${base}.jpg`, { type: "image/jpeg" });
+  return new File([best], `${base}.jpg`, { type: "image/jpeg" });
 }
 
 async function addFiles(fileList) {
@@ -726,7 +834,7 @@ async function addFiles(fileList) {
       try { file = await shrinkImage(file); } catch { /* 压缩失败就用原图 */ }
     }
     if (file.size > MAX_ATTACH_BYTES) {
-      problems.push(`${original.name} 超过 ${humanSize(MAX_ATTACH_BYTES)}`);
+      problems.push(`${original.name} 太大（${humanSize(file.size)}，单个上限 ${humanSize(MAX_ATTACH_BYTES)}）`);
       continue;
     }
     let dataUrl = "";
@@ -734,6 +842,10 @@ async function addFiles(fileList) {
       dataUrl = await readAsDataURL(file);
     } catch {
       problems.push(`${original.name} 读取失败`);
+      continue;
+    }
+    if (dataUrl.length > MAX_ATTACH_B64) {
+      problems.push(`${original.name} 编码后太大（${humanSize(dataUrl.length)}），换小一点的图或先压缩`);
       continue;
     }
     state.attachments.push({
