@@ -45,7 +45,8 @@ EDGE_CANDIDATES = [
 # 拦掉会长挂 / 会惊动守护进程的请求；EventSource 换成计数器（用来数"重连了几次"）
 STUB = """<script>
 (function () {
-  var DEAD = ["/heartbeat", "/bye", "/form", "/permission", "/qq/", "/live/"];
+  var DEAD = ["/heartbeat", "/bye", "/form", "/permission", "/qq/", "/live/",
+              "/update/", "/wallpaper/", "/orchestrate/", "/audit/"];
   var raw = window.fetch;
   window.fetch = function (u, o) {
     var s = String(u);
@@ -69,6 +70,11 @@ setTimeout(async function () {
   var out = {};
   var note = function () { var n = document.getElementById("cfg-engine-note"); return n ? n.textContent : null; };
   var wait = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  var until = async function (fn, ms) {
+    var t0 = Date.now();
+    while (Date.now() - t0 < ms) { if (fn()) return true; await wait(150); }
+    return !!fn();
+  };
   try {
     var cfg = document.getElementById("btn-cfg");
     if (cfg) cfg.click();
@@ -90,11 +96,14 @@ setTimeout(async function () {
     ENGINE.engines = out.engines;
     var before = window.__esCount;
     await setEngine("acp");
+    // CI 上慢（POST /engine + 重连 SSE 可能 >1.2s）→ 轮询等它真的生效，别用固定 sleep 赌
+    await until(function () { return ENGINE.active === "acp" && window.__esCount > before; }, 8000);
     out.acpActive = ENGINE.active;
     out.acpEsDelta = window.__esCount - before;
     out.acpNote = note();
     var before2 = window.__esCount;
     await setEngine("opencode");
+    await until(function () { return ENGINE.active === "opencode" && window.__esCount > before2; }, 8000);
     out.openActive = ENGINE.active;
     out.openEsDelta = window.__esCount - before2;
     out.title = (document.getElementById("session-title") || {}).textContent;
@@ -208,7 +217,9 @@ setTimeout(async function () {
     // 真跑一遍写接口（APPEARANCE_FILE 已被指到临时目录）
     // ⚠ 用 avatar 而不是 hero：0.2.55 起「空会话主图」那一行已删（首屏只留内联圣徽），
     //    hero 没有 data-img-name 元素可回显了。
-    await setAppearanceImage("avatar", "D:/opencode-ui/frontend/assets/sticker-duck.jpg");
+    // ⚠ 用**仓库里就有**的图（`hiru-bg.jpg` 是项目自有资产、随仓库走）；
+    //   以前用 sticker-duck.jpg —— 那是本机同人图、CI 里根本不存在，所以 CI 必挂。
+    await setAppearanceImage("avatar", "__ASSET__");
     out.appearUrl = appearanceUrl("avatar", "/assets/icon-256.png");
     out.appearName = (document.querySelector('[data-img-name="avatar"]') || {}).textContent || "";
     try { out.appearImg = (await fetch(appearanceUrl("avatar", "/assets/icon-256.png"))).status; }
@@ -228,7 +239,10 @@ setTimeout(async function () {
 
 def build_probe():
     src = io.open(os.path.join(WEB, "index.html"), encoding="utf-8").read()
-    out = src.replace('<script src="/app.js', STUB + TEST + '<script src="/app.js')
+    # 素材用**仓库自带**的图（CI 里没有同人图）；路径按本仓库算，别写死 D:
+    asset = os.path.join(WEB, "assets", "hiru-bg.jpg").replace("\\", "/")
+    js = TEST.replace("__ASSET__", asset)
+    out = src.replace('<script src="/app.js', STUB + js + '<script src="/app.js')
     if out == src:
         raise SystemExit("在 index.html 里找不到 app.js 的 <script> 标签")
     io.open(PROBE, "w", encoding="utf-8", newline="").write(out)
@@ -241,24 +255,33 @@ def find_edge():
     raise SystemExit("没找到 msedge.exe")
 
 
-def render(edge):
-    tmp = os.environ.get("TEMP", ".")
-    dom = os.path.join(tmp, "probe_engine_dom.html")
+def _render_once(edge, dom, budget, timeout):
     if os.path.exists(dom):
         os.remove(dom)
     with open(dom, "wb") as fh:
         proc = subprocess.Popen(
             [edge, "--headless=new", "--disable-gpu", "--no-first-run",
              "--no-default-browser-check",
-             "--user-data-dir=" + os.path.join(tmp, "edge-acptest"),
-             "--virtual-time-budget=20000", "--dump-dom", URL],
+             "--user-data-dir=" + os.path.join(os.environ.get("TEMP", "."), "edge-acptest"),
+             "--virtual-time-budget=%d" % budget, "--dump-dom", URL],
             stdout=fh, stderr=subprocess.DEVNULL)
         try:
-            proc.wait(timeout=90)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             print("  (Edge 超时，已强杀)")
     return io.open(dom, encoding="utf-8", errors="replace").read()
+
+
+def render(edge):
+    tmp = os.environ.get("TEMP", ".")
+    dom = os.path.join(tmp, "probe_engine_dom.html")
+    html = _render_once(edge, dom, 15000, 120)
+    if 'id="__probe__"' not in html:
+        # ★ CI 上偶发"Edge 渲染超时 → DOM 空"（虚拟时间被慢请求拖住）→ 缩短预算再试一次
+        print("  (没拿到探针结果，缩短虚拟时间重试一次…)")
+        html = _render_once(edge, dom, 8000, 120)
+    return html
 
 
 def main() -> int:
@@ -444,7 +467,7 @@ def main() -> int:
         ("空会话文案改了", d.get("heroL1") == "测试文案一号"),
         ("首屏跟着变", d.get("heroHasText") is True),
         ("素材 URL 走 /appearance/img", str(d.get("appearUrl") or "").startswith("/appearance/img?k=avatar")),
-        ("素材文件名回显", d.get("appearName") == "sticker-duck.jpg"),
+        ("素材文件名回显", d.get("appearName") == "hiru-bg.jpg"),
         ("素材代理取图 200", d.get("appearImg") == 200),
         ("素材能恢复默认", d.get("appearCleared") == "/assets/icon-256.png"),
         ("真实 _appearance.json 没被动过", appear_untouched),
