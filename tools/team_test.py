@@ -243,8 +243,10 @@ def main() -> int:
         fh.write("1\n")
 
     ca._ws_root = lambda aid: ws
-    scope = ca._snap_before_turn("11", "7")
-    ok("派活前落了轮快照（scope = cc-<chat>-<aid>）", scope == "cc-7-11", "%r" % (scope,))
+    snap = ca._snap_before_turn("11", "7")
+    # 实现返回 {scope, ts}（ts 用于 C3 时间线归属）；老版本返回裸字符串，两种都认
+    scope = snap.get("scope") if isinstance(snap, dict) else snap
+    ok("派活前落了轮快照（scope = cc-<chat>-<aid>）", scope == "cc-7-11", "%r" % (snap,))
 
     with open(os.path.join(ws, "a.txt"), "w", encoding="utf-8") as fh:
         fh.write("2222\n")

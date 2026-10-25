@@ -83,6 +83,8 @@ def main() -> int:
                  ' env_key = "DEEPSEEK_API_KEY" }\n')
 
     import server                                       # noqa: E402
+    import audit as _audit                              # noqa: E402
+    _audit.set_file(os.path.join(tmp, "_audit.jsonl"))   # ★别写真实审计链
     from engines.acp import agents                      # noqa: E402
     from engines.acp import service as svc_mod          # noqa: E402
 

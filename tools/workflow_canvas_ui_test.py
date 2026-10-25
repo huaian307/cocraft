@@ -246,7 +246,7 @@ function __node(id) { return document.querySelector('#collab-cv-nodes [data-node
     step("★左栏工作流按项目分组", wfRows.length === 1
          && /ws/.test(__t(document.getElementById("collab-wf-list"))), __t(document.getElementById("collab-wf-list")));
 
-    /* 1b. ★整窗 + 任务输入条搬到「小本子」的位置 */
+    /* 1b. ★整窗 + 任务输入条搬到「祈祷书」的位置 */
     var collabEl = document.getElementById("collab");
     var cst = getComputedStyle(collabEl);
     var compH = document.getElementById("composer").getBoundingClientRect().height;
@@ -256,7 +256,7 @@ function __node(id) { return document.querySelector('#collab-cv-nodes [data-node
          && Math.abs(ch - (window.innerHeight - compH)) < 8,
          "pos=" + cst.position + " h=" + Math.round(ch)
          + " expect=" + Math.round(window.innerHeight - compH));
-    step("★任务输入条搬到小本子（composer 里，画布上方不再有）",
+    step("★任务输入条搬到祈祷书（composer 里，画布上方不再有）",
          !!document.querySelector("#composer .collab-quick")
          && !document.querySelector("#collab-wf .collab-quick")
          && /这次要做什么/.test(__t(document.querySelector("#composer .composer-label"))),

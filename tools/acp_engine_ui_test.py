@@ -183,27 +183,18 @@ setTimeout(async function () {
     out.modeBtnW = bBtn ? Math.round(bBtn.getBoundingClientRect().width) : 0;
     out.modeBtnClipped = bBtn ? (bBtn.scrollWidth > bBtn.clientWidth + 1) : true;
 
-    // ---- 模型 API Key：设置里能填，且界面只拿到掩码 ----
-    // 现在**只有一个输入框**（值）+ 一个只读变量名标签（用户反馈"怎么有两个输入框"）
+    // ---- 模型凭据（0.2.22 起改成「厂商 → 账号」多凭据列表；老的「单 Key 输入框」已下线）----
+    // 单 Key 的保存 / 掩码流程由 tools/credentials_ui_test.py 专门盯，这里只锁结构不重复跑网络。
     var cfgBtn = document.getElementById("btn-cfg");
     if (cfgBtn) cfgBtn.click();
     await wait(900);
     out.keyRowThere = !!document.getElementById("cfg-key-row");
-    var varEl = document.getElementById("cfg-key-var");
-    out.keyNamePrefilled = (varEl || {}).textContent || "";
-    out.keyNameInputs = document.querySelectorAll("#cfg-key-row input").length;
-    out.keyVarReadonly = !!varEl && varEl.tagName !== "INPUT";
-    document.getElementById("cfg-key-value").value = "sk-abcdef1234567890";
-    document.getElementById("cfg-key-save").click();
-    await wait(900);
-    var note = (document.getElementById("cfg-key-note") || {}).textContent || "";
-    out.keyNote = note.slice(0, 160);
-    out.keyMasked = note.indexOf("sk-abcdef1234567890") < 0 && /sk-a|…|•/.test(note);
-    out.keyValueCleared = document.getElementById("cfg-key-value").value === "";
-    // 清除：值留空再保存（变量名沿用标签里那个）
-    document.getElementById("cfg-key-save").click();
-    await wait(700);
-    out.keyClearedNote = ((document.getElementById("cfg-key-note") || {}).textContent || "").slice(0, 80);
+    out.keyLabel = (((document.querySelector("#cfg-key-row > label") || {}).textContent) || "").trim().slice(0, 40);
+    out.credAdd = !!document.getElementById("cred-add");
+    out.credList = !!document.getElementById("cred-list");
+    out.legacyKeyGone = !document.getElementById("cfg-key-value")
+        && !document.getElementById("cfg-key-save")
+        && !document.getElementById("cfg-key-var");
 
     // ---- 空会话文案 + 自定义素材（头像/首图/贴纸）：改一下要立刻反映到首屏 ----
     var l1 = document.getElementById("cfg-hero-l1");
@@ -215,13 +206,15 @@ setTimeout(async function () {
     if (ms) ms.innerHTML = heroHtml();
     out.heroHasText = (ms ? ms.innerHTML : "").indexOf("测试文案一号") >= 0;
     // 真跑一遍写接口（APPEARANCE_FILE 已被指到临时目录）
-    await setAppearanceImage("hero", "D:/opencode-ui/frontend/assets/sticker-duck.jpg");
-    out.appearUrl = appearanceUrl("hero", "/assets/hero.jpg");
-    out.appearName = (document.querySelector('[data-img-name="hero"]') || {}).textContent || "";
-    try { out.appearImg = (await fetch(appearanceUrl("hero", "/assets/hero.jpg"))).status; }
+    // ⚠ 用 avatar 而不是 hero：0.2.55 起「空会话主图」那一行已删（首屏只留内联圣徽），
+    //    hero 没有 data-img-name 元素可回显了。
+    await setAppearanceImage("avatar", "D:/opencode-ui/frontend/assets/sticker-duck.jpg");
+    out.appearUrl = appearanceUrl("avatar", "/assets/icon-256.png");
+    out.appearName = (document.querySelector('[data-img-name="avatar"]') || {}).textContent || "";
+    try { out.appearImg = (await fetch(appearanceUrl("avatar", "/assets/icon-256.png"))).status; }
     catch (e) { out.appearImg = -1; }
-    await setAppearanceImage("hero", "");
-    out.appearCleared = appearanceUrl("hero", "/assets/hero.jpg");
+    await setAppearanceImage("avatar", "");
+    out.appearCleared = appearanceUrl("avatar", "/assets/icon-256.png");
   } catch (e) { out.error = String(e); }
   out.jsErrors = window.__probeErr;
   var pre = document.createElement("pre");
@@ -284,6 +277,7 @@ def main() -> int:
     tmpdir = tempfile.mkdtemp(prefix="acp_ui_test_")
     svc_mod.STATE_DIR = tmpdir
     svc_mod._ALWAYS_FILE = os.path.join(tmpdir, "_acp_always.json")
+    svc_mod.audit.set_file(os.path.join(tmpdir, "_audit.jsonl"))   # ★别写真实审计链
 
     # ⚠⚠ 自定义外观（POST /appearance）也会写状态文件 —— 同样必须指到临时目录，
     #   否则会污染真实的 runtime/state/_appearance.json（踩坑 #36 同一类坑）。
@@ -376,12 +370,10 @@ def main() -> int:
           "| 行:", d.get("impRows"), "| 内部行:", d.get("impInternalRows"), "| 切回项目:", d.get("impRowsAfterTab"))
     print("  行数:", d.get("impRows"), "| 点一下后弹窗关闭:", d.get("impClosed"),
           "| 面板会话 +", d.get("impDelta"), "| 当前:", d.get("impCurSession"))
-    print("  --- 模型 API Key ---")
-    print("  Key 行/只读变量名/输入框数:",
-          d.get("keyRowThere"), "/", d.get("keyNamePrefilled"), "/", d.get("keyNameInputs"))
-    print("  保存后提示:", d.get("keyNote"))
-    print("  只回掩码（无明文）:", d.get("keyMasked"), "| 值已清空:", d.get("keyValueCleared"))
-    print("  清除后提示:", d.get("keyClearedNote"))
+    print("  --- 模型凭据（多 Key）---")
+    print("  凭据行/标签:", d.get("keyRowThere"), "/", d.get("keyLabel"))
+    print("  添加按钮/凭据列表:", d.get("credAdd"), "/", d.get("credList"))
+    print("  老的单 Key 输入框已下线:", d.get("legacyKeyGone"), "（值/保存/只读变量名标签都不该在）")
     print("  脚本异常    :", d.get("error"), " JS错误:", d.get("jsErrors"))
 
     # 只读断言：整个测试**没有**把假 agent 的会话写进真实状态（隔离生效）
@@ -404,58 +396,66 @@ def main() -> int:
 
     opts = d.get("options") or []
     engs = d.get("engines") or []
-    ok = (
-        "acp" in opts and "opencode" in opts
-        and d.get("disabled") is False
-        and d.get("acpActive") == "acp" and (d.get("acpEsDelta") or 0) >= 1
-        and d.get("openActive") == "opencode" and (d.get("openEsDelta") or 0) >= 1
+    # 逐条命名 → 失败时能直接说出是哪一条（以前是一个大 and，只看到 BAD）
+    checks = [
+        ("引擎下拉含 acp/opencode", "acp" in opts and "opencode" in opts),
+        ("引擎下拉不禁用", d.get("disabled") is False),
+        ("切到 acp 生效 + SSE 重连", d.get("acpActive") == "acp" and (d.get("acpEsDelta") or 0) >= 1),
+        ("切回 opencode 生效 + SSE 重连",
+         d.get("openActive") == "opencode" and (d.get("openEsDelta") or 0) >= 1),
         # 引擎自述带 label/available（向导/设置据此标灰不可用引擎）
-        and len(engs) >= 2 and all(("label" in e and "available" in e) for e in engs)
+        ("引擎自述带 label/available",
+         len(engs) >= 2 and all(("label" in e and "available" in e) for e in engs)),
         # 不可用引擎：标「未就绪」+ disabled
-        and "（未就绪）" in str(d.get("optHtml2") or "")
-        and 'value="bad" disabled' in str(d.get("optHtml2") or "")
+        ("不可用引擎标「未就绪」", "（未就绪）" in str(d.get("optHtml2") or "")),
+        ("不可用引擎 disabled", 'value="bad" disabled' in str(d.get("optHtml2") or "")),
         # 编辑弹窗：能打开、预填、命令解析正确、能保存 provider
-        and d.get("editOpen") is True
-        and d.get("parsed") == ["C:\\Program Files\\x.exe", "--flag", "a"]
-        and d.get("savedProvider") == "deepseek"
-        and d.get("editClosed") is True
-        and d.get("badgeInHtml") is True
+        ("agentlist 编辑弹窗能打开", d.get("editOpen") is True),
+        ("命令解析", d.get("parsed") == ["C:\\Program Files\\x.exe", "--flag", "a"]),
+        ("能保存 provider", d.get("savedProvider") == "deepseek"),
+        ("保存后弹窗关闭", d.get("editClosed") is True),
+        ("卡片有「改」按钮", d.get("badgeInHtml") is True),
         # 模式切换：弹窗能开、列出可见模式、有 current 标记、点一下能切、按钮文案跟着变
-        and d.get("modeOpen") is True
-        and (d.get("modeRows") or 0) >= 2
-        and (d.get("modeMarked") or 0) >= 1
-        and d.get("modeClosed") is True
-        and (d.get("modeBtnAfter") or "") != ""
-        and (d.get("modeBtnW") or 0) > 34          # 放开 34px 方图标宽度（踩坑 #24）
-        and d.get("modeBtnClipped") is False       # 文字没被截断
+        ("模式弹窗能开", d.get("modeOpen") is True),
+        ("模式列表 >= 2 行", (d.get("modeRows") or 0) >= 2),
+        ("模式有 current 标记", (d.get("modeMarked") or 0) >= 1),
+        ("切换后模式弹窗关闭", d.get("modeClosed") is True),
+        ("模式按钮文案跟着变", (d.get("modeBtnAfter") or "") != ""),
+        ("模式按钮宽度 > 34px（踩坑 #24）", (d.get("modeBtnW") or 0) > 34),
+        ("模式按钮文字没被截断", d.get("modeBtnClipped") is False),
         # 从 agent 导入：按钮可见（acp 模式）、弹窗能开、列出 agent 侧会话、点一下导入并打开
-        and d.get("impBtnVisible") is True
-        and d.get("impOpen") is True
-        and (d.get("impRows") or 0) >= 2
-        and d.get("impTabs") is True
-        and (d.get("impProjectCount") or "") == "2"
-        and (d.get("impInternalCount") or "") == "1"
-        and (d.get("impInternalRows") or 0) == 1
-        and (d.get("impRowsAfterTab") or 0) >= 2
-        and d.get("impClosed") is True
-        and (d.get("impDelta") or 0) >= 1
-        # 模型 API Key：行在、能保存、界面只拿到掩码、值框被清空
-        and d.get("keyRowThere") is True
-        and d.get("keyMasked") is True
-        and d.get("keyNameInputs") == 1          # 只有一个输入框（不再手填变量名）
-        and d.get("keyVarReadonly") is True      # 变量名是只读标签
+        ("接续按钮可见", d.get("impBtnVisible") is True),
+        ("接续弹窗能开", d.get("impOpen") is True),
+        ("接续列表 >= 2 行", (d.get("impRows") or 0) >= 2),
+        ("项目/内部两个标签", d.get("impTabs") is True),
+        ("项目标签计数 2", (d.get("impProjectCount") or "") == "2"),
+        ("内部标签计数 1", (d.get("impInternalCount") or "") == "1"),
+        ("内部行 1 条", (d.get("impInternalRows") or 0) == 1),
+        ("切回项目后 >= 2 行", (d.get("impRowsAfterTab") or 0) >= 2),
+        ("接续后弹窗关闭", d.get("impClosed") is True),
+        ("接续后面板会话 +1", (d.get("impDelta") or 0) >= 1),
+        # 模型凭据：行在、是多凭据 UI（＋添加凭据 + 列表）、老的单 Key 输入框已彻底下线
+        ("凭据行存在", d.get("keyRowThere") is True),
+        ("有「＋ 添加凭据」", d.get("credAdd") is True),
+        ("有凭据列表", d.get("credList") is True),
+        ("老的单 Key 输入框已下线", d.get("legacyKeyGone") is True),
+        ("凭据行标签写「凭据」", "凭据" in str(d.get("keyLabel") or "")),
         # 空会话文案可改（改 SET + 立刻反映到 heroHtml）+ 自定义素材真能存取
-        and d.get("heroL1") == "测试文案一号"
-        and d.get("heroHasText") is True
-        and str(d.get("appearUrl") or "").startswith("/appearance/img?k=hero")
-        and d.get("appearName") == "sticker-duck.jpg"
-        and d.get("appearImg") == 200
-        and d.get("appearCleared") == "/assets/hero.jpg"
-        and appear_untouched
-        and d.get("keyValueCleared") is True
-        and leaked == 0
-        and not d.get("error") and not d.get("jsErrors")
-    )
+        ("空会话文案改了", d.get("heroL1") == "测试文案一号"),
+        ("首屏跟着变", d.get("heroHasText") is True),
+        ("素材 URL 走 /appearance/img", str(d.get("appearUrl") or "").startswith("/appearance/img?k=avatar")),
+        ("素材文件名回显", d.get("appearName") == "sticker-duck.jpg"),
+        ("素材代理取图 200", d.get("appearImg") == 200),
+        ("素材能恢复默认", d.get("appearCleared") == "/assets/icon-256.png"),
+        ("真实 _appearance.json 没被动过", appear_untouched),
+        ("真实状态没混进假 agent 会话", leaked == 0),
+        ("脚本没抛异常", not d.get("error")),
+        ("页面没有 JS 错误", not d.get("jsErrors")),
+    ]
+    bads = [name for name, val in checks if not val]
+    ok = not bads
+    if bads:
+        print("  未通过:", " / ".join(bads))
     print("\n  结论:", "[OK] 引擎切换 / SSE 重连 / agentlist 编辑 都正常" if ok else "[BAD] 有问题，见上面")
     return 0 if ok else 2
 

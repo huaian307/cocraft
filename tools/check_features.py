@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import struct
 import sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -150,6 +151,12 @@ CHECKS = [
     ("消息", "★本轮进展：不再有「一步步列表」的卡片（细节统一去轨迹页）", r"NOT:tc-rows"),
     ("消息", "★思考 / 工具已移出主界面（只记标记）", r"hadReasoning = true"),
     ("消息", "★只显示最终输出：旁白（后面还跟着工具）不进主界面", r"hasToolAfter"),
+    # ---- ★翻页按"看得见"的条数补页（2026-10-25：工具密集的会话会把上一轮推进「加载更早」）----
+    ("消息", "★翻页按**看得见**的条数补页（工具/思考/系统通知不渲染，一页 80 条可能一条都看不到）", r"const MSG_MIN_VISIBLE = 12;"),
+    ("消息", "★补页有上限（最多 6 页，别把整个会话一次拉进来）", r"const MSG_ENSURE_PAGES = 6;"),
+    ("消息", "★打开/刷新后自动补页（跟着底部时补，在读历史时不打扰）", r"await ensureVisibleHistory\(\);"),
+    ("消息", "★「看得见」按 DOM 里的 .msg 数算（不拿原始消息条数充数）", r'querySelectorAll\("\.msg"\)\.length'),
+    ("消息", "★点一次「加载更早」至少看得见一条新内容（全工具页自动再补，最多 3 页）", r"async function loadHistoryMore\(\)"),
     ("消息", "★系统注入通知（指令变更/日期/环境）不进主界面", r'if \(type === "system"\) return ""'),
     ("消息", "★系统通知归「轨迹」页（kind:note）", r'kind: "note", label: sysNoteLabel'),
     ("消息", "★系统通知短标题（指令变更 · 文件名）", r"function sysNoteLabel"),
@@ -183,7 +190,8 @@ CHECKS = [
     ("消息", "内容指纹（避免重建整块）", r"function signatureOf"),
     ("消息", "重渲染时保住展开状态", r"details\[data-k\]"),
     ("消息", "空会话首屏卡片", r"function heroHtml\("),
-    ("外观", "★首屏主图/贴纸/文案可自定义（SET.heroL1）", r"heroL1"),
+    ("消息", "★空会话首屏**只留圣徽**（不再渲染主图 / 贴纸）", r'class="hero-card hero-mk"'),
+    ("外观", "★首屏文案可自定义（SET.heroL1 / heroL2 / heroCredit）", r"heroL1"),
     ("外观", "自定义素材走 /appearance/img 代理", r"/appearance/img\?k="),
     ("外观", "选图走原生对话框 /pick/image", r'api\("/pick/image"'),
     ("外观", "★素材清单接口 /appearance", r'api\("/appearance"\)'),
@@ -235,6 +243,10 @@ CHECKS = [
     ("交互", "粘贴图片", r'"paste"'),
     ("交互", "拖拽文件", r'"drop"'),
     ("交互", "附件压缩", r"function shrinkImage"),
+    ("交互", "★附件压缩逐级再压（大图不会原样发出去→500）", r"\[\[MAX_EDGE, 0\.86\], \[1200, 0\.8\], \[900, 0\.75\]\]"),
+    ("交互", "★单个附件上限 4 MB（上游实测 5.5 MB 就 500）", r"MAX_ATTACH_BYTES = 4 \* 1024 \* 1024"),
+    ("交互", "★base64 长度再兜一道", r"dataUrl\.length > MAX_ATTACH_B64"),
+    ("交互", "★上游 500 空 body 时给人话（附件太大）", r"若刚发过附件，多半是附件太大"),
     ("交互", "左上角名字可编辑", r"plaintext-only"),
     ("交互", "主题记忆", r"localStorage\.setItem\(THEME_KEY"),
     ("交互", "侧栏状态记忆", r"localStorage\.setItem\(SIDEBAR_KEY"),
@@ -268,6 +280,31 @@ CHECKS = [
     ("壁纸", "清单定期重拉(新订阅免刷新)", r"5 \* 60 \* 1000"),
     ("壁纸", "播放速度可调", r"let liveRate = "),
     ("壁纸", "倍速赋值有越界保护", r"const setRate = \(r\)"),
+    # ---- 场景壁纸（scene.pkg → WebWallGL 实时渲染）----
+    ("壁纸", "★场景壁纸走 WebWallGL（懒加载 vendor）", r'const SCENE_LIB = "/vendor/webwallgl/webwallgl\.global\.min\.js"'),
+    ("壁纸", "场景按 hiruKind 分流（video / scene）", r'const kindOf = \(t\) =>'),
+    ("壁纸", "场景用 httpSource 取整个壁纸目录", r'lib\.httpSource\(base\)'),
+    ("壁纸", "场景默认不执行壁纸自带脚本（同源 eval 风险）", r"scripts: false"),
+    ("壁纸", "场景挂不上退回静态背景", r"场景壁纸渲染失败，已回退静态背景"),
+    ("壁纸", "展开时把最后一帧抓进 2D 定格层（同帧 drawImage）", r"g\.drawImage\(gl, 0, 0, w, h\)"),
+    ("壁纸", "定格层复用 .lb-scene 的定位（多一个 .lb-freeze）", r'c\.className = "lb-scene lb-freeze"'),
+    ("壁纸", "抓帧全黑视为失败（不把黑帧当背景）", r'throw new Error\("blank frame"\)'),
+    ("壁纸", "切走时销毁场景并释放 GL", r"sceneInst\.destroy\(\{ releasePkgCache: true \}\)"),
+    ("壁纸", "场景缩略图占位（没有 preview 时）", r"wp-thumb-scene"),
+    # ---- 壁纸设置独立页 + 「会话界面也动」----
+
+    ("壁纸", "★「会话界面也动」：展开也继续渲染", r"const playing = collapsed \|\| !!SET\.liveAlways"),
+    ("壁纸", "liveAlways 默认关（省电）", r"liveAlways: false"),
+    ("壁纸", "壁纸设置页登记到 OVERLAY（Esc 可关）", r'OVERLAY\.push\("wpc", wpcClose\)'),
+    # ---- 拖拽导入自定义壁纸（图片 → 静态；视频 → 动态）----
+    ("壁纸", "★拖拽上传走原始字节（不是 JSON）", r'"/wallpaper/upload\?name=" \+ encodeURIComponent'),
+    ("壁纸", "拖拽 dragover / drop 都拦下来", r'drop\.addEventListener\("drop"'),
+    ("壁纸", "只导入一个时自动应用", r'if \(ok === 1 && lastId\)'),
+    ("壁纸", "自定义壁纸可删除", r'async function deleteWallpaper\('),
+    ("壁纸", "★自定义静态图走 #custom-bg", r'root\.classList\.add\("has-custom-bg"\)'),
+    ("壁纸", "静态图不受「动态壁纸」开关影响", r'if \(kind === "image"\)'),
+    ("壁纸", "★聊天拖拽在选择器打开时让路（否则抢成附件）", r'wallPickerOpen\(\)'),
+    ("壁纸", "内置壁纸标「官方 · 内置」（且没有删除按钮）", r'tags\.push\("官方 · 内置"\)'),
     # ---- 设置面板 ----
     ("设置", "顶栏设置按钮", r'\$\("btn-cfg"\)'),
     ("设置", "背景亮度可调", r'--bg-dim'),
@@ -289,7 +326,7 @@ CHECKS = [
     ("设置", "两侧音频条起伏按倍数绘制", r"\* gain"),
     ("设置", "左上角名字设置", r'\$\("cfg-brand"\)'),
     ("设置", "左上角小标签设置", r'\$\("cfg-brand-sub"\)'),
-    ("设置", "名字默认值", r'BRAND_DEFAULT = "絵梨衣"'),
+    ("设置", "★名字默认值 = cocraft（不带角色名）", r'BRAND_DEFAULT = "cocraft"'),
     ("设置", "小标签默认值", r"BRAND_SUB_DEFAULT"),
     ("设置", "会话详情展开", r"function sessionDetailHtml"),
     ("设置", "会话详情状态记账", r"detailOpen"),
@@ -543,14 +580,22 @@ CHECKS = [
     ("群聊", "★C1 登出清掉活动（别留角标）", r"CC\.activity = \{\}"),
     ("设置", "新会话选目录走原生框 /pick/folder", r'api\("/pick/folder"'),
     ("设置", "记住上次工作目录", r"cocraft\.newsession\.dir"),
-    ("设置", "首次设置应用引擎/agent", r"async function setupNext"),
+    ("设置", "★首次设置：应用引擎 / agent（选完立刻套用，模型清单才准）", r"async function setupApplyChoice"),
+    ("设置", "★首次设置：一页拉模型清单（拿不到也不挡着完成）", r"async function setupLoadModels"),
+    ("设置", "★首次设置：一次写入（Key + 默认模型）后重启", r"async function setupDone"),
+    ("设置", "★首次设置：说明跟着引擎变（OpenCode 不需要 Key）", r'OpenCode 引擎：只需要选好默认模型'),
+    ("设置", "★切引擎：只对 opencode-acp 才尝试接续（别人不认这条会话）",
+     r'async function setupCanContinueFromOpenCode'),
+    ("设置", "★切引擎：接续前先确认目标 agent = opencode-acp",
+     r'return active === "opencode-acp";'),
+    ("设置", "★首次设置不再有「下一步」两段式", r'NOT:setup-next'),
     # ---- 微信（截图+OCR 只读识别；回复必须二次确认）----
-    # ---- 龙族视觉 + 歌词翻译 ----
-    ("龙族", "歌词翻译开关", r'\$\("cfg-zh"\)'),
-    ("龙族", "翻译开关默认开启", r"zh: true"),
-    ("龙族", "按开关决定是否翻译", r"&tr=\$\{SET\.zh \? 1 : 0\}"),
-    ("龙族", "译文渲染成小字行", r'<span class="zh">'),
-    ("龙族", "关翻译时隐藏译文", r"no-lyrics-zh"),
+    # ---- 教堂视觉 + 歌词翻译 ----
+    ("视觉层", "歌词翻译开关", r'\$\("cfg-zh"\)'),
+    ("视觉层", "翻译开关默认开启", r"zh: true"),
+    ("视觉层", "按开关决定是否翻译", r"&tr=\$\{SET\.zh \? 1 : 0\}"),
+    ("视觉层", "译文渲染成小字行", r'<span class="zh">'),
+    ("视觉层", "关翻译时隐藏译文", r"no-lyrics-zh"),
     # ---- 对话引擎（后端 /engine；S4）----
     ("引擎", "引擎状态接口", r'api\("/engine/status"\)'),
     ("引擎", "引擎切换接口", r'api\("/engine",\s*\{\s*method:\s*"POST"'),
@@ -862,7 +907,33 @@ CHECKS = [
     ("本地协作", "★「推荐 X」可点跳列", r"function collabJumpPick"),
     ("本地协作", "★重跑（同成员发新任务）", r"function collabRerun"),
     ("本地协作", "★信任面板接入：去处理 / 打开工作台", r"data-orch-run"),
-    ("本地协作", "★导出审计（JSON，不含成员正文）", r"function collabExport"),
+    ("本地协作", "★导出审计（服务端权威链，不含成员正文）", r"function collabExport"),
+    ("本地协作", "★导出审计走 /audit/export?run=（不再由前端拼）", r"api\(`/audit/export\?run=\$\{encodeURIComponent\(run\.id\)\}`\)"),
+    ("本地协作", "★运行记录另有导出（成员/活动/结论；不是审计）", r"function collabExportRun"),
+    ("本地协作", "★「导出记录」按钮 + 点击接线", r"data-collab-run-export"),
+    ("审计链", "★面板显示「链完整 / 第 N 条断裂」（不假装完整）", r"断裂 \$\{broken\.length"),
+    ("审计链", "★「重新校验」按钮（逐条重算哈希）", r"data-audit-verify"),
+    ("审计链", "★「导出」按钮（带文件头与链尾，可离线复核）", r"data-audit-export"),
+    ("审计链", "★「导出 CSV」按钮（Excel 留档，仍可逐行复核）", r"data-audit-csv"),
+    ("审计链", "★CSV 走 /audit/export?format=csv + 读响应头条数", r'res\.headers\.get\("X-Audit-Records"\)'),
+    ("审计链", "★空链时说「还没有审批记录」（不是界面坏了）", r"还没有审批记录"),
+    ("审计链", "★C3：读审计链里的 kind=files（不是另存一份）", r'api\("/audit/list\?source=ccagent&kind=files&limit=12"\)'),
+    ("审计链", "★C3：列出谁 + 改了哪些文件 + 增删改计数", r"改了文件|paths\.slice\(0, 2\)"),
+    ("审计链", "★C3：没有记录时说清「改了文件才会记」（不存内容）", r"还没有文件改动记录"),
+    ("审计链", "★「导出报告」按钮（一页 Markdown，可交同事/甲方）", r"data-audit-report"),
+    ("审计链", "★报告走 /audit/report 并下载 .md", r"cocraft-audit-report-.*\.md"),
+    ("审计链", "★归档数量显示出来（不是「看不见了」）", r"含归档 \$\{arch\.records\} 条"),
+    ("主题", "★切主题时清掉用户主题叠加（data-theme-user / 注入 CSS / 图标槽）", r'function applyTheme\(theme\) \{\s*\n\s*const id = normThemeId\(theme\);'),
+    ("主题", "★JS 注释里不再有「龙族校徽」", r'NOT:龙族'),
+    ("主题", "★老用户提示：存着 hiru 的人在侧栏看到一次「换成圣烛教堂」", r'function themeHintOnce\(saved\)'),
+    ("审计链", "★面板的 fetch 带 X-Cocraft-UI 标记", r'"X-Cocraft-UI": "1"'),
+    # ---- ★窗口 / 托盘标题跟随「左上角名字」（0.2.46，前端侧）----
+    ("窗口标题", "★前端拼成品标题：`cocraft · <名字>`（名字= cocraft 时只写 cocraft）",
+     r'const docTitle = use\.toLowerCase\(\) === "cocraft" \? "cocraft" : "cocraft · " \+ use;'),
+    ("窗口标题", "★改名 / 启动时 POST /panel/title（守护 / 托盘读不到 localStorage）", r'api\("/panel/title", \{ method: "POST"'),
+    ("窗口标题", "★失败就算了（标题退回默认 cocraft，不挡界面）", r'function pushPanelTitle\(title\)'),
+    ("审计链", "★信任面板读 /audit/stats + POST /audit/verify", r'api\("/audit/verify", \{ method: "POST", body: "\{\}" \}\)'),
+    ("审计链", "★校验不过就常驻横幅（sticky，别一闪就没）", r"审计链有断裂"),
     ("本地协作", "旧的一次性启动函数已删（工作流是唯一入口）", r"NOT:async function collabStart\(\)"),
     # ---- ★运行历史删除 / 多任务并行（0.2.5）----
     ("本地协作", "★删除运行记录（先本地删 + 后台对账）", r"function collabDeleteRun"),
@@ -895,8 +966,8 @@ CHECKS = [
     ("工作流", "★加 / 删阶段", r"function collabAddStage"),
     ("工作流", "★拖阶段连带成员一起动", r"const isStage = !!collabStageById"),
     ("工作流", "★连线按方位选锚点（上/下/左/右，节点拖哪都连得明白）", r"function cvEdgePath"),
-    ("工作流", "★工作台整窗：按小本子高度让位", r"function collabSyncFullscreen"),
-    ("工作流", "★任务输入条搬进 / 搬出小本子", r"function collabComposerSync"),
+    ("工作流", "★工作台整窗：按祈祷书高度让位", r"function collabSyncFullscreen"),
+    ("工作流", "★任务输入条搬进 / 搬出祈祷书", r"function collabComposerSync"),
     ("工作流", "★底部输入 Enter / 送出 → 工作流开跑", r"if \(collabIsOpen\(\)\) \{\s*\n\s*await collabQuickRun\(\)"),
     ("工作流", "★按角色分阶段（实现 → 审查）", r"function collabSplitStagesByRole"),
     ("工作流", "★默认排布：阶段在左、成员在右", r"memberX: 250"),
@@ -908,11 +979,19 @@ CHECKS = [
     ("安全", "★agent 卡片标危险（前排红字）", r"a\.dangerous \?"),
 ]
 
-# index.html 也要有：龙族标记 / 弹窗 / 控件（这些不是 app.js 里的东西）
+# index.html 也要有：圣徽标记 / 弹窗 / 控件（这些不是 app.js 里的东西）
 HTML_CHECKS = [
-    ("龙族", "半朽世界树校徽(SVG symbol)", r'id="mk-tree"'),
-    ("龙族", "弹窗标题引用校徽", r'<use href="#mk-tree"'),
-    ("龙族", "设置里的歌词翻译开关", r'id="cfg-zh"'),
+    ("圣徽", "世界树标记（hiru 用的 SVG symbol）", r'id="mk-tree"'),
+    ("圣徽", "弹窗标题引用世界树标记（hiru）", r'class="mk-tree" href="#mk-tree"'),
+    ("圣徽", "★题字：设置/AKey/向导用的是「圣器室」（不再是装备部）", r'class="mk-cap">圣器室<'),
+    ("圣徽", "★题字：模型/模式用的是「祷言名录」（不再是言灵周期表）", r'class="mk-cap">祷言名录<'),
+    ("圣徽", "★题字：技能用「祷言」、音乐用「圣咏」", r'class="mk-cap">祷言<|class="mk-cap">圣咏'),
+    ("圣徽", "★题字：壁纸用「彩窗」（不再是尼伯龙根）", r'class="mk-cap">彩窗<'),
+    ("圣徽", "★输入框叫「祈祷书」（不带角色名）", r'composer-label">祈祷书<'),
+    ("圣徽", "★index.html 里不再有《龙族》词汇", r'NOT:装备部|言灵|尼伯龙根|半朽|卡塞尔'),
+    ("圣徽", "★index.html 里不再有「絵梨衣 / 绘梨衣」", r'NOT:絵梨衣|绘梨衣|落尽红樱'),
+    ("圣徽", "★圣烛教堂的圣徽（尖拱窗 + 烛焰）", r'class="mk-chapel" href="#mk-chapel"'),
+    ("视觉层", "设置里的歌词翻译开关", r'id="cfg-zh"'),
     ("设置", "设置里的任务栏开关", r'id="cfg-taskbar"'),
     ("设置", "★设置里的液态玻璃开关", r'id="cfg-glass"'),
     ("设置", "★金色光点开关", r'id="cfg-gold"'),
@@ -922,6 +1001,14 @@ HTML_CHECKS = [
     ("更新", "★GitHub Token：输入框 + 保存按钮（可选，提到 5000 次/小时）", r'id="upd-token-value"'),
     ("更新", "★GitHub Token：当前状态只显示掩码", r'id="upd-token-var"'),
     ("更新", "★模型 Key 的实时提示带 data-live（否则被 tooltip 收起、保存后看不到掩码）", r'id="cfg-key-note" data-live'),
+    # ---- ★官方软件图标（0.2.45）----
+    ("主题", "★默认主题 = chapel（<html data-theme=\"chapel\">）", r'<html lang="zh-CN" data-theme="chapel"'),
+    ("主题", "★弹窗圣徽换成「尖拱窗 + 烛焰」(#mk-chapel)", r'<symbol id="mk-chapel"'),
+    ("主题", "★设置里两张内置主题卡（chapel / hiru）", r'id="cfg-theme-builtin"'),
+    ("主题", "★老用户提示条容器（§ 侧栏，一次性）", r'id="theme-hint"'),
+    ("图标", "★网页 favicon 用 SVG（现代浏览器清晰）+ ico 兜底", r'rel="icon" href="/assets/icon\.svg\?v='),
+    ("图标", "★favicon 同时给 .ico（老浏览器 / WebView2）", r'rel="icon" href="/assets/cocraft\.ico\?v='),
+    ("窗口标题", "★页面 <title> 用中性默认（名字由 JS 拼上）", r'<title>cocraft</title>'),
     ("更新", "★向导里的模型 Key 实时提示也带 data-live", r'id="setup-key-note" data-live'),
     ("消息", "★顶栏「轨迹」按钮", r'id="btn-trace"'),
     ("消息", "★往上翻页：消息区顶部的提示 / 按钮容器", r'id="msg-more"'),
@@ -934,6 +1021,10 @@ HTML_CHECKS = [
     ("工作流", "★「分阶段」按钮（按角色拆）", r'id="collab-wf-split"'),
     # ---- ★消息导航（0.2.2）：回到底部 / 问题导航 ----
     ("消息", "★消息导航容器（贴消息区右下角）", r'id="msg-nav"'),
+    # ---- ★审计链（0.2.39）：信任面板里那一节 ----
+    ("审计链", "★信任面板「审计链」一节（条数 / 链完整 / 最后时间）", r'id="trust-audit"'),
+    ("审计链", "★审计链一节带说明（谁批准了什么 · 可校验）", r'id="trust-audit-note"'),
+    ("审计链", "★C3「AI 成员改了什么」一节", r'id="trust-files"'),
     # ★接续弹窗：项目 / 内部会话分标签（群聊 AI 成员 / 本地协作不混进项目列表）
     ("消息", "★接续弹窗：项目 / 内部标签条", r'id="imp-tabs"'),
     ("消息", "★接续弹窗：项目会话标签", r'data-imp-tab="project"'),
@@ -991,14 +1082,18 @@ HTML_CHECKS = [
     ("消息", "★用户提问的编辑提示条", r'id="edit-bar"'),
     ("消息", "★编辑提示条里的取消按钮", r'id="edit-cancel"'),
     ("外观", "头像/素材选择行（data-img）", r'data-img="brand"'),
-    ("外观", "空会话主图可换", r'data-img="hero"'),
-    ("外观", "空会话贴纸可换", r'data-img="sticker2"'),
+    ("外观", "★首屏不再引用同人图（hero.jpg / sticker-*.jpg）", r'NOT:hero\.jpg|sticker-duck|sticker-couple'),
+    ("外观", "★设置里不再有「空会话主图 / 贴纸」那三行", r'NOT:data-img="hero"|data-img="sticker'),
+
     ("外观", "空会话文案可改", r'id="cfg-hero-l1"'),
     ("外观", "空会话署名可改", r'id="cfg-hero-credit"'),
     ("中性化", "provider 自动推断按钮", r'id="ae-guess"'),
     ("中性化", "编辑按钮文案（不再只改命令）", r'编辑当前 agent…'),
     ("设置", "首次设置 agent 下拉", r'id="setup-agent"'),
     ("设置", "首次设置模型下拉", r'id="setup-model"'),
+    ("设置", "★首次设置：默认模型行一开始就显示（不再 hidden）", r'id="setup-model-row">'),
+    ("设置", "★首次设置：只有一个「完成并重启」", r'id="setup-done" class="primary">完成并重启'),
+    ("设置", "★首次设置：不再有固定序号（OpenCode 下只显示 2 项，序号会像缺项）", r'NOT:① 对话引擎'),
     ("设置", "设置里的左上角名字输入框", r'id="cfg-brand"'),
     ("设置", "设置里的小标签输入框", r'id="cfg-brand-sub"'),
     ("设置", "侧栏小标签元素", r'id="brand-sub"'),
@@ -1019,6 +1114,15 @@ HTML_CHECKS = [
     ("壁纸", "设置里动态壁纸目录输入框", r'id="cfg-wall-root"'),
     ("壁纸", "选择壁纸目录按钮", r'id="cfg-wall-root-pick"'),
     ("壁纸", "壁纸目录恢复自动按钮", r'id="cfg-wall-root-auto"'),
+    ("壁纸", "★壁纸设置独立页（#wpc）", r'id="wpc"'),
+    ("壁纸", "★设置里「壁纸与外观…」入口", r'id="cfg-wallpaper"'),
+    ("壁纸", "★「会话界面也动」开关", r'id="wpc-always"'),
+    ("壁纸", "★「壁纸与外观」那些行**直接**写在 #wpc-body 里（不靠运行时搬）",
+     r'id="wpc-body"[\s\S]{0,6000}id="cfg-dim-hiru"'),
+    ("壁纸", "★不再有 WPC_ROWS / wpcBuild 那套搬节点", r'NOT:WPC_ROWS'),
+    ("壁纸", "★壁纸选择器里的拖拽导入区", r'id="wp-drop"'),
+    ("壁纸", "拖拽区里也能点选文件", r'id="wp-drop-pick"'),
+    ("壁纸", "自定义静态背景图层", r'id="custom-bg"'),
     ("音乐", "音乐音频元素", r'id="mus-audio"'),
     ("音乐", "播放条折叠箭头", r'id="p-fold"'),
     ("音乐", "设置里贴Cookie", r'id="cfg-ck-qq"'),
@@ -1340,7 +1444,7 @@ CSS_CHECKS = [
     # ---- ★本地协作工作台（0.2.1）----
     ("本地协作", "★全页容器（替换消息区）", r"\.collab-home \{"),
     ("本地协作", "★整窗：给底部输入区让位", r"--collab-bottom"),
-    ("本地协作", "★任务输入条搬进小本子", r"#composer\.collab-input \.collab-quick"),
+    ("本地协作", "★任务输入条搬进祈祷书", r"#composer\.collab-input \.collab-quick"),
     ("本地协作", "★「分阶段」按钮高亮（旧单阶段工作流）", r"#collab-wf-split\.attention"),
     ("群聊", "★成员行「权限上限」下拉（只紧不松）", r"\.cc-ai-opts \.cc-ai-perm"),
     ("群聊", "★行里显示当前生效等级", r"\.cc-ai-eff"),
@@ -1352,6 +1456,13 @@ CSS_CHECKS = [
     ("本地协作", "★hidden 要压过 display:flex（否则空态和详情同时占位）", r"\.collab-empty\[hidden\]"),
     ("本地协作", "★项目筛选 chip + 历史行项目徽章", r"\.collab-proj-chip \{"),
     ("本地协作", "★项目徽章不换行（长了省略号）", r"\.collab-run-proj em \{[^}]*text-overflow: ellipsis"),
+    ("主题", "★chapel 底盘变量：暖黑 + 米白 + 烛焰金 + 绣线金", r'\[data-theme="chapel"\] \{\s*\n\s*--paper:\s*#17120f;'),
+    ("主题", "★静态背景槽：chapel 用同一张官方壁纸（暖黑纱 + 烛光余晖）", r'#static-bg \.sb\[data-bg="chapel"\]'),
+    ("主题", "★CSS 里不再有《龙族》词汇（龙族/言灵/黄金瞳/半朽）", r'NOT:龙族|言灵|黄金瞳|半朽'),
+    ("主题", "★chapel 玻璃参数：暖棕黑 tint + 金色 hairline", r'--g-tint: 30,24,19;'),
+    ("主题", "★主按钮改成烛金渐变 + 深色字（白字压金看不清）", r'\[data-theme="chapel"\] button\.primary \{'),
+    ("主题", "★危险按钮在顶栏也保持红（别被 `#topbar .actions button` 的 color 盖掉）", r'\[data-theme="chapel"\] #topbar \.actions button\.danger'),
+    ("主题", "★顶栏 / 图标的圆角用 chapel 那套（比纸面更软）", r'border-radius: 8px 8px 6px 6px;'),
     ("工作流", "★画布网格底 + 节点卡片", r"\.cv-node \{"),
     ("工作流", "★连线（审查用虚线）", r"\.cv-edges path\.dash"),
     ("工作流", "★工作流列表行（项目分组）", r"\.collab-wf-row \{"),
@@ -1365,7 +1476,10 @@ CSS_CHECKS = [
 # Inno 安装脚本（注释是 `;`，单独扫）
 ISS_CHECKS = [
     ("安装包", "★组件 payload 用 DirExists 判断（FileExists 对目录为假！）", r"DirExists\("),
-    ("安装包", "★不再随包频谱组件（audio 已移除；music 已回归）", r'NOT:Name: "audio"'),
+    # ---- ★官方图标（0.2.45）：安装包 exe + 快捷方式 + 卸载项都用它 ----
+    ("安装包", "★安装包 exe 自己带官方图标（SetupIconFile）", r"SetupIconFile=\{#PayloadDir\}\\app\\frontend\\assets\\cocraft\.ico"),
+    ("安装包", "★卸载项显示官方图标（UninstallDisplayIcon）", r"UninstallDisplayIcon=\{app\}\\frontend\\assets\\cocraft\.ico"),
+    ("安装包", "★开始菜单 / 桌面快捷方式用官方图标（IconFilename）", r'IconFilename: "\{app\}\\frontend\\assets\\cocraft\.ico"'),    ("安装包", "★不再随包频谱组件（audio 已移除；music 已回归）", r'NOT:Name: "audio"'),
     ("安装包", "★agent 组件**可选**（用户只装自己用的；可重跑安装包补装）", r'Name: "agent_opencode";\s*Description:'),
     ("安装包", "★agent 组件**不再是 fixed**（`0.1.82` 起）", r'NOT:Name: "agent_(codex|claude|opencode)";[^\n]*Flags: fixed'),
     ("安装包", "★随包 OpenCode 组件", r'Name: "agent_opencode"'),
@@ -1393,6 +1507,20 @@ ISS_CHECKS = [
 ]
 
 PY_CHECKS = [
+    ("壁纸", "★官方内置动态壁纸（随包、不可删）", r"def builtin_wallpapers\(\)"),
+    ("壁纸", "官方内置壁纸不可删（400 人话）", r"官方内置壁纸不可删除"),
+    ("壁纸", "★没选过时官方内置即默认", r"_bl = builtin_wallpapers\(\)"),
+    ("壁纸", "官方内置是动态壁纸（/assets/videos/official-bg.mp4）", r'OFFICIAL_BG_URL = "/assets/videos/official-bg.mp4"'),
+    ("壁纸", "★内置壁纸 kind=video（照常走视频管线）", r'"url": OFFICIAL_BG_URL'),
+    ("壁纸", "★自定义壁纸：存盘 + 索引（按内容 sha1 去重）", r"def wp_custom_add\("),
+    ("壁纸", "★自定义壁纸：raw 字节上传端点", r'path == "/wallpaper/upload"'),
+    ("壁纸", "自定义壁纸文件走 Range 流式", r"def _wallpaper_file\("),
+    ("壁纸", "只收常见图片 / 视频扩展名", r"WP_IMAGE_EXT = \("),
+    ("壁纸", "custom:<id> 也能被 live 解析", r'if str\(wid\)\.startswith\("custom:"\):'),
+    ("壁纸", "★后端列 scene 壁纸（给 WebWallGL 用）", r"def list_scene_wallpapers\(\)"),
+    ("壁纸", "★后端回 hiruKind / yoruKind 让前端分流", r'out\[theme \+ "Kind"\]'),
+    ("壁纸", "壁纸选择器同时列 video + scene", r"list_video_wallpapers\(\) \+ list_scene_wallpapers\(\)"),
+    ("壁纸", "scene 的 url 指向壁纸目录（带末尾斜杠）", r'base = "/we/" \+ quote\(wid\) \+ "/"'),
     ("群聊AI", "★桥：建 agent（上游）", r"def create_agent"),
     ("群聊AI", "★桥：被 @ 生成回复", r"def _ask"),
     ("群聊AI", "★桥：用成员自己的 WS 回帖", r"def _send_message"),
@@ -1648,7 +1776,8 @@ PY_CHECKS = [
     ("ACP会话", "★读不到库 → None（绝不把读不到当全都删了）", r"path = _opencode_db\(\)\s*\n\s*if not path:\s*\n\s*return None"),
     ("ACP会话", "★对账：只对 opencode-acp 做", r"def _prune_deleted_at_source"),
     ("ACP会话", "★载入时就对一次账（force=True）", r"_prune_deleted_at_source\(force=True\)"),
-    ("ACP会话", "★列会话时也对账（节流，5 秒）", r"_prune_deleted_at_source\(\)\s*\n\s*with self\._lock"),
+    ("ACP会话", "★列会话时也对账（节流，5 秒）：opencode 对共享库 + 各家清「接续空壳」",
+     r"_prune_deleted_at_source\(\)\s*\n\s*self\._prune_orphan_imports\(\)"),
     ("ACP会话", "★只比对与 agent 对应的 id（本地草稿不碰）", r"target = asid or"),
     ("ACP会话", "★库读不到就放弃同步", r"ids = _opencode_session_ids\(\)\s*\n\s*if ids is None"),
     ("ACP会话", "★别把路径里的 opencode-ui 当 OpenCode（假 agent 会被误删）", r'has_acp = any\(t == "acp"'),
@@ -1943,11 +2072,86 @@ PY_CHECKS = [
     ("可逆执行", "★同毫秒并发落快照时让开一个（别互相覆盖）", r'ts \+= "x"'),
     ("可逆执行", "★内容仓**硬上限**（超了丢最旧的快照 + 回收）", r"def _enforce_store_budget"),
     ("可逆执行", "★但每个 scope 至少留 MIN_SNAPSHOTS 次（别把撤销弄没了）", r"MIN_SNAPSHOTS"),
+    # ---- ★审计链：append-only + 哈希链（2026-10-24）----
+    ("主题", "★内置主题清单：chapel（默认）+ hiru（和纸白昼）", r'"id": "chapel", "name": "圣烛教堂（默认）"'),
+    ("主题", "★默认主题常量 DEFAULT_THEME = chapel（回落也用它）", r'DEFAULT_THEME = "chapel"'),
+    ("ACP", "★接续：agent 名录里没有的会话直接拒绝（不建同名空壳）", r'当前 agent 里没有这条会话'),
+    ("ACP", "★清掉「接续失败留下的空会话」（imported + 0 消息 + 名录里没有）",
+     r'def _prune_orphan_imports'),
+    ("审计链", "★底座：链哈希 = sha256(canonical(记录去 hash) + prev)", r"def _digest\(body: dict, prev: str\)"),
+    ("审计链", "★canonical JSON 用 sort_keys（换个键序不改哈希）", r"sort_keys=True"),
+    ("审计链", "★只追加：open(..., \"a\") 不重写（重写就能被静默抹掉）", r'open\(_path\(\), "a", encoding="utf-8"'),
+    ("审计链", "★跨进程锁（server.py 与群聊桥会同时写）", r"msvcrt\.locking\(fh\.fileno\(\), msvcrt\.LK_LOCK, 1\)"),
+    ("审计链", "★fail-open：写不进审计也不能挡住权限流程", r"审计落盘失败绝不能挡住"),
+    ("审计链", "★校验：逐条重算 + prev 必须能解析", r"def verify\(items=None, subset: bool = False\)"),
+    ("审计链", "★区间导出：首条 prev 只当锚点（否则筛选导出永远报断）", r"if subset and seq_items"),
+    ("审计链", "★导出带文件头 format/version/tail/engine（能被别人独立验）", r'"format": FORMAT'),
+    ("审计链", "★导出前先自校验（导出文件里带 chain.ok）", r"verify\(items, subset=narrowed\)"),
+    ("审计链", "★路由 /audit/*（本地路由，不走上游代理）", r'path == "/audit" or path\.startswith\("/audit/"\)'),
+    ("审计链", "★GET /audit/export 可下载成文件（交甲方/同事）", r'attachment; filename="%s"'),
+    ("审计链", "★CSV 导出：列头定死（加列只能往后加，别重排）", r"CSV_FIELDS = \["),
+    ("审计链", "★CSV 每行带 prev/hash（所以 CSV 也能逐行重算）", r'"prev", "hash",'),
+    ("审计链", "★CSV：targets 用 JSON 列（逗号/竖线不打架）", r'json\.dumps\(act\.get\("targets"\) or \[\], ensure_ascii=False, separators=\("\,", ":"\)\)'),
+    ("审计链", "★CSV：纯表格、无前导说明行（Excel 能直接开）", r'w\.writerow\(CSV_FIELDS\)'),
+    ("审计链", "★CSV：带 BOM 且能读回来（Excel 中文不乱码）", r'utf-8-sig'),
+    ("审计链", "★CSV：也能被校验脚本重建（csv_records）", r"def csv_records\(text: str\) -> list"),
+    ("审计链", "★路由 /audit/export?format=csv（text/csv + 附件）", r'"Content-Type", "text/csv; charset=utf-8"'),
+    ("审计链", "★CSV 的链尾/条数放在响应头（不污染表格）", r'"X-Audit-Tail"'),
+    ("审计链", "★CSV 一律当文件下载（不当 JSON 返回）", r'if fmt == "csv":'),
+    ("审计链", "★非法 format 明确拒绝", r'format 只支持 json / csv'),
+    ("审计链", "★C3 接线：轮快照返回 scope+ts（能对回哪一轮）", r"return \{\"scope\": scope, \"ts\": str\(\(res or \{\}\)\.get\(\"ts\"\) or \"\"\)\}"),
+    ("审计链", "★C3：这一轮改了什么 → 写进链（source=ccagent / kind=files）", r'"kind": "files", "title"'),
+    ("审计链", "★C3：只记文件名 + 计数（不存内容，所以不给一键回滚）", r"with_content=False"),
+    ("审计链", "★C3：没改动就不入链（别刷空记录）", r'if not res\.get\("ok"\) or not res\.get\("files"\):'),
+    ("审计链", "★C3：统计失败不影响回帖", r"轮改动统计失败"),
+    ("审计链", "★查询支持 kind 过滤（按动作类型筛）", r'want_kind = filters\.get\("kind"\)'),
+    ("审计链", "★保留期：主文件超阈值才归档（可关，默认 4 MB / 留 1 MB）", r"def maybe_rotate\(\) -> dict"),
+    ("审计链", "★归档逐字节搬（哈希不变）到 _audit-archive/<首seq>-<末seq>.jsonl", r'name = "%06d-%06d\.jsonl"'),
+    ("审计链", "★归档这件事也写进链（不是偷偷删）", r'"kind": "archive"'),
+    ("审计链", "★读取同时带上归档（跨文件仍是同一条链）", r"for p in archive_files\(\) \+ \[_path\(\)\]"),
+    ("审计链", "★seq 重复时保留先读到的（切换瞬间不双计）", r"if s in seen:"),
+    ("审计链", "★stats 报归档条数/文件数", r'"archived": \{"files"'),
+    ("审计链", "★一页报告（Markdown：结论分布 / 破坏性逐条 / 明细）", r"def report\(since: float = 0\.0"),
+    ("审计链", "★报告不含成员正文（只给决定/命令/目标）", r"不含成员正文"),
+    ("审计链", "★路由 GET /audit/report（可 download）", r'"cocraft-audit-report-%s\.md"'),
+    ("审计链", "★路由 POST /audit/archive（手动归档，maxMb/keepMb）", r'if sub == "archive" and method == "POST"'),
+    ("审计链", "★签名：复用 ssh-keygen（自己不搓密码学）", r'"-Y", "sign"'),
+    # ---- ★「谁干的」：面板点的 vs 本机接口调的（2026-10-25）----
+    ("审计链", "★记录带 via（ui=面板点的 / api=本机接口 / system=程序内部）", r'"via": str\(via or "system"\)'),
+    ("审计链", "★服务端按请求头判 via（agent/脚本直接发 HTTP 没有这个头）", r'self\.headers\.get\("X-Cocraft-UI"\)'),
+    ("审计链", "★接口调的记「本机接口（未经面板）」—— 不冒充人", r"本机接口（未经面板）"),
+    ("审计链", "★恢复/删除恢复点/撤销 都按 via 记 actor", r"actor=self\._actor_by_via\(\)"),
+    ("审计链", "★CSV 的 via 加在最后一列（加列只能往后加）", r'"via",\s+# ★加在最末尾'),
+    ("审计链", "★老记录（没有 via）导出 CSV 不硬塞空值（否则假报断）", r'if row\.get\("via"\):'),
+    # ---- ★官方图标（0.2.45）：托盘 + 原生窗口读同一份 ico ----
+    ("图标", "★托盘用官方 ico（pystray/PIL 打开）", r'os\.path\.join\(root, "frontend", "assets", "cocraft\.ico"\)'),
+    ("图标", "★原生窗口（WebView2）也用同一份 ico", r'"frontend", "assets", "cocraft\.ico"'),
+    # ---- ★窗口 / 托盘标题跟随「左上角名字」（0.2.46）----
+    ("窗口标题", "★后端落盘 `_panel_title.json`（三方共享的唯一来源）", r'PANEL_TITLE_FILE = os\.path\.join\(STATE_DIR, "_panel_title\.json"\)'),
+    ("窗口标题", "★标题归一（压平空白 / 去控制字符 / 最多 60）", r"def norm_panel_title\(text\) -> str"),
+    ("窗口标题", "★路由 GET/POST /panel/title", r'path == "/panel/title"'),
+    ("窗口标题", "★守护每次开窗前读它（--title）", r"title = panel_title_desired\(\)"),
+    ("窗口标题", "★原生窗口运行中改名 → SetWindowTextW 立刻生效", r"_user32\.SetWindowTextW\(hwnd, want\)"),
+        ("窗口标题", "★后端也归一：名字= cocraft 时标题只写一个 cocraft", r'def _collapse_title'),
+("窗口标题", "★浏览器模式不抢标题（跟 document\.title）", r"def _is_native_window\(pid: int\) -> bool"),
+    ("窗口标题", "★托盘 tooltip 也每 0.8s 跟一下", r'icon\.title = want'),
+    # ---- ★官方主题「圣烛教堂」(chapel)（0.2.47）：默认主题 ----
+    ("审计链", "★接线：群聊审批结论进链", r'audit\.append\(\s*"ccagent"'),
+    ("审计链", "★接线：工作台审批结论进链（带 run/member/perm）", r'audit\.append\(\s*"collab"'),
+    ("审计链", "★接线：人工批准才记 approver（超时/取消不冒充有人批）", r'"kind": "user", "id": "local", "name": "owner"'),
+    ("审计链", "★接线：隔离区恢复/永久删除也留痕", r'"kind": "restore", "title": "从隔离区恢复"'),
+    ("审计链", "★接线：「撤销这一轮」留痕（最该能追溯的操作）", r'"kind": "undo", "title": "撤销这一轮"'),
+    ("审计链", "★独立校验脚本（拿导出文件就能复核）", r"sys\.exit\(main\(sys\.argv\[1:\]\)\)"),
+    ("审计链", "★回归覆盖 fail-open（链写不进去仍照常返回）", r"写不进去时 append 回 None"),
+    ("审计链", "★接线：面板内单会话审批（OpenCode 反代里截答复）", r"note_permission_reply\(handler\.path, method, body, agent_id=self\.id\)"),
+    ("审计链", "★接线：ACP 面板权限在等待点收尾写链", r'audit\.append\(\s*"panel"'),
+    ("审计链", "★面板答复只认 once/always/reject（别把普通 POST 记成审批）", r'if decision not in \("once", "always", "reject"\)'),
+    ("审计链", "★面板记录带 session（新增 ref 维度，可按会话筛）", r'"session": m\.group\(1\)'),
     ("可逆执行", "★ACP 预热显式入口 POST /engine/acp/prewarm", r'path == "/engine/acp/prewarm"'),
     ("可逆执行", "★已经在跑就不重复起进程（只回报状态）", r'"prewarming": not running'),
     ("主题", "★内置清单只剩「昼」（夜主题 `0.1.50` 已删，别留死卡片）", r'NOT:"id": "yoru", "name": "夜'),
     ("主题", "★`read_active()` 兜底：内置已删 / 主题被卸 → 回落 hiru", r"def _is_builtin"),
-    ("主题", "★旧的 yoru 引用一律当 hiru（别让启动套一个不存在的主题）", r'if tid == "yoru":\s*tid = "hiru"'),
+    ("主题", "★旧的 yoru 引用一律当默认主题（别让启动套一个不存在的主题）", r'if tid == "yoru":\s*tid = DEFAULT_THEME'),
     # ---- ★主动编排：后端角色预设（2026-10-17）----
     ("主动编排", "★角色预设 4 个（实现者 / 审查者 / 测试者 / 调研者）", r"\nROLES = \{"),
     ("主动编排", "★角色归一（不认识的当空，别让脏值漏进去）", r"def norm_role"),
@@ -2116,6 +2320,7 @@ def main() -> int:
                  os.path.join("backend", "external.py"),
                  os.path.join("backend", "fsview.py"),
                  os.path.join("backend", "snapshots.py"),
+                 os.path.join("backend", "audit.py"),
                  os.path.join("backend", "orchestrator.py"),
                  os.path.join("backend", "agent_install.py"),
                  os.path.join("backend", "themes.py"),
@@ -2131,6 +2336,9 @@ def main() -> int:
                  os.path.join("scripts", "heal_opencode_link.py"),
                  os.path.join("packaging", "build.py"),
                  os.path.join("packaging", "init_state.py"),
+                 os.path.join("tools", "cocraft_audit_verify.py"),
+                 os.path.join("tools", "cocraft_audit_sign.py"),
+                 os.path.join("tools", "audit_chain_test.py"),
                  os.path.join("tools", "selftest.py")]
     for rel in py_files:
         p = os.path.join(HERE, rel)
@@ -2174,6 +2382,31 @@ def main() -> int:
     if not _ca_ok:
         fails.append("证书/随包 CA 文件")
 
+    # ★官方软件图标（项目自有资产）：设计稿 svg + 多尺寸 ico + 预览图，都要在；
+    #   ico 还必须真的包含 16~256 全套（托盘 / 安装包 / 快捷方式都吃它）。
+    _ico = os.path.join(HERE, "frontend", "assets", "cocraft.ico")
+    _svg = os.path.join(HERE, "frontend", "assets", "icon.svg")
+    _png = os.path.join(HERE, "frontend", "assets", "icon-256.png")
+    _ico_sizes = []
+    try:
+        _raw = open(_ico, "rb").read()
+        if _raw[:4] == b"\x00\x00\x01\x00":
+            _n = struct.unpack("<H", _raw[4:6])[0]
+            for _i in range(_n):
+                _e = _raw[6 + 16 * _i:6 + 16 * (_i + 1)]
+                if len(_e) == 16:
+                    _ico_sizes.append(_e[0] or 256)
+    except OSError:
+        pass
+    total += 1
+    print("\n[图标 · 文件]")
+    _want = [16, 24, 32, 48, 64, 128, 256]
+    _icon_ok = (os.path.isfile(_svg) and os.path.isfile(_png) and _ico_sizes == _want)
+    print("  %s ★官方图标三件套：icon.svg（设计稿）+ cocraft.ico（%s）+ icon-256.png"
+          % ("OK  " if _icon_ok else "MISS", ",".join(str(x) for x in _ico_sizes) or "空"))
+    if not _icon_ok:
+        fails.append("图标/官方图标文件或 ico 尺寸不全（跑 python tools\\make_icon.py）")
+
     # ★无头回归工具本体（内容由上面的断言盯着，这里只保证"文件还在"，防误删）
     _tools = ("jsbalance.py", "check_ids.py", "check_features.py", "inspect_ui.py",
               "history_page_test.py", "trace_time_test.py", "cocraft_unread_test.py",
@@ -2190,6 +2423,8 @@ def main() -> int:
               "perm_level_auto_test.py", "chatter_split_test.py",
               "acp_events_test.py", "acp_api_test.py", "acp_engine_ui_test.py",
               "watch_mode_test.py", "md_render_test.py", "selftest.py",
+              "audit_chain_test.py", "cocraft_audit_verify.py", "cocraft_audit_sign.py",
+              "make_icon.py", "theme_chapel_test.py",
               "cocraft_agents_check.py", "cocraft_ws_check.py")
     _miss_t = [t for t in _tools if not os.path.isfile(os.path.join(HERE, "tools", t))]
     total += 1

@@ -91,6 +91,7 @@ def main() -> int:
     # point both state files at a temp dir - never touch the real runtime/state
     svc_mod.STATE_DIR = tmp
     svc_mod._ALWAYS_FILE = os.path.join(tmp, "_acp_always.json")
+    svc_mod.audit.set_file(os.path.join(tmp, "_audit.jsonl"))   # ★别写真实审计链
 
     got_all: list = []
     svc = AcpService([sys.executable, MOCK], cwd=tmp, env=dict(os.environ),

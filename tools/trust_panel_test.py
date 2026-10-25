@@ -108,9 +108,48 @@ STUB = r"""<script>
     // ★信任面板新增四块的数据源（可撤销 / 审批时间线 / agent 活动 / 本地协作）
     if (window.__badShapes) {
       if (path === "/quarantine/list" || path === "/snapshot/list" || path === "/ccagent/permissions"
-          || path === "/ccagent/activity" || path === "/orchestrate/runs" || path === "/orchestrate/pending") {
+          || path === "/ccagent/activity" || path === "/orchestrate/runs" || path === "/orchestrate/pending"
+          || path === "/audit/stats" || path === "/audit/verify" || path === "/audit/list"
+          || path === "/audit/report") {
         return J({ ok: true, items: "nope", data: "nope", runs: 5, pending: {} });
       }
+    }
+    // ★审计链（信任面板新增）：stats 给条数/时间，verify 逐条重算
+    if (path === "/audit/list") {
+      return J({ ok: true, count: 1, tail: "sha256:abc123", items: [
+        { seq: 11, ts: "2026-10-24T12:40:00.000Z", source: "ccagent",
+          actor: { kind: "agent", id: "11", name: "yiyi", engine: "codex-node" },
+          action: { kind: "files", title: "改了 3 个文件",
+                    targets: ["src/login.js", "README.md", "build/out.js"] },
+          decision: "auto", result: "ok", note: "+1 ~1 -1" },
+      ] });
+    }
+    if (path === "/audit/stats") {
+      if (window.__auditEmpty) {
+        return J({ ok: true, data: { ok: true, bytes: 0, records: 0, badLines: 0,
+          first: { seq: 0, ts: "" }, last: { seq: 0, ts: "", hash: "sha256:000" } } });
+      }
+      return J({ ok: true, data: { ok: true, bytes: 7135, records: 12, badLines: 0, machine: "WS-01",
+        archived: { files: 1, records: 3, latest: "000001-000003.jsonl" },
+        first: { seq: 1, ts: "2026-10-24T12:29:34.426Z" },
+        last: { seq: 12, ts: "2026-10-24T20:11:02.123Z", hash: "sha256:abc123" } } });
+    }
+    if (path === "/audit/report") {
+      return J({ ok: true, data: { markdown: "# 审计报告（cocraft）\n\n| 项 | 值 |" } });
+    }
+    if (path === "/audit/verify") {
+      if (window.__auditBroken) {
+        return J({ ok: false, count: 12, brokenCount: 1, gaps: 0, subset: false,
+          broken: [{ index: 7, seq: 7, reason: "哈希不匹配（内容被改过）",
+                     expected: "sha256:x", actual: "sha256:y" }] });
+      }
+      return J({ ok: true, count: 12, brokenCount: 0, broken: [], gaps: 0,
+        first: 1, last: 12, tail: "sha256:abc123" });
+    }
+    if (path === "/audit/export") {
+      return J({ ok: true, data: { format: "cocraft-audit", version: 1,
+        exported: "2026-10-24T20:12:00.000Z", records: 12, tail: "sha256:abc123",
+        engine: "cocraft dev", items: [] } });
     }
     if (path === "/quarantine/list") {
       return J({ ok: true, data: { items: [
@@ -343,14 +382,58 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
     if (qx) qx.click();
     await __s(150);
 
+    /* ---------- 8.55 ★审计链（哈希链）：条数 / 链完整 / 断裂 / 空链 ---------- */
+    var au = __txt(document.getElementById("trust-audit"));
+    var aun = __txt(document.getElementById("trust-audit-note"));
+    step("★审计链：条数 + seq 区间 + 链完整",
+         /12 条/.test(au) && /seq 1\.\.12/.test(au) && /链完整/.test(au), au);
+    step("★审计链：有「重新校验」「导出 JSON」「导出 CSV」「导出报告」四个按钮",
+         !!document.querySelector('#trust-audit [data-audit-verify]')
+         && !!document.querySelector('#trust-audit [data-audit-export]')
+         && !!document.querySelector('#trust-audit [data-audit-csv]')
+         && !!document.querySelector('#trust-audit [data-audit-report]'), au);
+    step("★保留了归档的部分（含归档 N 条 / M 个文件，不是「看不见了」）",
+         /归档 3 条/.test(aun) && /1 个文件/.test(aun), aun);
+    window.__auditBroken = true;
+    await trustRefresh();
+    await __s(300);
+    var au2 = __txt(document.getElementById("trust-audit"));
+    step("★链断了就说第几条 + 原因（不假装完整）",
+         /断裂/.test(au2) && /第 7 条/.test(au2) && /哈希不匹配/.test(au2), au2);
+    window.__auditBroken = false;
+    document.querySelector('#trust-audit [data-audit-verify]').click();
+    await __s(400);
+    step("★点「重新校验」→ 横幅报「链完整」",
+         /链完整/.test(__txt(document.getElementById("banner"))),
+         __txt(document.getElementById("banner")));
+    window.__auditEmpty = true;
+    await trustRefresh();
+    await __s(300);
+    var au3 = __txt(document.getElementById("trust-audit"));
+    step("★空链时说清楚「还没有审批记录」（不是界面坏了）",
+         /空链/.test(au3) && /还没有审批记录/.test(au3), au3);
+    window.__auditEmpty = false;
+    await trustRefresh();
+    await __s(300);
+
+    /* ---------- 8.56 ★C3：AI 成员到底改了什么 ---------- */
+    var fs2 = __txt(document.getElementById("trust-files"));
+    step("★AI 成员改了什么：谁 + 改了哪些文件 + 增删改计数",
+         /yiyi/.test(fs2) && /login\.js/.test(fs2) && /\+1 ~1 -1/.test(fs2), fs2);
+    step("★改了什么：条数写清楚（最近 12 次派活）", /1 条/.test(__txt(document.getElementById("trust-files-note"))),
+         __txt(document.getElementById("trust-files-note")));
+
     /* ---------- 8.6 ★接口返回错形状也不崩（列表归一成空） ---------- */
     window.__badShapes = true;
     await trustRefresh();
     await __s(400);
     var badTxt = __txt(document.getElementById("trust-permlog")) + " | "
-      + __txt(document.getElementById("trust-undo")) + " | " + __txt(document.getElementById("trust-act"));
+      + __txt(document.getElementById("trust-undo")) + " | " + __txt(document.getElementById("trust-act"))
+      + " | " + __txt(document.getElementById("trust-audit"))
+      + " | " + __txt(document.getElementById("trust-files"));
     step("★接口返回错形状（对象/字符串）也不崩，列表归一成空",
-         /还没有审批记录/.test(badTxt) && /隔离区是空的/.test(badTxt) && /还没有活动/.test(badTxt),
+         /还没有审批记录/.test(badTxt) && /隔离区是空的/.test(badTxt) && /还没有活动/.test(badTxt)
+         && /空链/.test(badTxt) && /还没有文件改动记录/.test(badTxt),
          badTxt);
     window.__badShapes = false;
 
@@ -395,9 +478,9 @@ function __sh(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   var te = document.querySelector("[data-trust-open]");
   if (te) te.click();
   await __sh(400);
-  // 滚到新增的四块（可撤销 / 审批时间线 / 活动 / 结论）—— 截图核对用
-  var tb = document.querySelector("#trust .trust-body");
-  if (tb) tb.scrollTop = tb.scrollHeight;
+  // 滚到「审计链」那一节（截图核对用；它是本轮新增的关键一块）
+  var auSec = document.getElementById("trust-audit");
+  if (auSec) { try { auSec.scrollIntoView({ block: "center" }); } catch (e) {} }
   await __sh(200);
 })();
 </script>

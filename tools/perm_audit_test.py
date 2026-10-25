@@ -42,6 +42,9 @@ TMP = tempfile.mkdtemp(prefix="perm-audit-")
 ca.STATE_DIR = TMP
 ca.PERM_LOG_FILE = os.path.join(TMP, "_cc_perm_log.json")
 ca.PERM_LOG_MAX = 5
+# ★审计链也指到临时目录：`_perm_log_add` 会同时写链，别污染 `runtime/state/_audit.jsonl`
+import audit as _audit  # noqa: E402
+_audit.set_file(os.path.join(TMP, "_audit.jsonl"))
 # 不联网：find() 换成内存表（审计里要记成员显示名 / 群 id）
 ca.find = lambda aid: {"id": aid, "name": "yiyi", "display": "yiyi", "chats": ["7"]}
 

@@ -58,6 +58,37 @@ STUB = """<script>
     }
     return ALL;
   })();
+  // ★工具密集数据集：最后一轮里有 120 条"只有工具调用"的助手消息 —— 主界面一条都不渲染。
+  //   用它复现「只调工具没有新输出，上一轮就被推进『加载更早』」那个问题。
+  var HEAVY = (function () {
+    var ALL = [], base = 1700100000000, i;
+    for (i = 1; i <= 40; i++) {
+      if (i % 2 === 1) {
+        ALL.push({ id: "h" + i, type: "user", text: "问题 " + i,
+                   time: { created: base + i * 1000 } });
+      } else {
+        ALL.push({ id: "h" + i, type: "assistant", agent: "build",
+                   model: { id: "probe-1", providerID: "acp" },
+                   time: { created: base + i * 1000, completed: base + i * 1000 + 300 },
+                   content: [{ type: "text", text: "回答 " + i }] });
+      }
+    }
+    ALL.push({ id: "h41", type: "user", text: "跑一下测试",
+               time: { created: base + 41000 } });
+    for (i = 1; i <= 120; i++) {
+      ALL.push({ id: "t" + i, type: "assistant", agent: "build",
+                 model: { id: "probe-1", providerID: "acp" },
+                 time: { created: base + 41000 + i * 100, completed: base + 41000 + i * 100 + 50 },
+                 content: [{ type: "tool", name: "shell",
+                             state: { status: "completed", input: { command: "npm test" },
+                                      content: [{ type: "text", text: "ok" }] } }] });
+    }
+    return ALL;
+  })();
+  window.__useHeavy = function () {
+    DATASET = HEAVY;
+    window.__msgReqs.length = 0;
+  };
   var SESS = { id: "ses_probe", title: "翻页探针",
                time: { created: 1700000000000, updated: 1700000250000 },
                location: { directory: "D:\\\\probe" },
@@ -268,6 +299,24 @@ function __pFirstVisible() {
     __pScroll(box3.scrollHeight);             // 回到底部 → 恢复跟随
     await __pSleep(100);
     step("★滚回底部自动恢复跟随", state.follow === true, "follow=" + state.follow);
+
+    /* ---- 5. ★工具密集：一页 80 条原始消息里几乎全是"不渲染"的工具消息 ---- */
+    window.__useHeavy();
+    await openSession("ses_probe");
+    await __pSleep(700);
+    var visN = document.querySelectorAll("#msg-static .msg").length;
+    var heavyTxt = __pTxt(document.getElementById("msg-static")) || "";
+    out.info.heavy = { loaded: state.messages.length, visible: visN,
+                       reqs: window.__msgReqs.length, done: state.msgDone,
+                       more: __pMore() };
+    step("★工具密集：首屏自动补页（不只拿 80 条就停）",
+         state.messages.length > 80, "loaded=" + state.messages.length);
+    step("★工具密集：一屏里照样能看到足够多的消息（≥12 条）",
+         visN >= 12, "visible=" + visN);
+    step("★工具密集：上一轮的正文直接可见（不用点「加载更早」）",
+         /回答 38/.test(heavyTxt), heavyTxt.slice(0, 80));
+    step("★自动补页有上限（不会把整个会话一次拉进来）",
+         window.__msgReqs.length <= 7, "reqs=" + window.__msgReqs.length);
   } catch (err) {
     out.crash = String(err && err.stack ? err.stack : err);
   }
@@ -353,7 +402,7 @@ def main() -> int:
     if d.get("crash") or d.get("jsErrors") or bad:
         print("\n  结论: [BAD] %s" % (bad or "有 JS 错误 / 探针异常"))
         return 2
-    print("\n  结论: [OK] 往上翻页（按钮 / 自动 / 锚定 / 到底 / 刷新不丢 / 两种游标）全部通过")
+    print("\n  结论: [OK] 往上翻页（按钮 / 自动 / 锚定 / 到底 / 刷新不丢 / 两种游标 / 工具密集自动补页）全部通过")
     return 0
 
 

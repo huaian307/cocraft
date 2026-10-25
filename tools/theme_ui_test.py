@@ -214,7 +214,7 @@ def main() -> int:
         ("恢复内置：变量回内置值", d.get("afterRevertPaper") == d.get("paperBefore")),
         ("恢复内置：底盘仍是 hiru（夜主题已删）", d.get("afterRevertBase") == "hiru"),
         ("恢复内置：样式清空", d.get("styleCleared") is True),
-        ("内置主题 1 个（夜主题已删，只剩昼）", d.get("builtinCount") == 1),
+        ("★内置主题 2 个（圣烛教堂默认 + 和纸白昼）", d.get("builtinCount") == 2),
         ("已安装 ≥ 3 个", (d.get("installedCount") or 0) >= 3),
         ("列表渲染出卡片", (d.get("listCards") or 0) >= 4),
         ("当前主题唯一高亮", (d.get("activeCards") or 0) == 1),

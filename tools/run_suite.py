@@ -53,6 +53,8 @@ TESTS = [
     "inbox_queue_test",
     "workflow_canvas_ui_test",
     "perm_audit_test",
+    "audit_chain_test",
+    "theme_chapel_test",
     "acp_session_sync_test",
     "internal_sessions_test",
     "orchestrator_test",
@@ -110,6 +112,16 @@ def main() -> int:
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
     os.makedirs(LOG_DIR, exist_ok=True)
+    # ★审计链隔离：任何测试都不许往真实链 `runtime/state/_audit.jsonl` 里写
+    #   （`backend/audit.py` 认 `COCRAFT_AUDIT_FILE`，子进程 / 面板都继承这个变量）
+    _audit_tmp = os.path.join(LOG_DIR, "_audit_test.jsonl")
+    for _f in (_audit_tmp, _audit_tmp + ".lock"):
+        try:
+            if os.path.exists(_f):
+                os.remove(_f)
+        except OSError:
+            pass
+    env["COCRAFT_AUDIT_FILE"] = _audit_tmp
 
     results = []
     started_all = time.time()

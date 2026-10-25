@@ -39,6 +39,9 @@ orch.WORKFLOWS_FILE = os.path.join(TMP, "_collab_workflows.json")   # 别碰真�
 orch.ASK_TIMEOUT = 8
 orch.RUN_TIMEOUT = 20
 orch._load_ok_models = lambda: {}
+# ★审计链指到临时目录：`_ask_permission` 现在会写链，别污染 `runtime/state/_audit.jsonl`
+import audit as _audit  # noqa: E402
+_audit.set_file(os.path.join(TMP, "_audit.jsonl"))
 
 PASS = 0
 FAIL = 0
