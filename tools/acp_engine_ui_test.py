@@ -255,33 +255,23 @@ def find_edge():
     raise SystemExit("没找到 msedge.exe")
 
 
-def _render_once(edge, dom, budget, timeout):
-    if os.path.exists(dom):
-        os.remove(dom)
-    with open(dom, "wb") as fh:
-        proc = subprocess.Popen(
-            [edge, "--headless=new", "--disable-gpu", "--no-first-run",
-             "--no-default-browser-check",
-             "--user-data-dir=" + os.path.join(os.environ.get("TEMP", "."), "edge-acptest"),
-             "--virtual-time-budget=%d" % budget, "--dump-dom", URL],
-            stdout=fh, stderr=subprocess.DEVNULL)
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            print("  (Edge 超时，已强杀)")
-    return io.open(dom, encoding="utf-8", errors="replace").read()
+def render(edge=None):
+    """★ 走 CDP 取结果（不再用 `--dump-dom` + 虚拟时间：CI 上会卡住/拿不到）。
 
-
-def render(edge):
-    tmp = os.environ.get("TEMP", ".")
-    dom = os.path.join(tmp, "probe_engine_dom.html")
-    html = _render_once(edge, dom, 15000, 120)
-    if 'id="__probe__"' not in html:
-        # ★ CI 上偶发"Edge 渲染超时 → DOM 空"（虚拟时间被慢请求拖住）→ 缩短预算再试一次
-        print("  (没拿到探针结果，缩短虚拟时间重试一次…)")
-        html = _render_once(edge, dom, 8000, 120)
-    return html
+    轮询页面里的 `#__probe__` 直到出现（最多 150s），然后取它的文本（就是那段 JSON）。
+    """
+    sys.path.insert(0, os.path.join(HERE, "tools"))
+    from _cdp import Browser                     # noqa: E402
+    with Browser() as b:
+        b.navigate(URL)
+        if not b.wait_for_js('!!document.getElementById("__probe__")', timeout=150):
+            try:
+                txt = b.eval_js('(document.body ? document.body.innerText : "").slice(0, 300)')
+            except Exception:                    # noqa: BLE001
+                txt = ""
+            print("  (CDP 等到 150s 仍没有 #__probe__；页面文字前 200：%r)" % str(txt)[:200])
+            return ""
+        return b.eval_js('document.getElementById("__probe__").textContent') or ""
 
 
 def main() -> int:
@@ -355,13 +345,15 @@ def main() -> int:
         else:
             io.open(ENGINE_FILE, "w", encoding="utf-8").write('{"engine": "opencode"}')
 
-    m = re.search(r'<pre id="__probe__">(.*?)</pre>', html, re.S)
-    if not m:
-        print("[BAD] 没拿到探针结果（渲染失败）。DOM 前 300 字符：")
-        print(html[:300])
+    raw = html if isinstance(html, str) else ""
+    if not raw.strip().startswith("{"):
+        m = re.search(r'<pre id="__probe__">(.*?)</pre>', raw, re.S)
+        raw = m.group(1) if m else ""
+    if not raw.strip():
+        print("[BAD] 没拿到探针结果（CDP 超时）。")
         return 1
 
-    d = json.loads(m.group(1))
+    d = json.loads(raw)
     print("\n=== 引擎切换（无头实测）===")
     print("  下拉选项    :", d.get("options"))
     print("  初始值/禁用 :", d.get("value"), "/", d.get("disabled"))
