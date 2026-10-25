@@ -94,6 +94,12 @@ setTimeout(async function () {
                       { id: "bad", label: "坏引擎", available: false }];
     out.optHtml2 = engineOptionsHtml(["good", "bad"]);
     ENGINE.engines = out.engines;
+    // 先保证从 opencode 起步（CI 上可能已经是 acp → setEngine("acp") 什么都没做）
+    if (ENGINE.active !== "opencode") {
+      var b0 = window.__esCount;
+      await setEngine("opencode");
+      await until(function () { return ENGINE.active === "opencode" && window.__esCount > b0; }, 8000);
+    }
     var before = window.__esCount;
     await setEngine("acp");
     // CI 上慢（POST /engine + 重连 SSE 可能 >1.2s）→ 轮询等它真的生效，别用固定 sleep 赌
@@ -326,6 +332,12 @@ def main() -> int:
     build_probe()
     httpd = server.Server(("127.0.0.1", PORT), server.Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    # ★ CI 上这台机器没装 OpenCode，`_engine.json` 可能已被别处写成 acp；
+    #   这里强制从 opencode 起步（否则 setEngine("acp") 是空操作 → 测不到 SSE 重连）
+    try:
+        server.engines.set_active_engine_id("opencode")
+    except Exception:  # noqa: BLE001
+        pass
     print("测试服务已起，正在无头渲染并切换引擎…")
     try:
         html = render(edge)
