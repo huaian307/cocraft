@@ -31,6 +31,24 @@
 
 ---
 
+## 1.5 内置主题（`ui 0.2.47` 起）
+
+| id | 名称 | 明暗 | 说明 |
+| --- | --- | --- | --- |
+| **`chapel`** | **圣烛教堂（默认）** | dark | 官方原创：暖黑石墙 + 米白（白袍）+ 绣线金 + 烛焰橙金。取色来自官方壁纸（白袍兜帽修女 + 蜡烛） |
+| `hiru` | 和纸白昼 | light | 原来的浅色主题（和纸白 + 绯红 + 金线），保留为可选 |
+
+- **实现位置**：变量在 `frontend/style/01-base.css`（`[data-theme="chapel"]`）、玻璃参数与 5 处签名细节在
+  `frontend/style/08-visual.css`、静态背景槽在 `frontend/style/02-chat.css`（`#static-bg .sb[data-bg="chapel"]`）。
+  **不走主题包**：内置主题只改 CSS，不涉及安装/校验。
+- **切换**：`applyTheme("chapel" | "hiru")`（清了用户主题叠加再设 `data-theme`），持久化在
+  `localStorage["cocraft.theme"]`；设置入口在**壁纸与外观 → 主题**（两张卡 + 主题工坊）。
+- **默认与回落**：`backend/themes.py` 的 `DEFAULT_THEME = "chapel"` —— `read_active()` 读不到 / 主题被卸载 /
+  旧数据里是已删除的 `yoru` → 一律回落 **chapel**（不是 hiru）。
+- **老用户**：`localStorage["cocraft.theme"] === "hiru"` 的人**不会**被强行改主题；侧栏出现一次性提示条
+  （`#theme-hint`，`localStorage["cocraft.themeSeen"]` 记账），点「换成圣烛教堂」即切换，点 × 关闭。
+- **用户主题仍然叠加**：`data-theme-user` + `#cocraft-theme` 那套**没变**；切内置主题时会先清掉叠加与图标槽。
+
 ## 2. 主题包格式
 
 一个目录 = 一个主题：

@@ -3,6 +3,434 @@
 > 版本号按 SemVer；`0.x` 期间次要版本可能包含行为变化。
 > 每个版本都要求：`check_features` 0 缺失 + `tools/run_suite.py` 0 失败 + 干净机/覆盖升级验证。
 
+> **未发布区间（`0.2.14` ~ `0.2.59`）**：这些版本**本地可用、未打包 / 未推送 / 未发布**，
+> 线上最新仍是 `v0.2.13`（Latest）。下面按交付顺序补齐。
+> `0.2.36`~`0.2.38` 与 `0.2.43` 没有逐版本拆分记录，按「同一批交付」合并说明。
+
+## 0.2.62 — 2026-10-25
+
+**定位**：打包前的默认值收口 —— 音乐条背景不再指向「不随包」的图。
+
+- `.p-bg` 的默认背景原来是 `/assets/night.jpg`，但 `packaging/build.py` 的 `CORE_SKIP_FILES`
+  早就不把这张同人图打进安装包 → **新装机器上这条背景 404**（只剩纸色 + 蒙版，看着像"没有背景"）。
+  现在默认改用随包的官方壁纸 `/assets/hiru-bg.jpg`（项目自有资产，`center / cover`）。
+- 用户自己设的 `playerbg`（`_appearance.json`）不受影响：设了就走自己的图 + `opacity .62`。
+- `index.html` 21 处 `?v=` → `0.2.62`。
+
+
+## 0.2.61 — 2026-10-25
+
+**定位**：官方内置动态壁纸换成更高清的一版（用户指定桌面 `更好的动态背景.mp4`）。
+
+### 换片
+- `frontend/assets/videos/official-bg.mp4`：**2,112×1,216 / 48 fps / 10 s / 6.0 Mbps / 7,534,256 B**
+  （旧片 `cocraft官方动态背景.mp4`：1,056×608 / 24 fps / 2,931,316 B）。
+- 缩略图 `official-bg.jpg` 同步重抽：**640×368 / 35,039 B**（headless Edge 的 canvas 取第 3 秒，**没有 ffmpeg**）。
+- `id` 仍是 **`builtin:official`**：默认选中 / 列表第一 / 不可删 / `/live/pick` 语义都不变；
+  `/live/list` 的 `size_mb` 自动变成 `7.2`。
+
+### 验证
+- `GET /assets/videos/official-bg.mp4` → **200 · video/mp4 · 7,534,256 B**；
+  **Range 206**（`Content-Range: bytes 0-2047/7534256`）。
+- `GET /assets/videos/official-bg.jpg` → 200 · image/jpeg · 35,039 B。
+- `GET /live/list` 里 `builtin:official` 的 `size_mb` = 7.2、`preview` 指向新缩略图；`/live/wallpapers` → 新片。
+
+### 备注
+- 安装包会 **+≈4.6 MB**。
+- 新片 48 fps / 2.1 MP，解码比旧片重；只在**收起侧栏**时解码，若某些机器掉帧再考虑降档。
+- ⚠ 桌面拷来的 mp4 带**只读属性**，`shutil.copy2` 会连属性一起带过来 → 下次替换会 `PermissionError: [Errno 13]`；
+  换之前先 `(Get-Item $p).IsReadOnly = $false`（已记进 AGENTS 壁纸章节）。
+
+
+## 0.2.60 — 2026-10-25
+
+**定位**：把两个「用户只看到一句红字、背后其实有明确原因」的坑修掉。
+
+### 修「发图 → 500 Internal Server Error」
+- 现场：用户粘一张截图发出去 → 输入区上方只有 `发送失败：500 Internal Server Error`，**没有任何线索**。
+- 查证：上游日志里是 `POST /api/session/<id>/prompt → 500`，cause 为
+  `Schema validation failed … SessionPrompt.normalizeImageAttachment … Prompt.Base64`；
+  用临时会话逐个试把范围缩到"只有大小"：**5.0 MB 通过 / 5.5 MB → 500**（base64 约 6.67 MB 通 / 7.33 MB 失败），
+  **两个 3 MB 同时发是 200** → 上限是**单个附件**、不是整个请求。
+- 顺带排除格式问题：非法 base64（`#` / 换行 / 缺 padding）上游给的是 **400 + 人话**
+  （`Invalid attachment data URL: x.png`），非 data URI 是 `Unsupported attachment URI` —— 都不是 500。
+- 修法：
+  - `MAX_ATTACH_BYTES` **12 MB → 4 MB**；base64 长度再兜一道（`MAX_ATTACH_B64` 5.6 MB）。
+  - `shrinkImage()` **逐级再压**：1600px/0.86 → 1200px/0.8 → 900px/0.75，压到上限 90% 为止；
+    压不下去就**明确提示、不让发**（不再把没压成功的原图直接发出去）。
+  - `api()` 遇到 **5xx 且空 body** 补一句人话（「若刚发过附件，多半是附件太大或格式不支持」）。
+- 回归：`check_features` +4 条（锁定上限、逐级压缩、base64 兜底、500 人话），**2046 项 / 缺失 0**。
+
+### 更新器不再依赖「能不能起 PowerShell」
+- **真凶**：起更新脚本用的是 `CREATE_NO_WINDOW | DETACHED_PROCESS` —— 实测（Windows 10.0.26200）
+  这样起 `powershell.exe` 会 **`rc=0` 但一行脚本都不执行**（`-File` / `-EncodedCommand` 都一样），
+  跟"PowerShell 坏了"长得一模一样。改用 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`。
+- 加固：PowerShell 走**绝对路径**；脚本改走 **`-EncodedCommand`**（不碰 `%TEMP%` 里的 `.ps1`，
+  免疫 ExecutionPolicy/ASR 拦脚本文件）；`apply.ps1` 仍写一份只作排查。
+- 兜底：仍然起不来时 `_launch_setup_direct()` 直接拉起**已校验**的安装包（返回 `via:"direct"` / `willRestart:false`，
+  文案写明「面板会被关闭，装完请重新打开」）；两路都失败才报错，且两边原因都写清。
+- 验证：桩测 **21 项** + **真 PowerShell 端到端** **4 项**全 PASS（0.5s 拿到 `started`）。
+
+### 其它
+- `index.html` 21 处 `?v=` 同步到 `0.2.60`。
+
+## 0.2.59 — 2026-10-25
+
+**定位**：切到 ACP 时不再凭空多出一条「同名空会话」。
+
+### 修「跨引擎接续留下空壳」
+- 前端 `setEngine()` 原来**无条件** `POST /api/session/import`（带 OpenCode 那边的 id + 标题）；
+  现在新增 `setupCanContinueFromOpenCode()` —— **只有目标 agent = `opencode-acp`**（与 OpenCode 共用历史库）才尝试接续。
+- 后端 `import_remote()`：`session/list` 名录里查不到、又不属于 OpenCode 共享库 → **直接 `ValueError`，不建本地记录**。
+- 新增 `_prune_orphan_imports()`：`imported` + 0 消息 + 名录里没有 → 删（**名录拉不到就什么都不删**），
+  在 `list_sessions()` 里节流调用 → **已经产生的空壳会自动消失**。
+
+### 回归
+- `check_features` +4 条（接续空壳）；离线验证：空壳清理 6 项 / `import_remote` 守卫 3 项。
+
+## 0.2.58 — 2026-10-25
+
+**定位**：首次设置向导按引擎显示，不再像「缺了两项」。
+
+- 去掉固定序号 ①②③④；顶部说明**跟着引擎变**：
+  ACP → 「对话引擎 / Agent / 模型 Key / 默认模型」；OpenCode → 「只需要选好默认模型（Key 走 OpenCode 自己的登录/配置）」。
+- 回归：`check_features` +3 条（序号不再出现）。
+
+## 0.2.57 — 2026-10-25
+
+**定位**：首次设置从「两段式」改成「一页填完」。
+
+- 四项（引擎 / ACP Agent / 模型 Key / 默认模型）**同时展示**；选引擎 / agent 时就**立刻套用**并按新引擎拉模型清单（拉不到不挡完成）。
+- 底部只留「**完成并重启**」+「稍后再说」；`setupDone` 一次写入 Key + 默认模型 → 标记 → 重启。
+- 删掉 `setupNext` / `#setup-next` / Key 行里的「保存」按钮。
+- 回归：`check_features` +5 条（含 `NOT:setup-next`）。
+
+## 0.2.56 — 2026-10-25
+
+**定位**：默认名字定为 **`cocraft`**（不再叫「守烛人」）。
+
+- `BRAND_DEFAULT = "cocraft"`；左上角 / 占位 / 说明同步；名字等于 `cocraft` 时窗口标题只写 `cocraft`（不出现 `cocraft · cocraft`）。
+- **后端也归一**：`_collapse_title()`（`cocraft · cocraft` → `cocraft`），`read_panel_title` / `write_panel_title` / `tray_host` 都过一遍
+  → **托盘 tooltip 只显示一个 `cocraft`**。
+- 老值 `絵梨衣` / `守烛人` 一律按「没设过」迁移。
+
+## 0.2.55 — 2026-10-25
+
+**定位**：空会话首屏只留一个圣徽。
+
+- `heroHtml()` 不再渲染主图 / 两张贴纸；设置里「空会话主图 / 贴纸·左 / 贴纸·右」三行一并删掉（素材槽只剩 头像 / 对话头像 / 气泡球 / 音乐条背景）。
+- 首屏文案垫一块暖黑玻璃牌 `.empty-copy`，保证压在壁纸亮部也读得清。
+- ⚠ 同时定下规矩：**每轮改完前端必须 bump `index.html` 的 `?v=`**（`0.2.54` 改了 JS 却没 bump → 面板还按旧版本加载，界面上停着旧首屏）。
+
+## 0.2.54 — 2026-10-25
+
+**定位**：把「絵梨衣」整体去掉（角色也是《龙族》强相关，不只是词汇）。
+
+- 默认名字 → 守烛人（`0.2.56` 又改成 `cocraft`）、题词 →「愿此烛长明，照见归途」、输入框 → **祈祷书**、
+  壁纸页题字 → **壁画**、空会话第二行 →「烛火未熄，静候你的话」、署名 →「烛在暗处，光在其中」。
+- **默认素材不再引用同人图**：头像 / 对话头像 → 官方 `icon-256.png`、空会话主图 → **内联圣徽**（`.hero-mk`）、贴纸默认不显示（两张都设了才出）。
+- 老浏览器里存着旧默认值（名字 / 题词 / `heroL2`）的按「没设过」迁移；`packaging/build.py` 的 `CORE_SKIP_FILES` 把同人图 + refs 画廊页排除出安装包。
+
+## 0.2.53 — 2026-10-25
+
+**定位**：「壁纸与外观」的分层改成真的。
+
+- 21 个 `.cfg-row` / `<details>` **静态写进 `#wpc-body`**（5 个 `.wpc-sec` 分节），`#cfg` 只剩 13 行。
+- 删掉 `WPC_ROWS` / `WPC_SECS` / `wpcBuild()` —— `0.2.33` 起的「运行时 `appendChild` 搬节点」方案退场。
+- 体检改成断言「行在 `#wpc-body` 里」+ `NOT:WPC_ROWS`。
+
+## 0.2.52 — 2026-10-25
+
+**定位**：修「点横幅后设置里冒出整套壁纸设置」。
+
+- 根因：`wpcBuild()` 原来**只在 `wpcOpen()`** 时把行搬进 `#wpc-body`；而每次页面重载（点横幅 → `safeReload`、更新后自动重启、手动刷新）都是全新 DOM
+  → 设置抽屉里又会把「背景亮度 / 模糊程度 / 界面缩放 / 动态壁纸速度…」摆出来。
+- 现在 `initSettings()` 启动即 `wpcBuild()`（只搬一次，`data-built` 记账）。
+
+## 0.2.51 — 2026-10-25
+
+**定位**：《龙族》词汇全部换成教堂意象（纯文案 / 注释，不动 id 与结构）。
+
+- `装备部`→**圣器室**、`言灵周期表`→**祷言名录**、`言灵 · 音乐`→**圣咏 · 音乐**、`言灵 · ConPTY`→**祷言 · ConPTY**、
+  技能 `言灵`→`祷言`、`尼伯龙根`（壁纸）→**彩窗**、`校徽`→**圣徽**、输入框 `絵梨衣の小本子`→**祈祷书**、`青铜`→黄铜…
+- `check_features` +6 条正向 + 3 条负向（`NOT:装备部|言灵|尼伯龙根…`）。
+
+## 0.2.50 — 2026-10-25
+
+**定位**：全屏纸白纱 → 暖黑暗纱。
+
+- `#live-bg .lb-wash` 是给浅色主题写的 `rgba(250,247,242,.34~.58)`，`z-index:3` 盖在**整屏**视频 / 场景上，
+  而以前只有 `[data-theme="hiru"]` 会隐藏它 → `chapel` 下整块壁纸被糊成灰白。
+- `chapel` 下换成暖黑暗纱 `.30/.22/.50`（静态背景槽同值）；`theme_chapel_test` +1 条「`.lb-wash` 不许含 250,247,242」。
+
+## 0.2.49 — 2026-10-25
+
+**定位**：消息气泡改暗玻璃（用户报「不要这层白色的蒙版」）。
+
+- 气泡底色原是 `--paper`（`rgba(30,24,19,.38)` + 28px 模糊），叠在壁纸亮部会糊成浅灰白纱 → `chapel` 下气泡单独加厚到 `rgba(22,16,12,.72)`
+  （只动气泡，不动侧栏 / 输入区）+ 表格头 `th` 换金色淡底。
+- `theme_chapel_test` +1 条「气泡 luma < 60 且 alpha ≥ .6」。
+
+## 0.2.48 — 2026-10-25
+
+**定位**：主题微调。
+
+- 老用户提示从**顶部横幅**改成**侧栏提示条**（横幅是单槽，启动时会被「已连接 / 更新」顶掉）。
+- 顶栏图标按钮的 `.danger`（停止）单独压回红色（否则被 `#topbar .actions button` 的 color 盖掉）；圆角 8px。
+- 新增 `tools/theme_chapel_test.py`（20 项无头回归：默认 / 变量 / 按钮 / 背景槽 / 圣徽 / 两卡切换 / 老用户提示）。
+
+## 0.2.47 — 2026-10-25
+
+**定位**：官方原创主题「**圣烛教堂**」`chapel`，并设为默认。
+
+- 暗色：暖黑石墙 `#17120f` + 米白 `#f6efe3` + 绣线金 `#d9bd83` + 烛焰 `#e0a24a`；
+  变量在 `01-base.css`，玻璃参数与 9 组签名（顶栏金线 / 主按钮烛金渐变 + 深色字 / 危险键保持红 / 图标按钮金边 / 选中金线 / 标签 / 滑块 / 圣徽）在 `08-visual.css`。
+- 静态背景槽 `data-bg="chapel"`（官方壁纸 + 暖黑暗纱 + 烛光余晖）；弹窗圣徽换 `#mk-chapel`（尖拱窗 + 烛焰）；设置「壁纸与外观 → 主题」两张卡。
+- `themes.py` `DEFAULT_THEME=chapel`（回落也用它）；**`hiru`（和纸白昼）保留**为可选。
+
+## 0.2.46 — 2026-10-25
+
+**定位**：窗口 / 托盘标题跟随「左上角名字」。
+
+- 原来标题是 `watch.py` 里**写死**的（`panel_window.py` / `tray_host.py` 的 `--title` 默认值也是它），改名不跟随。
+- 现在前端拼 `cocraft · <名字>` 并 `POST /panel/title` → 后端归一后落 `runtime/state/_panel_title.json`；
+  守护开窗前读它（`--title`）；原生窗口运行中改名用 `SetWindowTextW` **立刻生效**；托盘每 0.8s 跟一次；页面 `<title>` 改中性 `cocraft`。
+- 顺带修：面板开着且心跳正常时守护拿不到窗口 PID（任务栏 / 标题都失效）→ 按 10s 惰性补一次 `panel_main_pid()`（**不动 `adopted_pid`**，不影响关窗判定）。
+
+## 0.2.45 — 2026-10-25
+
+**定位**：官方软件图标（项目自有资产）。
+
+- 设计稿 `frontend/assets/icon.svg`（深底圆角 + 橙色圆环/圆点 + 中心红点）→ `tools/make_icon.py`
+  （headless Edge 渲染 + 面积平均降采样 + 自拼 ICO：≤128 BMP 条目 / 256 PNG 条目）
+  → `cocraft.ico`（16/24/32/48/64/128/256，113,808 B）+ `icon-256.png`。
+- 接线：安装包 exe（`SetupIconFile`）、卸载项（`UninstallDisplayIcon`）、开始菜单 / 桌面快捷方式（`IconFilename`）、托盘、WebView2 窗口、网页 favicon。
+
+## 0.2.44 — 2026-10-25
+
+**定位**：修「只调工具也会把上一轮推进『加载更早』」。
+
+- 翻页按 `MSG_PAGE=80` 条**原始消息**算，而工具 / 思考 / 系统通知在主界面**不渲染** → 工具密集的一轮就能吃掉整页。
+- 现在按**看得见的条数**补页：`MSG_MIN_VISIBLE=12` / `MSG_ENSURE_PAGES=6`；打开会话与刷新（跟随底部时）自动补；
+  点「↑ 加载更早」一次也保证至少看见一条（`loadHistoryMore()`，最多 3 页）；在往上读历史时不打扰。
+- 回归：`history_page_test` +4 项（工具密集数据集）。
+
+## 0.2.43 — 2026-10-24
+
+**定位**：版本收口（**无独立功能改动记录**）。
+
+- 与 `0.2.39` ~ `0.2.42` 的审计链同批交付，仅同步 `?v=` 与文档。
+- 若后续确认该版本有具体改动，在此补记。
+
+## 0.2.42 — 2026-10-24
+
+**定位**：审计链收尾 —— 能归档、能出报告、能签名。
+
+- **保留期 / 归档**：主文件超 4 MB → 最旧一段**逐字节**搬进 `_audit-archive/<首seq>-<末seq>.jsonl`，主文件留最近约 1 MB；
+  归档动作本身入链（`kind=archive`）；读 / 校验跨文件仍是一条链；`POST /audit/archive` 可手动。
+- **一页报告** `GET /audit/report`（Markdown：结论分布 / 破坏性逐条 / 明细，不含成员正文）。
+- **签名导出** `tools/cocraft_audit_sign.py keygen|sign|verify` —— 复用系统 OpenSSH 的 `ssh-keygen -Y sign`（SSHSIG，命名空间 `cocraft`），
+  私钥默认 `~/.cocraft/audit-key`、不进仓库 / 安装包；改一个字段即验签失败。
+- **`via` 归因**（`ui` / `api` / `system`）：面板 fetch 统一带 `X-Cocraft-UI: 1` → `actor=user/local`；
+  agent / 脚本直接调本机接口没有这个头 → `actor=system/local-api`（CSV 加在最后一列，老记录不硬塞空值）。
+- 回归：`audit_chain_test` 64 → **106 项**；`trust_panel_test` 28 → **36 项**；`check_features` 1904 → **1985 项**。
+
+## 0.2.41 — 2026-10-24
+
+**定位**：C3「AI 成员到底改了什么」。
+
+- `backend/cocraft_agents.py` 的 `_record_turn_changes()` 在每次派活收尾用「派活前轮快照 → 现在」算**文件级**改动 →
+  写进链（`source=ccagent` / `kind=files`，`ref.scope` / `ref.ts` 对回哪一轮，`note` 记 `+增 ~改 -删 ⇄重命名`）。
+- 信任面板同名一节按 `GET /audit/list?source=ccagent&kind=files` 列出。
+- **只记文件名 + 计数、不存内容 → 没有一键回滚**（轮快照是 `with_content=False`）。
+
+## 0.2.40 — 2026-10-24
+
+**定位**：审计 CSV 导出。
+
+- `CSV_FIELDS` 列序**定死**（34 列，加列只能往后加）；`GET /audit/export?format=csv` → BOM + `text/csv` +
+  响应头 `X-Audit-Tail` / `Records` / `Chain` / `Gaps`；信任面板加「导出 CSV」。
+- 每行仍带 `prev` / `hash` → `tools/cocraft_audit_verify.py` **也能复核 CSV**。
+
+## 0.2.39 — 2026-10-24
+
+**定位**：审计链 —— 每一条「谁放行了什么」都可追溯、可离线复核。
+
+- `backend/audit.py`：append-only JSONL + `seq` / `prev` / `hash` 哈希链 + `msvcrt` 跨进程锁 + fail-open。
+- 接线：群聊审批 / 工作台待批 / **面板内单会话审批** / 隔离区恢复·删除 / 撤销这一轮。
+- 接口 `GET /audit/list|stats|export|verify`；信任面板「审计链」显示 `链完整 · N 条` / `第 N 条断裂`；
+  工作台「导出审计」改走服务端（前端不再自己拼）；另有「导出记录」。
+- `tools/cocraft_audit_verify.py` 可离线复核（JSON / CSV / 原始 `.jsonl`）；`tools/audit_chain_test.py` 64 项。
+
+## 0.2.38 — 2026-10-24
+
+（与 `0.2.36` / `0.2.37` 同一批交付：**逐版本差异未单独记录**，内容见下面的 `0.2.36` 条。）
+
+## 0.2.37 — 2026-10-24
+
+（同上。）
+
+## 0.2.36 — 2026-10-24
+
+**定位**：官方内置动态壁纸（`0.2.36` ~ `0.2.38` 三个版本**共同交付**，逐版本差异未单独记录）。
+
+- 素材：桌面 `cocraft官方动态背景.mp4` → `frontend/assets/videos/official-bg.mp4`（**2,931,316 B / 10s**）+
+  抽帧缩略图 `official-bg.jpg`（37,758 B，headless Edge 的 canvas 抽第 3 秒，无 ffmpeg）。
+- `id = builtin:official`、`kind = video`、`url = /assets/videos/official-bg.mp4`（`_send_file` 带 Range，实测 `206`）。
+- `/live/list` 里排第一、标「官方 · 内置」、**没有删除按钮**（`_wallpaper_delete` 对 `builtin:` 直接 400）；
+  没选过壁纸时**它就是默认**（在回落 WE 候选之前先取它）。
+- 只 2.8 MB → `.gitignore` 里**逐文件放行**（`!frontend/assets/videos/official-bg.mp4`），随包（`build.py` 整目录复制 `frontend/`）。
+
+## 0.2.35 — 2026-10-24
+
+**定位**：修「拖进来的图被丢进文本框」。
+
+- 聊天区有 window 级拖拽处理器（`drop-veil` + `addFiles`），落点稍偏就会被它抢走、变成**聊天附件**。
+- 现在选择器开着时用 **document 捕获阶段**接管 `dragenter/dragover/drop` + `stopPropagation`（整页都能放），
+  并在 `js/21-cocraft.js` 的四个 window 监听器里让 `wallPickerOpen()` 让路。
+
+## 0.2.34 — 2026-10-24
+
+**定位**：拖拽导入自定义壁纸。
+
+- 图片（jpg/png/webp/gif/avif/bmp）→ **静态背景**（新 `#custom-bg` 层，**不受**动态壁纸开关 / `prefers-reduced-motion` 影响）；视频（mp4/webm/m4v）→ 动态背景。
+- `POST /wallpaper/upload?name=…` 走**原始字节**，存 `runtime/wallpapers/`（`_index.json`，**id = 内容 sha1 前 16 位** → 同一文件不会存两份；512 MB 上限 + 扩展名白名单）。
+- `builtin:` / `custom:<id>` 都由 `/live/pick` 认；**只拖 1 个时自动应用**；列表里自定义项可删。
+
+## 0.2.33 — 2026-10-24
+
+**定位**：「壁纸与外观」独立页 + 会话界面也能播壁纸。
+
+- 设置抽屉只留一行入口 → `#wpc` **5 节**（背景 / 外观 / 身份与素材 / 空会话首屏 / 主题）。
+- 新增「**会话界面也动**」（`SET.liveAlways`，默认**关**）：`playing = 收起侧栏 || SET.liveAlways`，视频与场景都适用。
+- ⚠ 当时用运行时 `appendChild` 把行搬进 `#wpc-body`；`0.2.52` / `0.2.53` 已改成**静态写死**（别再回到搬节点那条路）。
+
+## 0.2.32 — 2026-10-24
+
+**定位**：场景壁纸（`scene.pkg`）恢复支持，但**换了机制**（不再让 WE 本体播 + 抓帧）。
+
+- 引入第三方 **WebWallGL**（MIT，`frontend/vendor/webwallgl/`，**1,106,453 B**，含 `LICENSE` + `NOTICE.md` 记来源 / 版本 / SHA-256 / 未修改）：
+  浏览器里用 **WebGL2** 实时渲染 `scene.pkg`，**不需要 Wallpaper Engine 在后台跑、不抓帧**。
+- 后端 `list_scene_wallpapers()`、`/live/list` 合并 video + scene、`/live/wallpapers` 多回 `hiruKind`；**没有新增任何 HTTP 端点**（WebWallGL 自己 GET，`/we/<rel>` 本来就支持 Range）。
+- 前端懒加载 vendor，**只在收起侧栏时跑**（DPR ≤ 1.5 / 30 fps / **`scripts:false`**）；展开时**同帧 `drawImage`** 抓进 2D 定格层（`.lb-freeze`）再 `pause()`；挂不上 / WebGL2 不可用 → 扣 `has-live` + 横幅提示一次 → 退回静态背景。
+
+## 0.2.31 — 2026-10-23
+
+**定位**：修「歌词气泡球收不起来」。
+
+- **没播歌就不显示**（未开音乐 / 暂停 / 停止）；悬停 2.8s 也排 idle；拖动松开丢 `pointerup` 时 3.5s 看门狗自愈；`blur` / 页面隐藏时清理。
+
+## 0.2.30 — 2026-10-23
+
+**定位**：粒子效果拆成三类，各自开关。
+
+- 金色光点（30）+ 绿色竹叶（14）+ 落樱（16）；设置里「粒子效果」清单**可收起**，三个开关互相独立。
+
+## 0.2.29 — 2026-10-23
+
+**定位**：默认壁纸换「烛光」。
+
+- 1680×1024 全幅（`hiru-bg.jpg`，项目自有资产、已入库）；玻璃模式暗纱 / 纸面模式浅纸纱两套。
+
+## 0.2.28 — 2026-10-23
+
+**定位**：提问编辑可取消。
+
+- 进入编辑时显示提示条 + 取消按钮 + `Esc`；**取消恢复进入编辑前的草稿**。
+
+## 0.2.27 — 2026-10-23
+
+**定位**：用户提问也能复制 / 重新编辑。
+
+- 编辑 = 作为**新消息**发出去，**原提问保留**（不移动、不改写历史）。
+
+## 0.2.26 — 2026-10-23
+
+**定位**：复查其它 agent 的同类问题。
+
+- 结论：只有 ACP 路径需要修（无整轮合并）；**所有 agent 的复制都只取最后一段**。
+
+## 0.2.25 — 2026-10-23
+
+**定位**：Codex「碎碎念」切段。
+
+- `text_segments`（文字 → 工具 = 一段）：过程收进「过程」折叠块，**最终回答单独显示**；复制只取最后一段。
+
+## 0.2.24 — 2026-10-23
+
+**定位**：Codex「完成不反馈」+「问了不回答」。
+
+- 后端也按 `_perm_level.json` **自动放行**（不再只靠前端 UI），解决「问了不回答」。
+- 已结束消息的**末尾正文照常显示**（不再被旁白规则吞掉）。
+
+## 0.2.23 — 2026-10-23
+
+**定位**：两个真 bug。
+
+- 权限自动放行把 `body` 传成对象 → 命令被取消（改成先序列化）。
+- 复制在 WebView2 失败（手势丢失）→ **先 `execCommand`** 再退回 Clipboard API。
+
+## 0.2.22 — 2026-10-23
+
+**定位**：模型凭据多 Key。
+
+- `_credentials.json`：**厂商 → 账号**两层清单；**agent 覆盖 > 全局默认**；接口只回**掩码**；旧 `baseline.env` 自动迁移。
+
+## 0.2.21 — 2026-10-22
+
+**定位**：面板内装的 npm agent 可自主更新。
+
+- `GET /agent/latest`（缓存 10 分钟）+ 一键更新；**不静默自动装**。
+
+## 0.2.20 — 2026-10-22
+
+**定位**：前端优化 P0~P5。
+
+- 统一轮询管理器 `POLL`（可见性暂停 + 隐藏时跳过回调，心跳除外）+ 全局错误捕获 / 横幅。
+- `app.js` 拆成模块（`js/` 10 个物理顺序加载）；消息**增量渲染**（纯追加时 `append` 不重建历史）。
+- 弹层栈 `OVERLAY`（Esc 只关栈顶 + 焦点归还）+ 16 个弹窗接入；CSS 拆 8 个；性能埋点 `PERF` + `window.__diagnostics` 诊断快照。
+
+## 0.2.19 — 2026-10-22
+
+**定位**：群聊成员 per-agent 权限上限（**只紧不松**）。
+
+- 生效 = `min(面板等级, 成员上限)`；成员行显示生效值。
+- 回归：`agent_perm_cap_test` 19 项。
+
+## 0.2.18 — 2026-10-22
+
+**定位**：P2 收尾。
+
+- 成员检查器加「**在运行结果里看 →**」：跳到最近一次运行并选中该成员。
+
+## 0.2.17 — 2026-10-22
+
+**定位**：画布排布 / 分阶段。
+
+- 「排布」= **阶段在左、成员在右**（一行一阶段）；「分阶段」按角色拆成 实现 → 审查（旧单阶段给提示 + 一键拆）。
+
+## 0.2.16 — 2026-10-22
+
+**定位**：整窗工作台。
+
+- `#collab` 改 fixed **整窗**（底部给小本子让位）；任务输入条搬进小本子（底部输入 + ▶ 运行），关闭搬回。
+
+## 0.2.15 — 2026-10-22
+
+**定位**：P4 阶段。
+
+- **阶段串行 + 阶段内并行**；上一阶段产出喂给下一阶段；`when` / `onFail` / `retries`；画布阶段节点 + 阶段检查器；
+  老工作流归一成一个阶段。
+
+## 0.2.14 — 2026-10-22
+
+**定位**：P3 收尾。
+
+- 旧 run「**存为工作流**」（`POST /orchestrate/workflows/from-run`：成员取 run 快照、排除仲裁者、按「目录+成员组合」**去重**、存完把 run 认领过去）。
+- **归档**（`workflows/archive`，**不删**：左栏收「已归档 N 个 ▸」折叠区、默认不选中、副本不继承）。
+- **快捷键**（Ctrl+Enter 开跑 / Esc 先收检查器 / Delete 删选中成员，输入框里不抢键）；空状态三步引导 + 画布首用提示（只弹一次、`pointer-events:none` 不挡节点）。
+- 回归：`orchestrator_test` **77** / `workflow_canvas_ui_test` **26**。
+
 ## 0.2.13 — 2026-10-22
 
 **定位**：权限不再"发一封邮件审核 40 次" —— 每个节点可以有自己的权限等级，破坏性操作仍然拦住。
