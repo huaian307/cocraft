@@ -281,9 +281,23 @@ function permMenuToggle() {
     `<button type="button" data-lv="${esc(it.id)}" class="${it.id === PERM.level ? "on" : ""}">${esc(it.label)}</button>`
   ).join("") + `<button type="button" class="perm-more" data-trust-open="1">信任面板…</button>`;
   document.body.appendChild(m);
+  // ★ 定位要按**界面缩放**换算（`html{zoom}`）：`getBoundingClientRect()` 给的是**真实像素**，
+  //   而 `style.left/top` 是**设计像素**（渲染时还会乘一次 zoom）。以前直接用 rect，
+  //   在非 100% 缩放（如 85%）下菜单会整体往左上偏、离按钮老远（用户实测截图）。
+  const z = (typeof uiZoom === "function" ? uiZoom() : 1) || 1;
   const r = b.getBoundingClientRect();
-  m.style.left = Math.max(8, r.left) + "px";
-  m.style.top = Math.max(8, r.top - m.offsetHeight - 6) + "px";
+  const mw = m.offsetWidth, mh = m.offsetHeight;          // 设计像素（未乘 zoom）
+  const vw = (window.innerWidth || 0) / z;
+  const vh = (window.innerHeight || 0) / z;
+  const left = Math.min(Math.max(8, r.left / z), Math.max(8, vw - mw - 8));
+  const topAbove = (r.top - 6) / z - mh;                    // 贴在按钮上方 6 个**真实**像素
+  const topBelow = (r.bottom + 6) / z;
+  let top;
+  if (topAbove >= 8) top = topAbove;                        // 上面放得下 → 上方
+  else if (topBelow + mh <= vh - 8) top = topBelow;         // 否则翻到下面
+  else top = (r.top > vh - r.bottom) ? Math.max(8, topAbove) : topBelow;  // 两边都不够：挑空间大的一边
+  m.style.left = left + "px";
+  m.style.top = Math.max(8, top) + "px";
   m.addEventListener("click", (e) => {
     const more = e.target.closest("button[data-trust-open]");
     if (more) { m.remove(); trustOpen(true); return; }
