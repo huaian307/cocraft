@@ -5,7 +5,7 @@ r"""独立托盘进程（pystray 版）—— 与窗口渲染技术无关，可�
 `runtime/state/_panel_cmd.json` 通知主窗口执行 `toggle` / `quit`。
 
 用法（由主窗口进程 spawn）：
-    <panel python> backend\tray_host.py --title "cocraft · 絵梨衣" [--parent-pid N]
+    <panel python> backend\tray_host.py --title "cocraft · 守烛人" [--parent-pid N]
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _read_json(path: str):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--title", default="cocraft · 絵梨衣")
+    ap.add_argument("--title", default="cocraft")
     ap.add_argument("--state", default="")
     ap.add_argument("--parent-pid", type=int, default=0)
     args = ap.parse_args()
@@ -98,7 +98,24 @@ def main() -> int:
             seen["ts"] = 0.0
 
     def _watch_notify():
+        # ★托盘提示跟着面板名字走：面板改名时前端 POST /panel/title 写 `_panel_title.json`，
+        #   这里每 0.8s 顺手读一次（文件很小；变了才改 tooltip，不闪）。
+        title_file = os.path.join(state_dir, "_panel_title.json")
+        cur_title = {"t": args.title}
         while True:
+            t = _read_json(title_file)
+            if isinstance(t, dict):
+                want = " ".join(str(t.get("title") or "").split())[:60]
+                # `cocraft · cocraft` → `cocraft`（两边同名时别重复）
+                _p = [x.strip() for x in want.split("·")]
+                if len(_p) > 1 and len({x.lower() for x in _p if x}) == 1:
+                    want = _p[0]
+                if want and want != cur_title["t"]:
+                    cur_title["t"] = want
+                    try:
+                        icon.title = want
+                    except Exception:  # noqa: BLE001
+                        pass
             data = _read_json(notify_file)
             if isinstance(data, dict):
                 try:

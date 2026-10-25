@@ -18,7 +18,9 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import datetime
 import glob
+import hashlib
 import json
 import mimetypes
 import os
@@ -59,6 +61,7 @@ import skills_install
 import snapshots
 import themes
 import updater
+import audit
 from engines.base import HOP_BY_HOP, EngineError
 from engines.acp import agents as acp_agents
 from engines.acp import credentials as acp_credentials
@@ -546,6 +549,49 @@ def write_taskbar_pref(enabled: bool) -> bool:
         return False
 
 
+# ---- ★面板窗口标题（跟随设置里的「左上角名字」）----
+# 为什么走文件：窗口标题是**守护进程 / 窗口进程 / 托盘进程**的事，它们读不到浏览器的 localStorage，
+# 所以前端改名时把成品标题 POST 过来，三方各自读这一份文件（进程间只共享磁盘，不共享内存）。
+PANEL_TITLE_FILE = os.path.join(STATE_DIR, "_panel_title.json")
+PANEL_TITLE_MIN = "cocraft"
+
+
+def norm_panel_title(text) -> str:
+    """归一标题：压平空白 / 去掉控制字符 / 最多 60 字；空 → 空串（调用方用默认）。"""
+    t = " ".join(str(text or "").split())
+    t = "".join(ch for ch in t if ch.isprintable())
+    return t[:60]
+
+
+def _collapse_title(t: str) -> str:
+    """`cocraft · cocraft` → `cocraft`（名字恰好等于产品名时不重复写一遍）。"""
+    if "·" not in t:
+        return t
+    parts = [x.strip() for x in t.split("·")]
+    uniq = {x.lower() for x in parts if x}
+    return parts[0] if len(uniq) == 1 else t
+
+
+def read_panel_title() -> str:
+    try:
+        with open(PANEL_TITLE_FILE, "r", encoding="utf-8") as fh:
+            return _collapse_title(norm_panel_title((json.load(fh) or {}).get("title")))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def write_panel_title(title: str) -> bool:
+    t = _collapse_title(norm_panel_title(title))
+    try:
+        tmp = PANEL_TITLE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"title": t}, fh, ensure_ascii=False)
+        os.replace(tmp, PANEL_TITLE_FILE)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ---- 面板窗口形态（原生 WebView2 / 浏览器 Edge --app）----
 PANEL_WINDOW_FILE = os.path.join(STATE_DIR, "_panel_window.json")
 
@@ -795,7 +841,7 @@ WE_APPID = "431960"
 #   "id:文件夹名"  —— 直接指定创意工坊 id
 #   其余当作相对 431960 的 glob（例如 "*/sakura*.mp4"）
 WE_WALLPAPERS = {
-    # 白昼：［绯莎］绘梨衣 sakura —— 夜：月读命绘梨衣
+    # 昼：4K 樱吹雪（创意工坊 3786830950）—— 夜：4K 月下（3568633530）
     "hiru": ["title:绯莎", "3786830950", "*/sakura*.mp4"],
     "yoru": ["title:月读", "3568633530"],
 }
@@ -1068,47 +1114,110 @@ def _pick_media(folder: str):
     return best
 
 
+def _wallpaper_entry(root: str, wid: str) -> dict:
+    """把一个壁纸 id 解析成前端要的形状：
+    `video` → 单个原片 URL；`scene` → **目录** URL（交给 WebWallGL.httpSource）；
+    `custom:<id>` → 用户拖进来的图片 / 视频（`/wallpaper/file?id=…`）。"""
+    if str(wid).startswith("builtin:"):
+        for it in builtin_wallpapers():
+            if it.get("id") == wid:
+                return {"id": wid, "kind": it["kind"], "title": it["title"],
+                        "file": it["file"], "size_mb": it["size_mb"], "url": it["url"]}
+        return {}
+    if str(wid).startswith("custom:"):
+        cid = str(wid).split(":", 1)[1]
+        for it in wp_custom_items():
+            if it.get("raw") == cid:
+                return {"id": "custom:" + cid, "kind": it["kind"], "title": it["title"],
+                        "file": it["file"], "size_mb": it["size_mb"], "url": it["url"]}
+        return {}
+    folder = os.path.join(root, wid)
+    kind = we_project_kind(folder)
+    title = _we_titles(root).get(wid, "")
+    if kind == "video":
+        p = _pick_media(folder)
+        if not p:
+            return {}
+        rel = os.path.relpath(p, root).replace("\\", "/")
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            size = 0
+        return {"id": wid, "kind": "video", "title": title,
+                "file": os.path.basename(rel), "size_mb": round(size / 1048576.0, 1),
+                "url": "/we/" + "/".join(quote(seg) for seg in rel.split("/"))}
+    if kind == "scene":
+        try:
+            pkgs = [n for n in os.listdir(folder) if n.lower().endswith(".pkg")]
+        except OSError:
+            pkgs = []
+        if not pkgs:
+            return {}
+        size = 0
+        for n in pkgs:
+            try:
+                size += os.path.getsize(os.path.join(folder, n))
+            except OSError:
+                pass
+        base = "/we/" + quote(wid) + "/"
+        return {"id": wid, "kind": "scene", "title": title, "file": pkgs[0],
+                "size_mb": round(size / 1048576.0, 1), "url": base, "base": base}
+    return {}
+
+
 def live_wallpaper_files() -> dict:
-    """按主题解析出可用的原片：{主题: (相对 431960 的路径, 壁纸标题)}。
-    优先用**用户在面板里选过的**，没选过才落到 WE_WALLPAPERS 里的默认候选。"""
-    root = we_root()
-    out = {}
-    if not root:
-        return out
-    titles = _we_titles(root)
+    """按主题解析出可用的壁纸：`{主题: {id, kind, title, url, file, size_mb}}`。
+    优先用**用户在面板里选过的**（WE 壁纸 id 或 `custom:<id>`），没选过才落到 WE_WALLPAPERS 默认候选
+    （默认候选只可能是 video —— 场景壁纸必须由用户显式选）。"""
+    root = we_root() or ""
+    titles = _we_titles(root) if root else {}
     pick = _read_pick()
+    out = {}
     for theme, specs in WE_WALLPAPERS.items():
         wid = str(pick.get(theme) or "")
-        if wid and wid in titles:                    # ① 用户选的
-            folder = os.path.join(root, wid)
-            if we_project_kind(folder) != "video":   # 只支持 video 类壁纸
+        if wid.startswith(("custom:", "builtin:")):   # ① 用户拖进来的 / 官方内置
+            e = _wallpaper_entry(root, wid)
+            if e:
+                out[theme] = e
                 continue
-            p = _pick_media(folder)
-            if p:
-                out[theme] = (os.path.relpath(p, root).replace("\\", "/"), titles.get(wid, ""))
+        if wid and wid in titles:                    # ② 用户选的 WE 壁纸（video / scene 都行）
+            e = _wallpaper_entry(root, wid)
+            if e:
+                out[theme] = e
                 continue
-        for spec in specs:                           # ② 默认候选
-            pick_path, label = None, ""
+        _bl = builtin_wallpapers()                   # ★没选过（或选的那张没了）→ 官方内置当默认
+        if _bl:
+            out[theme] = {k: v for k, v in _bl[0].items() if k != "builtin"}
+            continue
+        if not root:
+            continue                                 # 没有 WE 目录：只可能走 custom / builtin
+        for spec in specs:                           # ③ 默认候选（video）
+            e = {}
             if spec.startswith("title:"):
                 key = spec[len("title:"):]
                 for d, t in titles.items():
                     if key and key in t:
-                        pick_path = _pick_media(os.path.join(root, d))
-                        label = t
-                        if pick_path:
+                        e = _wallpaper_entry(root, d)
+                        if e:
                             break
             elif spec.startswith("id:"):
                 d = spec[len("id:"):]
                 if d in titles:
-                    pick_path = _pick_media(os.path.join(root, d))
-                    label = titles.get(d, "")
+                    e = _wallpaper_entry(root, d)
             else:
                 hits = [p for p in glob.glob(os.path.join(root, spec)) if os.path.isfile(p)]
                 if hits:
                     hits.sort(key=lambda p: -os.path.getsize(p))
-                    pick_path = hits[0]
-            if pick_path:
-                out[theme] = (os.path.relpath(pick_path, root).replace("\\", "/"), label)
+                    rel = os.path.relpath(hits[0], root).replace("\\", "/")
+                    try:
+                        size = os.path.getsize(hits[0])
+                    except OSError:
+                        size = 0
+                    e = {"id": "", "kind": "video", "title": "",
+                         "file": os.path.basename(rel), "size_mb": round(size / 1048576.0, 1),
+                         "url": "/we/" + "/".join(quote(seg) for seg in rel.split("/"))}
+            if e:
+                out[theme] = e
                 break
     return out
 
@@ -1195,6 +1304,187 @@ def list_video_wallpapers() -> list:
             continue                                    # 单个壁纸出问题就跳过它
     out.sort(key=lambda x: -x["size_mb"])
     return out
+
+
+def list_scene_wallpapers() -> list:
+    """创意工坊里的 **scene** 壁纸（面板里由 WebWallGL 用 WebGL2 实时渲染）。
+    application / 含 exe·dll 的项目一律不列、不解析、不执行。
+    `url` 是**目录**（带末尾斜杠）—— 前端直接交给 `WebWallGL.httpSource()`。"""
+    root = we_root()
+    if not root:
+        return []
+    out = []
+    for d, t in _we_titles(root).items():
+        try:
+            folder = os.path.join(root, d)
+            if we_project_kind(folder) != "scene":
+                continue
+            pkgs = [n for n in os.listdir(folder) if n.lower().endswith(".pkg")]
+            if not pkgs:
+                continue
+            size = 0
+            for n in pkgs:
+                try:
+                    size += os.path.getsize(os.path.join(folder, n))
+                except OSError:
+                    pass
+            preview = ""
+            for name in ("preview.gif", "preview.jpg", "preview.png"):
+                if os.path.isfile(os.path.join(folder, name)):
+                    preview = "/we/" + quote(d) + "/" + quote(name)
+                    break
+            base = "/we/" + quote(d) + "/"
+            out.append({
+                "id": d, "title": t, "kind": "scene",
+                "file": pkgs[0], "size_mb": round(size / 1048576.0, 1),
+                "url": base, "base": base, "preview": preview,
+            })
+        except Exception:  # noqa: BLE001
+            continue                                    # 单个壁纸出问题就跳过它
+    out.sort(key=lambda x: -x["size_mb"])
+    return out
+
+
+# ---------- 自定义壁纸（用户在面板里拖进来的图片 / 视频）----------
+#   存在 runtime/wallpapers/（不进 git）；索引 _index.json：{id, name, file, kind, size, added}
+#   id = 内容 sha1 前 16 位 → 同一个文件重复拖进来不会存两份。
+WALLPAPER_DIR = os.path.join(RUNTIME_DIR, "wallpapers")
+WALLPAPER_INDEX = os.path.join(WALLPAPER_DIR, "_index.json")
+WP_IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp")
+WP_VIDEO_EXT = (".mp4", ".webm", ".m4v")
+WP_MAX_BYTES = 512 * 1024 * 1024
+_WP_LOCK = threading.Lock()
+
+# ★官方内置动态壁纸：`frontend/assets/videos/official-bg.mp4`（**用户桌面那份「cocraft官方动态背景」**，
+#   2,931,316 B / 10s / 烛光），配一张抽帧缩略图 `official-bg.jpg`。
+#   随安装包发（build.py 整目录复制 frontend/）、**不可删**；没选过时它就是默认。
+OFFICIAL_BG = os.path.join(ROOT, "frontend", "assets", "videos", "official-bg.mp4")
+OFFICIAL_BG_ID = "builtin:official"
+OFFICIAL_BG_URL = "/assets/videos/official-bg.mp4"
+
+
+def builtin_wallpapers() -> list:
+    """内置（官方）壁纸清单：不落 `runtime/wallpapers`、不可删除、随包分发。"""
+    if not os.path.isfile(OFFICIAL_BG):
+        return []
+    try:
+        size = os.path.getsize(OFFICIAL_BG)
+    except OSError:
+        size = 0
+    poster = os.path.join(os.path.dirname(OFFICIAL_BG), "official-bg.jpg")
+    return [{
+        "id": OFFICIAL_BG_ID, "title": "cocraft 官方动态背景 · 烛光",
+        "kind": "video", "size_mb": round(size / 1048576.0, 1),
+        "file": os.path.basename(OFFICIAL_BG), "url": OFFICIAL_BG_URL,
+        # 缩略图用预先抽好的那一帧（视频 moov 在尾部，直接当缩略图会多拉不少字节）
+        "preview": ("/assets/videos/official-bg.jpg" if os.path.isfile(poster) else ""),
+        "builtin": True,
+    }]
+
+
+def _wp_load() -> list:
+    try:
+        with open(WALLPAPER_INDEX, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        items = d.get("items") if isinstance(d, dict) else None
+        return [x for x in (items or []) if isinstance(x, dict) and x.get("id")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _wp_save(items: list) -> None:
+    try:
+        os.makedirs(WALLPAPER_DIR, exist_ok=True)
+        tmp = WALLPAPER_INDEX + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"items": items}, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, WALLPAPER_INDEX)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def wp_custom_items() -> list:
+    """自定义壁纸清单（选择器与 live 解析共用）。`id` 对外是 `custom:<raw>`。"""
+    out = []
+    for it in _wp_load():
+        raw = str(it.get("id") or "")
+        path = os.path.join(WALLPAPER_DIR, os.path.basename(str(it.get("file") or "")))
+        if not raw or not os.path.isfile(path):
+            continue
+        url = "/wallpaper/file?id=" + quote(raw)
+        kind = str(it.get("kind") or "image")
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        out.append({
+            "id": "custom:" + raw, "raw": raw, "title": str(it.get("name") or raw),
+            "kind": kind, "size_mb": round(size / 1048576.0, 1),
+            "file": os.path.basename(path), "url": url,
+            "preview": url if kind == "image" else "",
+        })
+    out.sort(key=lambda x: -x["size_mb"])
+    return out
+
+
+def wp_custom_add(name: str, data: bytes):
+    """保存一个上传的壁纸。返回 (ok, payload 或 人话错误)。"""
+    ext = os.path.splitext(name or "")[1].lower()
+    if ext in WP_VIDEO_EXT:
+        kind = "video"
+    elif ext in WP_IMAGE_EXT:
+        kind = "image"
+    else:
+        return False, "只支持图片（jpg/png/webp/gif/avif/bmp）或视频（mp4/webm/m4v）"
+    if not data:
+        return False, "文件是空的"
+    if len(data) > WP_MAX_BYTES:
+        return False, "文件太大（上限 512 MB）"
+    raw = hashlib.sha1(data).hexdigest()[:16]
+    safe = os.path.basename(name or "")[:120] or (raw + ext)
+    with _WP_LOCK:
+        items = _wp_load()
+        fn = raw + ext
+        path = os.path.join(WALLPAPER_DIR, fn)
+        try:
+            os.makedirs(WALLPAPER_DIR, exist_ok=True)
+            if not os.path.isfile(path):
+                with open(path, "wb") as fh:
+                    fh.write(data)
+        except OSError as e:
+            return False, "写盘失败：%s" % e
+        have = next((x for x in items if str(x.get("id")) == raw), None)
+        if have:
+            have["name"] = safe
+            have["kind"] = kind
+        else:
+            items.append({"id": raw, "name": safe, "file": fn, "kind": kind,
+                          "size": len(data), "added": int(time.time())})
+        _wp_save(items)
+    return True, {"id": "custom:" + raw, "kind": kind, "name": safe,
+                  "size_mb": round(len(data) / 1048576.0, 1)}
+
+
+def wp_custom_delete(wid: str) -> bool:
+    raw = str(wid or "").replace("custom:", "")
+    with _WP_LOCK:
+        items = _wp_load()
+        keep, hit = [], None
+        for it in items:
+            if str(it.get("id")) == raw:
+                hit = it
+            else:
+                keep.append(it)
+        if not hit:
+            return False
+        try:
+            p = os.path.join(WALLPAPER_DIR, str(hit.get("file") or ""))
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
+        _wp_save(keep)
+    return True
 
 
 def _read_spectrum() -> dict:
@@ -1363,6 +1653,19 @@ class Handler(BaseHTTPRequestHandler):
         if os.environ.get("OPENCODE_UI_VERBOSE"):
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+    def _via(self) -> str:
+        """这次请求是**面板点的**还是**本机接口调的**（本机接口无鉴权 → 必须能区分）。
+
+        面板的 fetch 统一带 `X-Cocraft-UI`；agent / 脚本直接发 HTTP 不会有这个头。
+        """
+        return "ui" if (self.headers.get("X-Cocraft-UI") or "") else "api"
+
+    def _actor_by_via(self) -> dict:
+        """审计里的 actor：人点的 = owner；本机接口调的 = 系统（**不冒充人**）。"""
+        if self._via() == "ui":
+            return {"kind": "user", "id": "local", "name": "owner"}
+        return {"kind": "system", "id": "local-api", "name": "本机接口（未经面板）"}
+
     def _send_json(self, code: int, obj: dict):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -1401,6 +1704,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._alive()
             elif path == "/panel/taskbar":
                 self._panel_taskbar(method)
+            elif path == "/panel/title":
+                # ★窗口 / 托盘标题跟随「左上角名字」（前端改名时写；守护与托盘各自读文件）
+                self._panel_title(method)
             elif path == "/panel/window":
                 self._panel_window(method)
             elif path == "/panel/notify":
@@ -1583,6 +1889,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/snapshot" or path.startswith("/snapshot/"):
                 # ★可逆执行：工作区快照（引擎无关；diff / 撤销这一轮 的底座）
                 self._snapshot_api(method, path)
+            elif path == "/audit" or path.startswith("/audit/"):
+                # ★审计链：append-only 哈希链（列表 / 统计 / 导出 / 校验）—— 本地路由，不走上游
+                self._audit_api(method, path)
             elif path == "/update/check":
                 self._update_check()
             elif path == "/update/status":
@@ -1605,6 +1914,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._live_list()
             elif path == "/live/pick":
                 self._live_pick(method)
+            elif path == "/wallpaper/list":
+                self._wallpaper_list()
+            elif path == "/wallpaper/file":
+                self._wallpaper_file()
+            elif path == "/wallpaper/upload":
+                self._wallpaper_upload(method)
+            elif path == "/wallpaper/delete":
+                self._wallpaper_delete(method)
             elif path.startswith("/we/"):
                 self._we(path)
             elif path == "/music/component":
@@ -1728,6 +2045,22 @@ class Handler(BaseHTTPRequestHandler):
         enabled = bool(body.get("enabled", True))
         ok = write_taskbar_pref(enabled)
         self._send_json(200 if ok else 500, {"ok": ok, "enabled": enabled})
+
+    def _panel_title(self, method: str):
+        """★窗口标题跟随「左上角名字」：前端改名时 POST `{title}`（如 `cocraft · 守烛人`）。
+
+        守护进程（窗口标题）和托盘进程各自读 `_panel_title.json`；空标题 = 回到默认 `cocraft`。
+        """
+        if method == "GET":
+            self._send_json(200, {"title": read_panel_title() or PANEL_TITLE_MIN})
+            return
+        if method != "POST":
+            self._send_json(405, {"error": "GET or POST only"})
+            return
+        body = self._read_json_body() or {}
+        ok = write_panel_title(str(body.get("title") or ""))
+        self._send_json(200 if ok else 500, {"ok": ok,
+                                             "title": read_panel_title() or PANEL_TITLE_MIN})
 
     def _panel_window(self, method: str):
         """面板窗口形态：native（WebView2 原生窗口）/ browser（Edge --app）/ auto。"""
@@ -2273,6 +2606,20 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
                 return
+            # ★审计链：恢复也是一次状态变更（谁恢复的、恢复了几项、有没有冲突/失败）
+            audit.append(
+                "snapshot",
+                actor=self._actor_by_via(),
+                action={"kind": "restore", "title": "从隔离区恢复"},
+                decision="restore",
+                result=("ok" if res.get("restored") else "failed"),
+                ref={"scope": str(res.get("id") or "")},
+                quarantine=str(res.get("id") or ""),
+                note="恢复 %d 项 · 冲突 %d · 缺失 %d · 失败 %d%s"
+                     % (res.get("restored") or 0, res.get("conflict") or 0,
+                        res.get("missing") or 0, res.get("failed") or 0,
+                        " · 允许覆盖" if b.get("override") else ""),
+                via=self._via())
             self._send_json(200, res)
             return
         if sub in ("drop", "delete") and method == "POST":
@@ -2288,6 +2635,16 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self._send_json(400, {"ok": False, "error": str(exc)})
                     return
+            # ★审计链：删恢复点要留痕（这是"以后再也救不回来"的操作）
+            audit.append(
+                "snapshot",
+                actor=self._actor_by_via(),
+                action={"kind": "drop", "title": "删除隔离记录"},
+                decision="drop", result="ok" if done else "skipped",
+                ref={"scope": ",".join(done)[:300]},
+                quarantine=",".join(done)[:300],
+                note="永久删除 %d 条隔离记录" % len(done),
+                via=self._via())
             self._send_json(200, {"ok": True, "dropped": done})
             return
         if sub == "add" and method == "POST":
@@ -2369,6 +2726,19 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
                 return
+            # ★审计链：「撤销这一轮」是**最该留痕**的操作（谁撤的、回到哪一版、动了几项）
+            audit.append(
+                "snapshot",
+                actor=self._actor_by_via(),
+                action={"kind": "undo", "title": "撤销这一轮",
+                        "targets": [str(x.get("path") or "") for x in (res.get("actions") or [])
+                                    if x.get("action") == "restore"][:20]},
+                decision="undo", result=("ok" if res.get("ok") else "failed"),
+                ref={"scope": str(res.get("scope") or scope), "ts": str(res.get("ts") or "")},
+                note="恢复 %d · 删除 %d · 跳过 %d"
+                     % (res.get("restored") or 0, res.get("removed") or 0,
+                        res.get("skipped") or 0),
+                via=self._via())
             self._send_json(200, res)
             return
         if sub == "drop" and method == "POST":
@@ -2381,6 +2751,145 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, res)
             return
         self._send_json(404, {"ok": False, "error": "unknown snapshot route"})
+
+    # ---------- ★审计链（append-only + 哈希链：谁批准了什么、能不能证明没被改过） ----------
+
+    def _audit_api(self, method: str, path: str):
+        """列表 / 统计 / 导出 / 校验。
+
+        ⚠ 这里**只读** —— 写入口是 `audit.append()`（工作台审批、群聊桥、隔离区恢复/撤销）。
+        ⚠ 不记成员正文，只有决定 + 命令原文 + 目标路径 + 隔离记录 id（见 `backend/audit.py`）。
+        """
+        sub = path[len("/audit"):].strip("/")
+        q = parse_qs(urlsplit(self.path).query)
+
+        def _one(key, default=""):
+            return (q.get(key) or [default])[0]
+
+        def _flt():
+            out = {}
+            for k in ("source", "run", "member", "chat", "aid", "actor", "approver",
+                      "decision", "result", "kind"):
+                v = _one(k, "")
+                if v:
+                    out[k] = v
+            return out
+
+        def _num(key, default=0.0):
+            try:
+                return float(_one(key, str(default)) or default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        if sub in ("", "list"):
+            if method != "GET":
+                self._send_json(405, {"ok": False, "error": "GET only"})
+                return
+            try:
+                limit = int(_one("limit", "80") or 80)
+            except (TypeError, ValueError):
+                limit = 80
+            items = audit.records(limit=limit, since=_num("since"), until=_num("until"), **_flt())
+            self._send_json(200, {"ok": True, "items": items, "count": len(items),
+                                  "tail": items[0].get("hash") if items else audit.GENESIS})
+            return
+        if sub == "stats":
+            self._send_json(200, {"ok": True, "data": audit.stats()})
+            return
+        if sub == "report":
+            # ★一页报告（Markdown）：给人看的「结论分布 + 破坏性逐条 + 明细」
+            try:
+                limit = int(_one("limit", "0") or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            text = audit.report(since=_num("since"), until=_num("until"),
+                                limit=limit, **_flt())
+            if _one("download") in ("1", "true", "yes"):
+                body = text.encode("utf-8-sig")
+                stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="cocraft-audit-report-%s.md"' % stamp)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._send_json(200, {"ok": True, "data": {"markdown": text}})
+            return
+        if sub == "archive" and method == "POST":
+            # ★保留期：手动把最旧的一段移进归档（平时追加时也会自动检查阈值）
+            b = self._read_json_body() or {}
+            try:
+                max_mb = float(b.get("maxMb")) if b.get("maxMb") is not None else None
+                keep_mb = float(b.get("keepMb")) if b.get("keepMb") is not None else None
+            except (TypeError, ValueError):
+                self._send_json(400, {"ok": False, "error": "maxMb / keepMb 要是数字（MB）"})
+                return
+            res = audit.rotate(
+                max_bytes=(int(max_mb * 1024 * 1024) if max_mb is not None else None),
+                keep_bytes=(int(keep_mb * 1024 * 1024) if keep_mb is not None else None),
+                via=self._via())
+            self._send_json(200 if res.get("ok") else 400, res)
+            return
+        if sub == "export":
+            if method != "GET":
+                self._send_json(405, {"ok": False, "error": "GET only"})
+                return
+            fmt = (_one("format", "json") or "json").lower()
+            if fmt not in ("json", "csv"):
+                self._send_json(400, {"ok": False, "error": "format 只支持 json / csv"})
+                return
+            try:
+                limit = int(_one("limit", "0") or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            data = audit.export(since=_num("since"), until=_num("until"),
+                                limit=limit, **_flt())
+            stamp = str(data.get("exported") or "export").replace(":", "").replace(".", "-")
+            if fmt == "csv":
+                # ★CSV 一律当文件下载（Excel 能直接开）；带 BOM 免得中文变乱码
+                body = audit.to_csv(data["items"]).encode("utf-8-sig")
+                name = "cocraft-audit-%s.csv" % stamp
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+                # 文件级元信息放响应头（CSV 里不掺说明行，免得工具读不了）
+                self.send_header("X-Audit-Records", str(data["records"]))
+                self.send_header("X-Audit-Tail", str(data["tail"]))
+                self.send_header("X-Audit-Chain", "ok" if data["chain"]["ok"] else "broken")
+                self.send_header("X-Audit-Gaps", str(data["chain"]["gaps"]))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if _one("download") in ("1", "true", "yes"):
+                body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+                name = "cocraft-audit-%s.json" % stamp
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._send_json(200, {"ok": True, "data": data})
+            return
+        if sub == "verify" and method == "POST":
+            b = self._read_json_body() or {}
+            items = b.get("items")
+            if isinstance(items, list):
+                # 校验外部送来的导出内容（面板/脚本复核别人给的审计文件）
+                res = audit.verify(items, subset=bool(b.get("subset")))
+            else:
+                res = audit.verify()
+            res["ok"] = bool(res.get("ok"))
+            self._send_json(200, res)
+            return
+        self._send_json(404, {"ok": False, "error": "unknown audit route"})
 
     # ---------- 软件更新（查 GitHub Releases 最新版 / 一键静默更新） ----------
 
@@ -2474,30 +2983,32 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _live_wallpapers(self):
-        """给前端：当前各主题生效的原片（只支持 video 类壁纸）。"""
+        """给前端：当前各主题生效的壁纸。
+        `hiru` / `yoru` 是**可播放的 URL**（video = 单个文件；scene = 整个目录），
+        另给 `hiruKind` / `yoruKind`（video / scene）告诉前端该走哪条渲染路径。"""
         root = we_root()
-        files = live_wallpaper_files() if root else {}
-        out = {"ok": bool(files), "root": root, "hiru": None, "yoru": None, "detail": {}}
-        for theme, (rel, label) in files.items():
-            url = "/we/" + "/".join(quote(seg) for seg in rel.split("/"))
-            out[theme] = url
-            try:
-                size = os.path.getsize(os.path.join(root, rel))
-            except OSError:
-                size = 0
-            out["detail"][theme] = {"title": label, "file": os.path.basename(rel),
-                                    "size_mb": round(size / 1048576.0, 1), "url": url,
-                                    "kind": "video"}
+        files = live_wallpaper_files()
+        out = {"ok": bool(files), "root": root, "hiru": None, "yoru": None,
+               "hiruKind": None, "yoruKind": None, "detail": {}}
+        for theme, e in files.items():
+            out[theme] = e.get("url")
+            out[theme + "Kind"] = e.get("kind")
+            out["detail"][theme] = {"title": e.get("title", ""), "file": e.get("file", ""),
+                                    "size_mb": e.get("size_mb", 0), "url": e.get("url", ""),
+                                    "kind": e.get("kind", "")}
         self._send_json(200, out)
 
     def _live_list(self):
         """所有能用浏览器播的壁纸（含用户当前选择），给面板里的选择器用。"""
         root = we_root()
-        items = list_video_wallpapers() if root else []
-        files = live_wallpaper_files() if root else {}
+        items = builtin_wallpapers() + wp_custom_items()
+        if root:
+            items = items + list_video_wallpapers() + list_scene_wallpapers()
+        files = live_wallpaper_files()
         self._send_json(200, {
             "ok": bool(items), "root": root, "items": items, "pick": _read_pick(),
-            "detail": {t: {"title": v[1]} for t, v in files.items()},
+            "detail": {t: {"title": e.get("title", ""), "kind": e.get("kind", "")}
+                       for t, e in files.items()},
         })
 
     def _live_pick(self, method: str):
@@ -2510,16 +3021,71 @@ class Handler(BaseHTTPRequestHandler):
         if theme not in ("hiru", "yoru"):
             self._send_json(400, {"error": "theme 必须是 hiru / yoru"})
             return
-        root = we_root()
+        root = we_root() or ""
         wid = body.get("id")
         wid = str(wid) if wid else None
-        if wid and (not root or wid not in _we_titles(root)):
+        if wid and not _wallpaper_entry(root, wid):
             self._send_json(400, {"error": "找不到这个壁纸 id", "id": wid})
             return
         _write_pick(theme, wid)
-        files = live_wallpaper_files() if root else {}
+        files = live_wallpaper_files()
         self._send_json(200, {"ok": True, "pick": _read_pick(), "theme": theme, "id": wid,
-                              "detail": {t: {"title": v[1]} for t, v in files.items()}})
+                              "detail": {t: {"title": e.get("title", ""), "kind": e.get("kind", "")}
+                                         for t, e in files.items()}})
+
+    # ---------- 自定义壁纸（拖拽导入的图片 / 视频）----------
+
+    def _wallpaper_list(self):
+        self._send_json(200, {"ok": True, "items": wp_custom_items(), "dir": WALLPAPER_DIR})
+
+    def _wallpaper_file(self):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        raw = str((q.get("id") or [""])[0]).replace("custom:", "")
+        it = next((x for x in _wp_load() if str(x.get("id")) == raw), None)
+        path = os.path.join(WALLPAPER_DIR, os.path.basename(str(it.get("file") or ""))) if it else ""
+        if not it or not os.path.isfile(path):
+            self._send_json(404, {"error": "找不到这个壁纸文件"})
+            return
+        self._send_file(path)
+
+    def _wallpaper_upload(self, method: str):
+        """拖拽导入：`POST /wallpaper/upload?name=<文件名>`，body 是**原始字节**（不是 JSON）。"""
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            self._send_json(400, {"error": "没有收到文件内容"})
+            return
+        if n > WP_MAX_BYTES:
+            self._send_json(413, {"error": "文件太大（上限 512 MB）"})
+            return
+        data = self.rfile.read(n)
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        name = str((q.get("name") or ["wallpaper"])[0])
+        ok, payload = wp_custom_add(name, data)
+        if ok:
+            self._send_json(200, {"ok": True, "item": payload, "items": wp_custom_items()})
+        else:
+            self._send_json(400, {"ok": False, "error": payload})
+
+    def _wallpaper_delete(self, method: str):
+        if method != "POST":
+            self._send_json(405, {"error": "POST only"})
+            return
+        body = self._read_json_body() or {}
+        wid = str(body.get("id") or "")
+        if wid.startswith("builtin:"):
+            self._send_json(400, {"ok": False, "error": "官方内置壁纸不可删除"})
+            return
+        ok = wp_custom_delete(wid)
+        payload = {"ok": ok, "items": wp_custom_items()}
+        if not ok:
+            payload["error"] = "找不到这个壁纸"
+        self._send_json(200 if ok else 400, payload)
 
     def _we(self, path: str):
         """/we/<相对 431960 的路径> —— 流式发创意工坊里的文件（给 <video> 用）。"""

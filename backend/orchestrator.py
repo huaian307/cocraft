@@ -24,6 +24,7 @@ import time
 import uuid
 
 import snapshots
+import audit
 from cocraft_agents import (ROLES, allowed_by_level, allow_network, _is_destructive,
                             _is_net, norm_role, perm_level, role_line)
 from engines import STATE_DIR
@@ -626,10 +627,11 @@ def _ask_permission(run: dict, member: dict, kind, title, locations, options, in
                     % (run["id"], member["id"], title or kind or ""))
         return "once"
     pid = "operm_%s" % uuid.uuid4().hex[:10]
+    created = _now()
     p = {"id": pid, "run": run["id"], "member": member["id"],
          "memberName": member.get("name") or member["id"], "kind": kind or "",
          "title": title or "", "locations": list(locations or []),
-         "command": cmd, "destructive": bool(destructive), "created": _now(),
+         "command": cmd, "destructive": bool(destructive), "created": created,
          "status": "pending", "decision": None, "event": threading.Event()}
     with _LOCK:
         _PENDING[pid] = p
@@ -654,6 +656,7 @@ def _ask_permission(run: dict, member: dict, kind, title, locations, options, in
         if cancel_evt is not None and cancel_evt.is_set():
             break
     decision = p.get("decision") or "reject"
+    answered = bool(p.get("event") is not None and p["event"].is_set())
     if cancel_evt is not None and cancel_evt.is_set():
         decision = "reject"
     if p.get("status") == "pending":
@@ -666,8 +669,27 @@ def _ask_permission(run: dict, member: dict, kind, title, locations, options, in
                     item.update({"status": p["status"], "decision": decision,
                                  "decidedAt": p["decidedAt"]})
             _save(run)
+    waited = round((time.time() * 1000.0 - created) / 1000.0, 1)
+    _cancelled = bool(cancel_evt is not None and cancel_evt.is_set())
     with _LOCK:
         _PENDING.pop(pid, None)
+    # ★审计链：**只记结论**（谁批准/拒绝了哪一条 + 命令原文 + 等了多久）。
+    #   策略自动放行（等级/trust）刻意不入链 —— 见 backend/audit.py 顶部「口径」。
+    audit.append(
+        "collab",
+        actor={"kind": "agent", "id": str(member.get("engine") or ""),
+               "name": member.get("name") or "", "member": member.get("id") or "",
+               "role": member.get("role") or "",
+               "engine": member.get("engine") or ""},
+        action={"kind": kind or "", "title": title or "", "command": cmd,
+                "targets": locations, "destructive": bool(destructive)},
+        decision=decision,
+        result=("ok" if decision in ("once", "always") else
+                "denied" if answered else "timeout"),
+        approver=({"kind": "user", "id": "local", "name": "owner"} if answered else None),
+        ref={"run": run["id"], "member": member["id"], "perm": pid},
+        note=("等待 %.1fs" % waited) + (" · 已取消" if _cancelled else "")
+             + ("" if answered else " · 无人批准"), ts=created / 1000.0)
     # 用户选了「始终允许」→ 写进 ACP 的 always 记忆（和面板同一条）
     if decision == "always":
         try:

@@ -138,8 +138,115 @@ NO_WINDOW = 0x08000000
 # ---- 原生窗口（pywebview / WebView2，可选组件）----
 STATE_DIR = os.path.join(RUNTIME_DIR, "state")
 PANEL_WINDOW_PY = os.path.join(HERE, "panel_window.py")
-PANEL_TITLE = "cocraft · 絵梨衣"
+PANEL_TITLE = "cocraft"          # 默认标题（没设名字 / 读不到 _panel_title.json 时用它）
+PANEL_TITLE_FILE = os.path.join(STATE_DIR, "_panel_title.json")
 _NATIVE_MARK = "panel_window.py"
+_NATIVE_WINDOW = False           # 这次开的是原生窗口（标题由我们 SetWindowTextW 维护）
+_TITLE_HWND = {"pid": 0, "hwnd": 0}
+_TITLE_WARNED = {"k": ""}
+_WIN_PID = {"t": 0.0, "pid": 0}      # 面板窗口主进程（只用来拿窗口句柄，不参与关窗判定）
+
+
+def panel_title_desired() -> str:
+    """窗口 / 托盘标题：面板改名时前端 `POST /panel/title` 写进 `_panel_title.json`。
+
+    ⚠ 窗口进程和托盘进程都读不到浏览器的 localStorage，所以只能走这份文件（进程间共享磁盘）。
+    """
+    try:
+        with open(PANEL_TITLE_FILE, "r", encoding="utf-8") as fh:
+            t = str((json.load(fh) or {}).get("title") or "")
+    except Exception:  # noqa: BLE001
+        t = ""
+    t = " ".join(t.split())[:60]
+    return t or PANEL_TITLE
+
+
+def _pid_image(pid: int) -> str:
+    """进程的 exe 全路径（纯 ctypes，不依赖 PowerShell）。拿不到回空。"""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        try:
+            kernel32.CloseHandle(h)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _is_native_window(pid: int) -> bool:
+    """这个面板进程是不是**原生窗口**（python 跑 `panel_window.py`）？
+
+    浏览器模式（Edge --app）的窗口标题跟着页面 `document.title`，我们不去抢；
+    用进程 exe 名判断（`pythonw.exe` = 原生；`msedge.exe`/`chrome.exe` = 浏览器），
+    这样"采纳已开窗口"时也能分辨，且不依赖 PowerShell。
+    """
+    if _NATIVE_WINDOW:
+        return True
+    if not pid:
+        return False
+    img = _pid_image(pid).lower()
+    return img.endswith("pythonw.exe") or img.endswith("python.exe")
+
+
+def _panel_hwnd(pid: int) -> int:
+    """该 PID 下"有标题的可见顶层窗口"（面板主窗口）。找到就缓存，换了 PID 重新枚举。"""
+    if not pid:
+        return 0
+    if _TITLE_HWND.get("pid") == pid and _TITLE_HWND.get("hwnd") \
+            and _user32.IsWindow(_TITLE_HWND["hwnd"]):
+        return _TITLE_HWND["hwnd"]
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _lparam):
+        wpid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+        if (wpid.value == pid and _user32.IsWindowVisible(hwnd)
+                and _user32.GetWindowTextLengthW(hwnd) > 0):
+            found.append(hwnd)
+        return True
+
+    _user32.EnumWindows(_cb, 0)
+    hwnd = found[0] if found else 0
+    _TITLE_HWND.update({"pid": pid, "hwnd": hwnd})
+    return hwnd
+
+
+def sync_panel_title(pid: int) -> None:
+    """把窗口标题改成「面板名字」（**只动原生窗口**；浏览器模式跟着 document.title）。
+
+    每 tick 比一次**实际标题**（GetWindowText 很便宜），不一致就改回去 —— 这样即使
+    WebView2 把标题改回页面标题，下一轮也能自愈。
+    """
+    if not pid or not _is_native_window(pid):
+        if _TITLE_WARNED.get("k") != "notnative":
+            _TITLE_WARNED["k"] = "notnative"
+            log(f"[title] 面板进程 {pid} 不是原生窗口 → 标题跟页面 document.title 走")
+        return
+    want = panel_title_desired()
+    hwnd = _panel_hwnd(pid)
+    if not hwnd or not want:
+        if _TITLE_WARNED.get("k") != "nohwnd":
+            _TITLE_WARNED["k"] = "nohwnd"
+            log(f"[title] 拿不到窗口句柄（pid={pid}）或标题为空（want={want!r}）")
+        return
+    cur = ctypes.create_unicode_buffer(256)
+    _user32.GetWindowTextW(hwnd, cur, 256)
+    if cur.value == want:
+        return
+    if _user32.SetWindowTextW(hwnd, want):
+        log(f"窗口标题 → {want}")
+    elif _TITLE_WARNED.get("k") != want:
+        _TITLE_WARNED["k"] = want
+        log(f"[!] 改窗口标题失败（hwnd={hwnd} 目标={want} err={ctypes.get_last_error()}）")
 
 # 原生窗口"起手卡死"看门狗：WebView2 有时初始化要几十秒（期间窗口是白屏），
 # 超过这个时间还没收到页面心跳就判定卡死 → 结束它、改用浏览器窗口（本次运行不再试原生）。
@@ -717,7 +824,7 @@ def _wait_page_loaded(proc, timeout: float) -> bool:
 
 
 def open_window(hide_taskbar: bool = True, required: bool = True):
-    global _native_disabled
+    global _native_disabled, _NATIVE_WINDOW
     wait_upstream(required=required)         # ★ 先等后端可用，避免开出连不上的页面
     if want_native() and not _native_disabled:
         exe, extra, _ = panel_python()
@@ -725,9 +832,11 @@ def open_window(hide_taskbar: bool = True, required: bool = True):
         env.update(extra)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         taskbar_sync(hide_taskbar)
+        title = panel_title_desired()
         log(f"打开面板窗口（原生 WebView2）: {exe}")
-        proc = subprocess.Popen([exe, PANEL_WINDOW_PY, "--port", str(PORT), "--title", PANEL_TITLE],
+        proc = subprocess.Popen([exe, PANEL_WINDOW_PY, "--port", str(PORT), "--title", title],
                                 cwd=ROOT, env=env, creationflags=NO_WINDOW)
+        _NATIVE_WINDOW = True
         time.sleep(MINIMIZE_DELAY)
         if should_minimize_opencode(required):
             try:
@@ -740,6 +849,7 @@ def open_window(hide_taskbar: bool = True, required: bool = True):
         log(f"原生窗口 {NATIVE_LOAD_TIMEOUT:.0f}s 内没等到页面心跳 → 判定卡死，改用浏览器窗口")
         _kill_proc(proc)
         _native_disabled = True
+    _NATIVE_WINDOW = False          # 浏览器模式：窗口标题跟着页面 document.title，我们不去抢
     os.makedirs(PROFILE_DIR, exist_ok=True)
     for exe in BROWSERS:
         if os.path.isfile(exe):
@@ -898,11 +1008,32 @@ def main() -> int:
         # 目标：设置允许 + 面板还在 + 面板未最小化 时才隐藏。
         # 最小化、设置关掉、面板关掉，都会走 taskbar_sync(False) 恢复（只恢复"我们藏过的"）。
         panel_pid = proc.pid if proc is not None else adopted_pid
+        # ★"窗口 PID"：采纳的外部窗口只有启动时没心跳才记了 adopted_pid；
+        #   面板开着且心跳正常时它是 0 → 任务栏联动 / 窗口标题都拿不到句柄。
+        #   这里**只为了拿窗口**补一次（10s 一次），不改 adopted_pid（那会影响关窗判定）。
+        win_pid = panel_pid
+        if not win_pid and fresh:
+            if now - _WIN_PID["t"] > 10:
+                _WIN_PID["t"] = now
+                try:
+                    _WIN_PID["pid"] = panel_main_pid() or 0
+                except Exception:  # noqa: BLE001
+                    _WIN_PID["pid"] = 0
+            if _WIN_PID["pid"] and pid_alive(_WIN_PID["pid"]):
+                win_pid = _WIN_PID["pid"]
+            else:
+                _WIN_PID["pid"] = 0
         # ⚠ 任务栏按"窗口真的在不在"判断，而不是"进程还在不在"：窗口关了但 Edge 残留进程时，
         #   残留进程会让 fresh 持续为真、任务栏一直藏着不恢复（用户实测报的 bug）。
-        has_win, minimized = (panel_window_state(panel_pid) if (fresh and panel_pid)
+        has_win, minimized = (panel_window_state(win_pid) if (fresh and win_pid)
                               else (False, False))
         taskbar_sync(bool(taskbar_pref and fresh and has_win and not minimized))
+        # ---- ①″ 窗口标题跟随「左上角名字」（原生窗口才动；浏览器模式跟随 document.title）----
+        if fresh and has_win and win_pid:
+            try:
+                sync_panel_title(win_pid)
+            except Exception:  # noqa: BLE001
+                pass
         # 「待显示」请求已经兑现（面板真的在屏幕上）→ 清掉标志
         if pending_show and fresh and has_win:
             pending_show = False

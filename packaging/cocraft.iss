@@ -56,6 +56,10 @@ CloseApplications=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName} 面板
+UninstallDisplayIcon={app}\frontend\assets\cocraft.ico
+; ★官方软件图标（设计稿 frontend/assets/icon.svg → 由 tools\make_icon.py 生成这套 ico）
+;   安装包 exe 自己的图标、以及开始菜单/桌面快捷方式的图标都用它（以前是 pythonw 的默认图标）。
+SetupIconFile={#PayloadDir}\app\frontend\assets\cocraft.ico
 MinVersion=10.0
 DisableWelcomePage=no
 
@@ -151,10 +155,10 @@ Type: filesandordirs; Name: "{app}\scripts"
 Type: filesandordirs; Name: "{app}\frontend"
 
 [Icons]
-Name: "{group}\cocraft 面板";     Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\launchers\launch_opencode.py"""; WorkingDir: "{app}"; Comment: "打开 cocraft 面板"
-Name: "{group}\cocraft 自检";     Filename: "{app}\python\python.exe";  Parameters: """{app}\tools\selftest.py"" --app-dir ""{app}"""; WorkingDir: "{app}"; Comment: "检查安装是否完整"
+Name: "{group}\cocraft 面板";     Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\launchers\launch_opencode.py"""; WorkingDir: "{app}"; Comment: "打开 cocraft 面板"; IconFilename: "{app}\frontend\assets\cocraft.ico"
+Name: "{group}\cocraft 自检";     Filename: "{app}\python\python.exe";  Parameters: """{app}\tools\selftest.py"" --app-dir ""{app}"""; WorkingDir: "{app}"; Comment: "检查安装是否完整"; IconFilename: "{app}\frontend\assets\cocraft.ico"
 Name: "{group}\卸载 cocraft";     Filename: "{uninstallexe}"
-Name: "{autodesktop}\cocraft";    Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\launchers\launch_opencode.py"""; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\cocraft";    Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\launchers\launch_opencode.py"""; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\frontend\assets\cocraft.ico"
 
 [Run]
 ; 初始化运行时状态（写 agent 注册表 + 默认引擎；不写密钥）

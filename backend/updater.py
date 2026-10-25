@@ -20,6 +20,7 @@ r"""软件更新：查 GitHub Releases 最新版 + 一键静默更新（装完�
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -58,7 +59,13 @@ DOWNLOAD_TIMEOUT = 120
 # ★ 启动更新脚本后，等它自报一次 `phase="started"` 的上限（本机 PowerShell 不可用时会静默什么都不做）。
 PS_START_WAIT = 12.0
 CREATE_NO_WINDOW = 0x08000000
+# ⚠ 不要用它启动 powershell：实测（Windows 10.0.26200）用 DETACHED_PROCESS 起 PowerShell，
+#   进程 `rc=0` 但**脚本一行都不执行**（-File / -EncodedCommand 都一样，静默无声）。
+#   这正是「更新脚本 12 秒没有回报」的真凶，见 AGENTS.md 踩坑 #52。
 DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+# ★ 直接拉起安装器后，看它"还活着"要等多久（活着一律算"起来了"）。
+DIRECT_START_WAIT = 2.5
 
 _cache = {"t": 0.0, "data": None}
 
@@ -421,6 +428,63 @@ def _relaunch_command(app: str) -> list:
     return []
 
 
+def powershell_exe() -> str:
+    """PowerShell 的**绝对路径**优先（不靠 PATH；找不到才退回裸名字）。
+
+    ★ 2026-10-25（用户的另一台机器 `v0.1.66` 实测）：安装包**已经下载完**了，却卡在
+      「更新脚本没能启动（12 秒内没有回报）」—— 因为起脚本用的是裸 `"powershell"`，
+      那台机器的 PATH 不可靠 / `powershell.exe` 起不来（`0xc0000142` 这类系统层问题）。
+      先按 `%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe` 找绝对路径，
+      能救掉「PATH 被改坏」这一类；真起不来还有 `_launch_setup_direct()` 兜底。
+    """
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    for rel in (r"System32\WindowsPowerShell\v1.0\powershell.exe",
+                r"SysWOW64\WindowsPowerShell\v1.0\powershell.exe"):
+        p = os.path.join(root, rel)
+        if os.path.isfile(p):
+            return p
+    return "powershell"
+
+
+def _ps_encoded_args(script: str) -> list:
+    """把脚本塞进 `-EncodedCommand`（base64 / UTF-16LE），**不走 .ps1 文件**。
+
+    ★ 2026-10-25 现场证据（用户那台 `lenovo`）：PowerShell **本体是好的**
+      （`powershell.exe -NoProfile -Command "exit 0"` → `errorlevel=0`），
+      但更新脚本以 `-File apply.ps1` 方式起时**一声不响什么都不做**。
+      最常见的两种原因是「组策略把 ExecutionPolicy 钉成 AllSigned/RemoteSigned（`-ExecutionPolicy Bypass`
+      顶不过 GPO）」和「Defender ASR / 智能应用控制拦 `%TEMP%` 里的 .ps1」——
+      两者的共同点是：**只拦"脚本文件"，不拦 `-Command` / `-EncodedCommand`**。
+      所以主路径改成 EncodedCommand（脚本仅 ~2 KB，远低于 32K 命令行上限），
+      `apply.ps1` 仍然写一份到临时目录**只作排查用**。
+    """
+    b64 = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ["-NoProfile", "-NonInteractive", "-EncodedCommand", b64]
+
+
+def _launch_setup_direct(setup: str, log: str) -> tuple:
+    """**不经过 PowerShell**，直接以脱离进程的隐藏方式拉起安装器（同为静默装）。
+
+    判据：`DIRECT_START_WAIT` 秒后它还**活着**（`poll() is None`）= 起来了；
+    一启动就退出 = 被拦了（杀软 / 权限 / 文件坏了），返回退出码给人看。
+    """
+    args = [setup, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            "/CLOSEAPPLICATIONS", "/LOG=%s" % log]
+    # ⚠ 这里也**不用 DETACHED_PROCESS**（原因同上，见踩坑 #52）；安装器是 GUI 程序，
+    #   面板退出后它照样跑完（Windows 不会因为父进程退出就杀子进程）。
+    flags = ((CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+             if sys.platform == "win32" else 0)
+    try:
+        proc = subprocess.Popen(args, close_fds=True, creationflags=flags)
+    except Exception as exc:  # noqa: BLE001
+        return False, "直接启动安装器失败：%s" % exc
+    time.sleep(DIRECT_START_WAIT)
+    rc = proc.poll()
+    if rc is None:
+        return True, ""
+    return False, "安装器一启动就退出（exit code %s）" % rc
+
+
 def _build_apply_ps(app: str, setup: str, log: str, latest: str, cur: str, relaunch: list) -> str:
     """生成「静默安装 → **恢复用户数据** → 记录结果 → 重启面板」的 PowerShell 脚本。
 
@@ -558,18 +622,23 @@ def apply_update(app_dir: str = "") -> dict:
     # ⚠ 它不在 {app} 下，安装器的 KillOurProcesses 按路径杀不到它，所以能"活过"安装。
     write_status(app, phase="installing", ok=None, version=latest, fromVersion=cur, error="", backup=backup)
     relaunch = _relaunch_command(app)
+    ps_script = _build_apply_ps(app, setup, log, latest, cur, relaunch)
     ps = os.path.join(tmp, "apply.ps1")
     with open(ps, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(_build_apply_ps(app, setup, log, latest, cur, relaunch))
+        fh.write(ps_script)             # 只作排查用（真正执行走 -EncodedCommand）
 
+    ps_exe = powershell_exe()
+    ps_err = ""
     try:
         subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-WindowStyle", "Hidden", "-File", ps],
+            [ps_exe] + _ps_encoded_args(ps_script),
             close_fds=True,
-            creationflags=(CREATE_NO_WINDOW | DETACHED_PROCESS) if sys.platform == "win32" else 0)
+            # ★ 只给 CREATE_NO_WINDOW（隐藏窗口）+ 新进程组；**绝不能加 DETACHED_PROCESS**
+            #   —— 实测那样 PowerShell 会静默什么都不做（见 AGENTS.md 踩坑 #52）。
+            #   实测（Popen + 2s 延迟脚本）父进程退出后脚本照样跑完，所以不需要 DETACHED 保活。
+            creationflags=(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0)
     except Exception as exc:  # noqa: BLE001
-        return fail("启动更新程序失败：%s" % exc)
+        ps_err = "启动 PowerShell 失败：%s" % exc
 
     # ★ 等脚本**自报 started** —— 本机 PowerShell 起不来（0xc0000142 之类）时它会静默什么都不做，
     #   面板就会永远停在"更新中…（装完自动重启）"，用户只能得出"更新失败"。这里把它变成明确报错。
@@ -581,10 +650,23 @@ def apply_update(app_dir: str = "") -> dict:
             started = True
             break
         time.sleep(0.5)
-    if not started:
-        return fail("更新脚本没能启动（%.0f 秒内没有回报）——本机 PowerShell 可能不可用；"
-                    "可手动运行 %s" % (PS_START_WAIT, setup))
+    if started:
+        return {"ok": True, "message": "已开始静默更新，安装完成后面板会自动重启",
+                "latest": latest, "setup": setup, "size": size, "backup": backup,
+                "source": used_src, "via": "powershell", "willRestart": bool(relaunch)}
 
-    return {"ok": True, "message": "已开始静默更新，安装完成后面板会自动重启",
-            "latest": latest, "setup": setup, "size": size, "backup": backup,
-            "source": used_src, "willRestart": bool(relaunch)}
+    # ★ 兜底：PowerShell 起不来（PATH 坏 / 0xc0000142 / 被策略拦）也**不能让更新卡死** ——
+    #   安装包已经下好并校验过了，直接把它以脱离进程的方式拉起来（同为静默装）。
+    #   代价：没人帮我们记结果、也自动重启不了面板 → **装完要自己打开 cocraft**（文案里说清楚）。
+    ok_direct, direct_err = _launch_setup_direct(setup, log)
+    if ok_direct:
+        write_status(app, phase="installing", ok=None, version=latest, fromVersion=cur,
+                     error="", backup=backup, via="direct")
+        return {"ok": True,
+                "message": "这台机器的 PowerShell 起不来，已改为**直接启动安装程序**；"
+                           "面板会被关闭，装完请重新打开 cocraft（设置已备份，不会丢）",
+                "latest": latest, "setup": setup, "size": size, "backup": backup,
+                "source": used_src, "via": "direct", "willRestart": False}
+
+    return fail("更新没能启动：PowerShell %s；直接启动 %s。可手动运行 %s"
+                % (ps_err or "12 秒内没有回报（%s）" % ps_exe, direct_err, setup))

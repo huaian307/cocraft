@@ -96,7 +96,7 @@ def _flash_taskbar() -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--title", default="cocraft · 絵梨衣")
+    ap.add_argument("--title", default="cocraft")
     ap.add_argument("--width", type=int, default=1440)
     ap.add_argument("--height", type=int, default=900)
     ap.add_argument("--no-bye", action="store_true")

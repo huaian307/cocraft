@@ -28,7 +28,8 @@ THEME_STATE_FILE = os.path.join(STATE_DIR, "_theme.json")
 DEFAULT_CATALOG = os.environ.get("COCRAFT_THEME_CATALOG") or "huaian307/cocraft-themes"
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")     # 主题 id
-RESERVED = {"hiru", "yoru", "cocraft"}               # 内置占用
+RESERVED = {"hiru", "yoru", "cocraft", "chapel"}     # 内置占用
+
 MANIFEST = ".cocraft.json"
 
 MAX_BYTES = 20 * 1024 * 1024      # 单主题总大小
@@ -36,13 +37,18 @@ MAX_FILES = 300                   # 单主题文件数
 MAX_CSS_BYTES = 1024 * 1024       # 单个 CSS 上限
 MAX_IMG_BYTES = 6 * 1024 * 1024   # 远程预览图上限
 
-# 内置主题（真正实现在 frontend/style.css，这里只做清单）
-# ⚠ 夜主题已在 `ui 0.1.50` 删除（CSS 全没了）→ **清单里只留「昼」**。
-#   以前这里还挂着一个 `yoru`，于是「主题工坊」会列出一张点不出效果的死卡片（2026-10-16 修）。
+# 内置主题（真正实现在 frontend/style/*.css，这里只做清单）
+# ⚠ 夜主题已在 `ui 0.1.50` 删除（CSS 全没了）→ 清单里**不要再挂 `yoru`**（会变成点不出效果的死卡片）。
+# ★`0.2.47` 起默认主题 = `chapel`（圣烛教堂，暗色，官方原创）；`hiru`（和纸白昼）保留为可选。
 BUILTIN = [
-    {"id": "hiru", "name": "昼（内置）", "author": "cocraft", "version": "内置",
-     "description": "内置白昼主题", "mode": "light", "builtin": True},
+    {"id": "chapel", "name": "圣烛教堂（默认）", "author": "cocraft", "version": "内置",
+     "description": "官方原创暗色主题：暖黑石墙 + 米白文字 + 绣线金 + 烛焰橙金", "mode": "dark",
+     "builtin": True, "default": True},
+    {"id": "hiru", "name": "和纸白昼", "author": "cocraft", "version": "内置",
+     "description": "原来的浅色主题：和纸白 + 绯红 + 金线", "mode": "light", "builtin": True},
 ]
+
+DEFAULT_THEME = "chapel"
 
 _URL_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.I)
 
@@ -194,14 +200,16 @@ def _is_builtin(tid: str) -> bool:
 def read_active() -> str:
     """当前生效的主题 id。
 
-    ★**兜底**：内置主题被删（例如 `yoru` 在 `ui 0.1.50` 随夜主题一起没了）/ 主题被卸掉了 →
-    一律回落到「hiru」。否则老状态会让启动套一个**不存在的主题**（界面上看不出哪里坏了）。
+    ★**兜底**：内置主题被删 / 主题被卸掉了 → 一律回落到**默认主题**（`DEFAULT_THEME` = chapel）。
+    否则老状态会让启动套一个**不存在的主题**（界面上看不出哪里坏了）。
     """
     try:
         with open(THEME_STATE_FILE, "r", encoding="utf-8") as fh:
-            tid = str(json.load(fh).get("id") or "hiru")
+            tid = str(json.load(fh).get("id") or DEFAULT_THEME)
     except Exception:  # noqa: BLE001
-        return "hiru"
+        return DEFAULT_THEME
+    if tid == "yoru":                       # 夜主题已删：旧引用当默认主题
+        return DEFAULT_THEME
     if _is_builtin(tid):
         return tid
     try:
@@ -209,7 +217,7 @@ def read_active() -> str:
             return tid
     except Exception:  # noqa: BLE001
         pass
-    return "hiru"
+    return DEFAULT_THEME
 
 
 def write_active(tid: str) -> None:
@@ -262,10 +270,11 @@ def get_theme(tid: str, mode: str = "") -> dict:
     """完整主题负载（给前端套用）：vars/css/icons/background（按 mode 合并）。内置只回身份信息。"""
     tid = str(tid or "").strip()
     if tid == "yoru":
-        tid = "hiru"                     # ⚠ 夜主题已删：旧的引用一律当「昼」，别把启动搞挂
-    if tid == "hiru":
-        return {"ok": True, "id": "hiru", "mode": "light",
-                "modes": ["light"], "builtin": True}
+        tid = DEFAULT_THEME              # ⚠ 夜主题已删：旧的引用一律当默认主题，别把启动搞挂
+    for b in BUILTIN:                    # 内置主题的样式写在 CSS 里 → 只回身份信息
+        if b.get("id") == tid:
+            return {"ok": True, "id": tid, "mode": b.get("mode") or "dark",
+                    "modes": [b.get("mode") or "dark"], "builtin": True}
     if not valid_id(tid):
         raise ValueError("非法的主题 id：%s" % tid)
     folder = theme_dir(tid)
@@ -327,7 +336,7 @@ def uninstall(tid: str) -> dict:
         raise ValueError("主题未安装：%s" % tid)
     shutil.rmtree(folder)
     if read_active() == tid:
-        write_active("hiru")
+        write_active(DEFAULT_THEME)
     return {"ok": True, "removed": folder, "id": tid}
 
 

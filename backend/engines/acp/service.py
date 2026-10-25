@@ -19,6 +19,11 @@ import threading
 import time
 
 from .. import STATE_DIR
+try:
+    import audit                                 # ★审计链：面板里对 ACP 权限申请的答复
+except ImportError:                              # 以 `backend.engines.acp.service` 形式加载时（测试）
+    from backend import audit  # type: ignore  # noqa: F401,F811
+
 from .client import AcpClient, AcpClosed
 from .map_events import AssistantTurn, content_text, now_ms, pick_option_id, schema_to_fields
 from .skills import injection_text
@@ -31,6 +36,15 @@ CLIENT_CAPABILITIES = {"elicitation": {"form": {}},
                        "_meta": {"terminal_output_delta": True}}
 # Codex 在自定义 provider 下会把这段告警当正文/想法输出；弹窗"背景"里没必要带它
 _MODEL_WARN_RE = re.compile(r"^\s*Warning: Model metadata for `[^`]*` not found\.[^\n]*\n+", re.I)
+
+
+def _destructive_cmd(cmd) -> bool:
+    """这条命令算不算破坏性（审计里要标出来；不认识的当"不是"，别误标）。"""
+    try:
+        import cocraft_agents as _ca          # 延迟 import：避免与桥形成环
+        return bool(_ca._is_destructive(str(cmd or "")))
+    except Exception:  # noqa: BLE001
+        return False
 
 # ---------------- ★内部会话（群聊 AI 成员 / 本地协作）识别 ----------------
 # 这些会话是"面板自己"创建的（桥 / 编排 Runner），不是用户的项目会话；不应该混在「接续」列表里。
@@ -521,6 +535,7 @@ class AcpService:
         self._seen_kinds = set()   # 诊断：见过哪些 session/update 类型（第一次出现记一行到 acp.log）
         self._sessions_file = sessions_file or os.path.join(STATE_DIR, "_acp_sessions.json")
         self._prune_at = 0.0      # 上次跟 OpenCode 共享库对账的时间（别每次 list_sessions 都查库）
+        self._orphan_at = 0.0     # 上次清理「接续空壳」的时间
         self._load()               # 重启后把上次的会话/消息读回来
 
     # ---------------- 事件订阅 ----------------
@@ -650,6 +665,65 @@ class AcpService:
             self._save()
         # ★ 跟 OpenCode 共享库对一次账：**在 OpenCode 客户端里删掉的会话，别在 ACP 里继续留着**
         self._prune_deleted_at_source(force=True)
+
+    def _prune_orphan_imports(self, force: bool = False) -> bool:
+        """清掉「接续失败留下的空壳」：`imported` + 0 消息 + agent 名录里没有这条。
+
+        为什么需要：`0.2.59` 之前切引擎会把 OpenCode 的会话硬"接续"进 codex/dsh，
+        那些 agent 根本不认识那条 id → 本地留一条**同名空会话**（用户在列表里看到的就是它）。
+        安全阀：
+          * 只对**非 opencode** agent 做（opencode 走 `_prune_deleted_at_source`）；
+          * 只在真有"imported + 0 消息"的候选时才去拉名录（省一次 session/list）；
+          * 名录**拉不到 / 是空的** → 判断不了，什么都不删。
+        """
+        if self._is_opencode():
+            return False
+        now = now_ms() / 1000.0
+        if not force and now - self._orphan_at < _PRUNE_EVERY:
+            return False
+        with self._lock:
+            cands = [sid for sid in self._order
+                     if (self._sessions.get(sid) or {}).get("imported")
+                     and not ((self._sessions.get(sid) or {}).get("messages") or [])]
+        if not cands:
+            return False
+        self._orphan_at = now
+        try:
+            remote = self.list_remote(include_internal=True)
+            items = remote.get("sessions") or []
+        except Exception:  # noqa: BLE001
+            items = None
+        ids = {str(x.get("id")) for x in (items or []) if x.get("id")}
+        # ★ 第二个判据：这条会话其实是 **OpenCode 的**（在它的共享库里）→ 它不可能属于当前 agent。
+        #   有些 agent 的 session/list 是空的（dsh），光靠名录判断不了，但对 OpenCode 的 id 仍然能确定。
+        oc_ids = _opencode_session_ids()
+        drop = []
+        with self._lock:
+            for sid in cands:
+                s = self._sessions.get(sid) or {}
+                if not self._owns(s):
+                    continue
+                asid = str(s.get("agentSessionId") or "").strip()
+                if asid and ids and asid in ids:      # agent 名录里真有（只是历史没导进来）→ 留着
+                    continue
+                foreign = bool(asid and oc_ids and asid in oc_ids)   # 属于 OpenCode 的会话
+                if not foreign:
+                    # 名录拿不到 / 是空的，又证明不了是别人的 → 别乱删（安全阀）
+                    if not ids:
+                        continue
+                drop.append(sid)
+            for sid in drop:
+                self._sessions.pop(sid, None)
+                if sid in self._order:
+                    self._order.remove(sid)
+                self._bound.discard(sid)
+                for a, l in list(self._alias.items()):
+                    if l == sid:
+                        self._alias.pop(a, None)
+        if drop:
+            self._log("[acp] 清掉 %d 条接续失败留下的空会话" % len(drop))
+            self._save()
+        return bool(drop)
 
     def _prune_deleted_at_source(self, force: bool = False) -> bool:
         """把「OpenCode 里已经删掉」的本地会话清掉（只对 opencode-acp 有效）。
@@ -1174,10 +1248,13 @@ class AcpService:
                 s.setdefault("permissions", {})[pid] = perm
         self._log("[acp] 权限请求 %s：%s" % (pid, perm["action"]))
         self._emit({"type": "permission.updated", "data": {"sessionID": sid, "id": pid}})
+        t_ask = time.time()
         if waiter["event"].wait(ANSWER_TIMEOUT):
             decision = waiter["value"] or "reject"
+            answered = True
         else:
             decision = "reject"
+            answered = False
         with self._lock:
             self._waiters.pop(pid, None)
             if s is not None:
@@ -1185,6 +1262,25 @@ class AcpService:
         if decision == "always":
             # 记住：以后同类请求（同 agent + 同会话 + 同 kind，路径范围相同）直接放行
             self._remember_always(sid, kind, locations, title)
+        # ★审计链：**只记结论**（谁点了允许/拒绝、或是超时没人答）。
+        #   策略自动放行（等级 / 「始终允许」记忆）刻意不入链 —— 见 backend/audit.py 顶部「口径」。
+        try:
+            audit.append(
+                "panel",
+                actor={"kind": "agent", "id": str(self.agent_id or ""), "name": str(self.agent_id or ""),
+                       "engine": "acp"},
+                action={"kind": kind or "", "title": title or "",
+                        "command": str(cmd or ""), "targets": locations,
+                        "destructive": _destructive_cmd(cmd)},
+                decision=decision,
+                result=("ok" if decision in ("once", "always") else
+                        "denied" if answered else "timeout"),
+                approver=({"kind": "user", "id": "local", "name": "owner"} if answered else None),
+                ref={"session": sid, "perm": pid},
+                note=("等待 %.0fs" % (time.time() - t_ask))
+                     + ("" if answered else " · 无人批准"))
+        except Exception:  # noqa: BLE001 - 审计绝不能挡住权限应答
+            pass
         oid = pick_option_id(options, decision)
         if oid is None:                       # 没有可选项 / 没匹配上 → 只能按取消回
             return {"outcome": {"outcome": "cancelled"}}
@@ -1625,15 +1721,26 @@ class AcpService:
         title = str(title or "").strip()
         # ⚠ 无论有没有传 title，都要去 session/list 核对 cwd：
         #   resume 要求 cwd 与会话归属一致，用错 cwd 会吃 -32602，随后被静默新建（这是老 bug）。
+        listed = False
+        hit = None
         try:
             remote = self.list_remote(include_internal=True)
             hit = next((x for x in (remote.get("sessions") or []) if x.get("id") == rid), None)
+            listed = True
             if hit:
                 cwd = str(hit.get("cwd") or "")
                 if not title:
                     title = str(hit.get("title") or "")
         except Exception:  # noqa: BLE001
-            pass
+            listed = False
+        # ★ 名录里没有这条 → 属于「别的引擎/别的 agent 的会话」（典型：OpenCode 的会话切到 codex）：
+        #   **绝不能建本地空壳**，否则列表里会多一条同名空会话（用户报过）。
+        if listed and hit is None:
+            if not self._is_opencode():
+                raise ValueError("当前 agent 里没有这条会话：%s" % rid)
+            ids = _opencode_session_ids()
+            if ids is not None and rid not in ids:
+                raise ValueError("OpenCode 里也没有这条会话：%s" % rid)
         if not cwd and self._is_opencode():
             cwd = _opencode_session_dir(rid)          # 兜底：从共享库读它自己的目录
         cwd = cwd or self._cwd
@@ -1877,6 +1984,7 @@ class AcpService:
         # ★ 跟 OpenCode 共享库对账（节流）：在 OpenCode 客户端里删掉的会话，这里也会消失。
         #   读不到库时 `_prune_deleted_at_source()` 什么都不做（不误删）。
         self._prune_deleted_at_source()
+        self._prune_orphan_imports()
         with self._lock:
             return [self._public(self._sessions[i]) for i in reversed(self._order)
                     if i in self._sessions and self._owns(self._sessions[i])]

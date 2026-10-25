@@ -43,6 +43,7 @@ import netsafe
 import snapshots
 from engines import STATE_DIR
 from engines.acp import agents as acp_agents
+import audit
 from engines.acp.engine import acp_log
 from engines.acp.service import AcpService, BusyError, _load_ok_models
 
@@ -644,18 +645,66 @@ def _turn_scope(aid, chat) -> str:
     return "cc-%s-%s" % (chat, aid)
 
 
-def _snap_before_turn(aid, chat) -> str:
-    """★群聊派活：在 agent **动手之前**记一份快照（只记路径 + 哈希 → 不占磁盘）。"""
+def _snap_before_turn(aid, chat) -> dict:
+    """★群聊派活：在 agent **动手之前**记一份快照（只记路径 + 哈希 → 不占磁盘）。
+
+    返回 `{scope, ts}`（拿不到工作目录 / 快照失败 → `{}`），`ts` 之后用于
+    「这一轮到底改了什么」的归属（C3 时间线）；**不带内容** → 只能看、不能一键回滚。
+    """
     root = _ws_root(aid)
     if not root or not os.path.isdir(root):
-        return ""
+        return {}
     scope = _turn_scope(aid, chat)
     try:
-        snapshots.take_turn_snapshot(root, scope, label="群聊派活")
-        return scope
+        res = snapshots.take_turn_snapshot(root, scope, label="群聊派活")
+        return {"scope": scope, "ts": str((res or {}).get("ts") or "")}
     except Exception as exc:                     # noqa: BLE001 - 快照失败绝不能挡住回帖
         acp_log("[cocraft-agents] %s 轮快照失败：%r" % (aid, exc))
-        return ""
+        return {}
+
+
+def _record_turn_changes(aid, chat, snap) -> dict:
+    """★C3：这一轮 agent **到底改了什么**（文件级）→ 写进审计链（可回看 / 可导出）。
+
+    ⚠ 只记**文件名 + 增删改计数**，不存内容；轮快照是 `with_content=False`，
+       所以这里**不提供一键回滚**（要做回滚必须先开内容快照 —— 会占磁盘，另议）。
+    """
+    root = _ws_root(aid)
+    scope = str((snap or {}).get("scope") or "") if isinstance(snap, dict) else ""
+    if not root or not os.path.isdir(root) or not scope:
+        return {"files": 0}
+    try:
+        res = snapshots.changes_since_latest(root, scope)
+    except Exception as exc:                     # noqa: BLE001 - 统计失败不影响回帖
+        acp_log("[cocraft-agents] %s 轮改动统计失败：%r" % (aid, exc))
+        return {"files": 0}
+    if not res.get("ok") or not res.get("files"):
+        return res
+    added = [str(x.get("path") or "") for x in (res.get("added") or [])]
+    changed = [str(x.get("path") or "") for x in (res.get("changed") or [])]
+    deleted = [str(x.get("path") or "") for x in (res.get("deleted") or [])]
+    renamed = ["%s → %s" % (x.get("from") or "", x.get("to") or "")
+               for x in (res.get("renamed") or [])]
+    paths = [p for p in (added + changed + renamed + deleted) if p][:20]
+    a = find(aid) or {}
+    try:
+        audit.append(
+            "ccagent",
+            actor={"kind": "agent", "id": str(aid),
+                   "name": str(a.get("display") or a.get("name") or aid),
+                   "engine": str(a.get("engine") or "")},
+            action={"kind": "files", "title": "改了 %d 个文件" % int(res.get("files") or 0),
+                    "targets": paths, "destructive": False},
+            decision="auto", result="ok",
+            ref={"chat": "" if chat is None else str(chat), "aid": str(aid),
+                 "scope": scope, "ts": str((snap or {}).get("ts") or "")},
+            note="+%d ~%d -%d%s" % (len(added), len(changed), len(deleted),
+                                    (" ⇄%d" % len(renamed)) if renamed else ""))
+    except Exception as exc:                     # noqa: BLE001 - 审计失败不影响回帖
+        acp_log("[cocraft-agents] %s 改动入链失败：%r" % (aid, exc))
+    acp_log("[cocraft-agents] %s 本轮改动 %d 个文件（+%d ~%d -%d）"
+            % (aid, res.get("files"), len(added), len(changed), len(deleted)))
+    return res
 
 
 def changes(chat, aid) -> dict:
@@ -701,6 +750,7 @@ def _perm_log_add(aid, chat, entry) -> None:
         "verdict": str(entry.get("verdict") or ""),      # once / always / reject / auto
         "by": str(entry.get("by") or ""),                # owner / level / timeout / no-ctx / send
         "reply": str(entry.get("reply") or "")[:160],
+        "quarantine": str(entry.get("quarantine") or "")[:200],
     }
     try:
         with _PERM_LOG_LOCK:
@@ -720,6 +770,27 @@ def _perm_log_add(aid, chat, entry) -> None:
             os.replace(tmp, PERM_LOG_FILE)
     except Exception:  # noqa: BLE001
         pass                  # 审计落盘失败绝不能挡住权限流程本身
+    # ★审计链：同一条决定再进 append-only 哈希链（`_cc_perm_log.json` 是给人看的列表，
+    #   链是给"这份记录没被改过"作证的；导出/校验走 `backend/audit.py`）。
+    audit.append(
+        "ccagent",
+        actor={"kind": "agent", "id": rec["aid"], "name": rec["agent"],
+               "engine": str(a.get("engine") or "")},
+        action={"kind": rec["kind"], "title": rec["title"], "command": rec["cmd"],
+                "targets": rec["paths"], "destructive": rec["destructive"]},
+        decision=rec["verdict"],
+        result=("timeout" if rec["by"] == "timeout" else
+                "failed" if rec["by"] in ("no-ctx", "send") else
+                "ok" if rec["verdict"] in ("once", "always") else "denied"),
+        approver=({"kind": "user", "id": rec["owner"], "name": "owner"}
+                  if rec["by"] == "owner" else None),
+        ref={"chat": rec["chat"], "aid": rec["aid"]},
+        quarantine=rec["quarantine"],
+        note=("by=%s" % rec["by"]
+              + ("" if not rec["destructive"] else
+                 " · 隔离 %d 项 / 未保住 %d 项" % (int(entry.get("qitems") or 0),
+                                                  int(entry.get("qmissed") or 0)))),
+        ts=rec["ts"])
 
 
 def perm_log(limit: int = 80) -> list:
@@ -835,13 +906,20 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
                                                   else "✅ 已允许：") + title)
                         if destructive:
                             # ★ 可逆执行：**放行前**先隔离（不信 OS 回收站）
-                            _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root)
+                            _q = _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root)
+                            _qid = str((_q or {}).get("id") or "")
+                            _qitems = int((_q or {}).get("items") or 0)
+                            _qmissed = int((_q or {}).get("missed") or 0)
+                        else:
+                            _qid, _qitems, _qmissed = "", 0, 0
                         _act_finish(chat, _ptcid, "allowed", detail="拥有者回复：%s" % c[:120])
                         _perm_log_add(aid, chat, {"kind": kind, "title": title, "cmd": cmd,
                                                   "locations": locations,
                                                   "destructive": destructive,
                                                   "owner": owner, "verdict": v,
-                                                  "by": "owner", "reply": c})
+                                                  "by": "owner", "reply": c,
+                                                  "quarantine": _qid,
+                                                  "qitems": _qitems, "qmissed": _qmissed})
                         return v
                     if _DENY.search(c):
                         _seen_push(fr.get("id"))
@@ -1670,8 +1748,9 @@ def _handle_event(aid, frame) -> None:
     plain_prompt = base_prompt + (("\n\n（群里有 %d 个文件（%s），但这轮没读进来 —— 只能按文件名回答。）"
                                   % (len(files), "、".join(f.get("name") or "?" for f in files))) if files else "")
     prompt = base_prompt + attach_note
+    snap = {}
     try:
-        _snap_before_turn(aid, chat)          # ★派活前记一份（之后能并排看"谁改了哪些文件"）
+        snap = _snap_before_turn(aid, chat)   # ★派活前记一份（之后能并排看"谁改了哪些文件"）
         reply = _ask(aid, prompt, files=files, chat=chat)
         if files and not str(reply or "").strip():
             # ★ 有些“大脑/模型”不吃图片：带附件那一轮会**空回复**（实测 text_parts=0）。
@@ -1688,6 +1767,11 @@ def _handle_event(aid, frame) -> None:
     except Exception as e:  # noqa: BLE001
         acp_log("[cocraft-agents] %s 生成失败：%r" % (aid, e))
         reply = ""
+    # ★C3：这一轮**到底改了什么**（文件级）→ 写进审计链；没出正文也照记（改了的文件是真的）
+    try:
+        _record_turn_changes(aid, chat, snap)
+    except Exception as e:  # noqa: BLE001
+        acp_log("[cocraft-agents] %s 轮改动记录异常：%r" % (aid, e))
     if not reply:
         acp_log("[cocraft-agents] %s no reply (%.1fs)" % (aid, time.time() - t_msg))
         return

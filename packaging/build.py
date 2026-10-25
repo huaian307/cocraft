@@ -52,7 +52,12 @@ PY_URL = f"https://www.python.org/ftp/python/{PY_VER}/python-{PY_VER}-embed-amd6
 CORE = ("backend", "frontend", "tools", "launchers", "scripts", "docs")
 CORE_FILES = ("AGENTS.md", "README.md")
 # 核心里的排除项：只去掉参考图画廊页（assets 里的主题素材**必须保留**）
-CORE_SKIP_FILES = ("refs.html", "refs_q.html")
+CORE_SKIP_FILES = (
+    "refs.html", "refs_q.html",              # 开发用的参考图画廊页
+    # ★同人图不再随包（`0.2.54`）：默认头像=官方图标、空会话主图=内联圣徽、贴纸默认不显示
+    "assets/badge.jpg", "assets/hero.jpg", "assets/avatar.png",
+    "assets/sticker-duck.jpg", "assets/sticker-couple.jpg", "assets/night.jpg",
+)
 
 # 可选组件的 site-packages 来源（本机是 venv）。
 # ⚠ 2026-10-12 起安装包**不再随包 music / audio**；**2026-10-14 起 music 又加回来且是必选组件**

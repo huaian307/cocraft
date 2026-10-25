@@ -23,6 +23,11 @@ import urllib.request
 
 import netsafe                                   # ★ 连本机服务要走 local_urlopen（绕过系统代理）
 
+try:
+    import audit                                 # ★审计链：面板权限答复在反代里截
+except ImportError:                              # 以 `backend.engines.opencode` 形式加载时（测试）
+    from backend import audit  # type: ignore  # noqa: F401,F811
+
 from .base import Engine, EngineError, HOP_BY_HOP
 
 _NO_WINDOW = 0x08000000
@@ -249,6 +254,13 @@ class OpenCodeEngine(Engine):
 
         length = int(handler.headers.get("Content-Length") or 0)
         body = handler.rfile.read(length) if length else None
+
+        # ★审计链：面板里点「允许 / 始终允许 / 拒绝」→ 记一条（谁批准的、哪条申请）
+        #   放在**转发之前**：即使上游回错，这次"人的决定"也已经有留痕。
+        try:
+            audit.note_permission_reply(handler.path, method, body, agent_id=self.id)
+        except Exception:  # noqa: BLE001 - 审计绝不能挡住反代
+            pass
 
         headers = {}
         for key, value in handler.headers.items():
