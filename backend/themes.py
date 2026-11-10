@@ -28,7 +28,7 @@ THEME_STATE_FILE = os.path.join(STATE_DIR, "_theme.json")
 DEFAULT_CATALOG = os.environ.get("COCRAFT_THEME_CATALOG") or "huaian307/cocraft-themes"
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")     # 主题 id
-RESERVED = {"hiru", "yoru", "cocraft", "chapel"}     # 内置占用
+RESERVED = {"cocraft", "chapel", "hiru", "yoru"}     # 内置占用（hiru/yoru 已删，仍占位防止老主题撞名）
 
 MANIFEST = ".cocraft.json"
 
@@ -38,14 +38,12 @@ MAX_CSS_BYTES = 1024 * 1024       # 单个 CSS 上限
 MAX_IMG_BYTES = 6 * 1024 * 1024   # 远程预览图上限
 
 # 内置主题（真正实现在 frontend/style/*.css，这里只做清单）
-# ⚠ 夜主题已在 `ui 0.1.50` 删除（CSS 全没了）→ 清单里**不要再挂 `yoru`**（会变成点不出效果的死卡片）。
-# ★`0.2.47` 起默认主题 = `chapel`（圣烛教堂，暗色，官方原创）；`hiru`（和纸白昼）保留为可选。
+# ⚠ 夜主题已在 `ui 0.1.50` 删除；`hiru`（和纸白昼）在 `ui 0.2.123` 也删了 ——
+#   清单里**只剩 `chapel`**，别再挂已删的 id（会变成点不出效果的死卡片）。
 BUILTIN = [
     {"id": "chapel", "name": "圣烛教堂（默认）", "author": "cocraft", "version": "内置",
      "description": "官方原创暗色主题：暖黑石墙 + 米白文字 + 绣线金 + 烛焰橙金", "mode": "dark",
      "builtin": True, "default": True},
-    {"id": "hiru", "name": "和纸白昼", "author": "cocraft", "version": "内置",
-     "description": "原来的浅色主题：和纸白 + 绯红 + 金线", "mode": "light", "builtin": True},
 ]
 
 DEFAULT_THEME = "chapel"

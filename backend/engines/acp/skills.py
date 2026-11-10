@@ -18,9 +18,15 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import time
+import urllib.request
 
 # 一个技能根目录最多往下找几层（防极端目录把这里拖慢）
 _MAX_DEPTH = 6
+
+# 内置技能缓存（问 OpenCode 服务要；5 分钟）
+_BUILTIN_CACHE = {"at": 0.0, "items": []}
 
 # frontmatter 里的 `metadata.opencode/autoinvoke: false` 或 `disable-model-invocation: true`
 _AUTO_OFF = re.compile(r"(opencode/autoinvoke\s*:\s*false|disable-model-invocation\s*:\s*true)", re.I)
@@ -135,6 +141,50 @@ def _iter_root(root: str):
             yield os.path.join(dirpath, "SKILL.md"), sid
 
 
+def opencode_builtin_skills(timeout: float = 2.0) -> list:
+    """从**本机 OpenCode 服务**取内置技能（`path` 以 `/builtin` 开头），5 分钟缓存。
+
+    为什么要问上游：内置技能（`opencode` / `report` …）**不在磁盘上**（编译进 OpenCode），
+    而 ACP 协议没有技能 → 只能借 OpenCode 的 `/api/skill`。
+    服务没在跑 / 鉴权失败 / 超时 → 回 `[]`，**不影响磁盘技能**。
+    """
+    now = time.time()
+    if _BUILTIN_CACHE["at"] and now - _BUILTIN_CACHE["at"] < 300:
+        return list(_BUILTIN_CACHE["items"])
+    items = []
+    try:
+        from engines.opencode import read_service      # 延迟 import：避免与引擎层成环
+        from netsafe import local_urlopen             # 连本机端口必须绕开系统代理
+        url, auth, _ver = read_service()
+        req = urllib.request.Request(url + "/api/skill",
+                                     headers={"Accept": "application/json"})
+        if auth:
+            req.add_header("Authorization", auth)
+        with local_urlopen(req, timeout=timeout) as resp:
+            obj = json.loads(resp.read().decode("utf-8", "replace"))
+        for it in (obj.get("data") or []):
+            if not isinstance(it, dict):
+                continue
+            if not str(it.get("path") or "").startswith("/builtin"):
+                continue
+            sid = str(it.get("id") or "").strip()
+            if not sid:
+                continue
+            items.append({
+                "id": sid,
+                "name": it.get("name") or sid,
+                "description": it.get("description") or "",
+                "autoinvoke": it.get("autoinvoke", True) is not False,
+                "source": "builtin",
+                "path": str(it.get("path") or ""),
+                "content": it.get("content") or "",
+            })
+    except Exception:  # noqa: BLE001
+        items = []
+    _BUILTIN_CACHE.update({"at": now, "items": items})
+    return list(items)
+
+
 def discover(cwd: str = None) -> list:
     """发现所有技能。回 `[{id,name,description,autoinvoke,source,path,content}]`（同名 id 后者胜）。"""
     out, order = {}, []
@@ -162,6 +212,14 @@ def discover(cwd: str = None) -> list:
 
     homes = _home_dirs()
     anc = _ancestors(cwd)
+    # ★内置技能（OpenCode 编译进程序里、不在磁盘）→ 最低优先级：磁盘上有同名就覆盖它
+    for it in opencode_builtin_skills():
+        sid = str(it.get("id") or "")
+        if not sid:
+            continue
+        if sid not in out:
+            order.append(sid)
+        out[sid] = it
     # 低 → 高（后面的覆盖前面的）
     for h in homes:
         add(os.path.join(h, ".claude", "skills"), "~/.claude")

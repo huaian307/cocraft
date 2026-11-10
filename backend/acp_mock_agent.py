@@ -113,6 +113,9 @@ while True:
         res.update(session_config())
         respond(rid, res)
     elif method in ("session/resume", "session/load"):
+        _p = msg.get("params") or {}
+        if _p.get("sessionId"):
+            STATE["sid"] = str(_p.get("sessionId"))
         res = session_config()
         if method == "session/resume":
             res["resumed"] = True

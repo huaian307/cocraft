@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -29,6 +30,7 @@ except ImportError:                              # 以 `backend.engines.opencode
     from backend import audit  # type: ignore  # noqa: F401,F811
 
 from .base import Engine, EngineError, HOP_BY_HOP
+from . import base as _base
 
 _NO_WINDOW = 0x08000000
 
@@ -249,6 +251,145 @@ class OpenCodeEngine(Engine):
         except Exception as exc:  # noqa: BLE001
             return 503, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    def _quarantine_on_allow(self, path: str, method: str, body) -> str:
+        """★先隔离再放行（单聊 · OpenCode 反代 · `ui 0.2.85`）。
+
+        面板里点「允许 / 始终允许」时，从**上游**取这条申请的原文（命令 + 涉及路径），
+        把**破坏性**目标复制进 `runtime/quarantine/panel-<会话>/` → 之后「工具 → 忏悔室」
+        能一键恢复。返回隔离记录 id（没做 / 失败 → `""`），**绝不挡放行**。
+        """
+        m = re.match(r"^/api/session/([^/]+)/permission/([^/]+)/reply", str(path or ""))
+        if not m or str(method or "").upper() not in ("POST", "PUT"):
+            return ""
+        try:
+            data = json.loads((body or b"{}").decode("utf-8") or "{}")
+        except Exception:  # noqa: BLE001
+            data = {}
+        decision = str((data or {}).get("decision") or (data or {}).get("reply") or "").lower()
+        if decision not in ("once", "always"):
+            return ""
+        sid, pid = m.group(1), urllib.parse.unquote(m.group(2))
+        try:
+            code, obj = _upstream_json("GET", "/api/session/%s/permission" % sid)
+        except Exception:  # noqa: BLE001
+            return ""
+        if code != 200:
+            return ""
+        items = (obj or {}).get("data") if isinstance(obj, dict) else None
+        item = next((x for x in (items or [])
+                     if isinstance(x, dict) and str(x.get("id")) == pid), None)
+        if not item:
+            return ""                        # 已经结算 / 取不到原文 → 什么都不做
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        cmd = str(meta.get("command") or item.get("command") or "")
+        title = str(item.get("action") or item.get("title") or item.get("message") or "")
+        kind = str(item.get("kind") or meta.get("kind") or "")
+        locs = [str(x) for x in (item.get("resources") or [])]
+        # 权限原文里偶尔把路径放在 metadata 的若干字段里；补进去，编辑类才能准确保存旧版。
+        for _k in ("file_path", "filePath", "path", "file", "target"):
+            _v = meta.get(_k)
+            if isinstance(_v, str) and _v.strip() and _v not in locs:
+                locs.append(_v)
+        root = ""
+        try:
+            code2, sess = _upstream_json("GET", "/api/session/%s" % sid)
+            if code2 == 200 and isinstance(sess, dict):
+                root = str((sess.get("location") or {}).get("directory") or "")
+        except Exception:  # noqa: BLE001
+            root = ""
+        qid = _base.capture_before_allow(root, cmd, title, locs,
+                                         scope="panel-%s" % str(sid)[:20],
+                                         note=title, kind=kind)
+        if qid:
+            print("[opencode] 忏悔室留存旧版（%s）→ %s" % (pid, qid))
+        return qid
+
+    def auto_ticket(self, sid: str, pid: str) -> dict:
+        """★低风险删除：**先隔离，再自动放行**（OpenCode 反代 · `ui 0.2.95`）。
+
+        前端轮询到权限申请后调用（ACP 那条在 `_ask_permission` 里后端直接处理）。
+        只有「删除类命令 + 目标全是 ★ + 隔离没跳过任何一项」才替用户回 `once`；
+        任何不确定都回 `auto=False`，前端照旧弹窗。
+
+        ⚠ 这条**不是**放宽破坏性操作：`shutdown` / `taskkill` / `format` / `reg delete`
+          会被 `file_rank.triage` 直接挡掉（没有可恢复的"原件"）。
+        """
+        try:
+            import file_rank                                # noqa: PLC0415
+            import snapshots                                # noqa: PLC0415
+
+            code, obj = _upstream_json("GET", "/api/session/%s/permission" % sid)
+            if code != 200:
+                return {"ok": True, "auto": False, "reason": "取不到待批权限（HTTP %s）" % code}
+            items = (obj or {}).get("data") if isinstance(obj, dict) else None
+            item = next((x for x in (items or []) if isinstance(x, dict)
+                         and str(x.get("id")) == str(pid)), None)
+            if not item:
+                return {"ok": True, "auto": False, "reason": "这条申请已结算或找不到原文"}
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            cmd = str(meta.get("command") or item.get("command") or "")
+            if not cmd:
+                for k, v in (meta or {}).items():
+                    if "command" in str(k).lower() and isinstance(v, str):
+                        cmd = v
+                        break
+            title = str(item.get("action") or item.get("title") or item.get("message") or "")
+            if not cmd:
+                return {"ok": True, "auto": False, "reason": "这条申请没带命令原文（不盲签）"}
+
+            cfg = snapshots.quarantine_config()
+            if not cfg.get("enabled"):
+                return {"ok": True, "auto": False, "reason": "低风险删除自动隔离未开启"}
+
+            root = ""
+            try:
+                code2, sess = _upstream_json("GET", "/api/session/%s" % sid)
+                if code2 == 200 and isinstance(sess, dict):
+                    root = str((sess.get("location") or {}).get("directory") or "")
+            except Exception:                               # noqa: BLE001
+                root = ""
+            tr = file_rank.triage(root, cmd, max_star=int(cfg.get("maxStar") or 1))
+            if not tr.get("ok"):
+                return {"ok": True, "auto": False, "reason": tr.get("reason") or "不够低风险"}
+
+            rec = snapshots.quarantine_paths(
+                root, tr.get("targets") or [], scope="panel-%s" % str(sid)[:20],
+                note=(title or "低风险删除"), cmd=cmd, auto=True,
+                scores=tr.get("items"), kind="delete")
+            if not rec or (rec.get("skipped") or []):
+                return {"ok": True, "auto": False,
+                        "reason": "隔离没保住全部目标（不自动放行）"}
+
+            code3, _ = _upstream_json(
+                "POST", "/api/session/%s/permission/%s/reply"
+                % (sid, urllib.parse.quote(str(pid))), {"decision": "once"})
+            if code3 not in (200, 201, 204):
+                return {"ok": True, "auto": False,
+                        "reason": "上游拒绝自动应答（HTTP %s）" % code3}
+            try:
+                audit.append(
+                    "permission",
+                    actor={"kind": "system", "name": "file_rank", "engine": "opencode"},
+                    action={"kind": "delete", "title": title or "低风险删除",
+                            "command": cmd, "targets": tr.get("targets") or [],
+                            "destructive": True},
+                    decision="allow", result="ok",
+                    ref={"session": sid, "perm": pid, "scope": str(rec.get("id") or "")},
+                    quarantine=str(rec.get("id") or ""),
+                    note="低风险删除自动隔离放行 · ★≤%s · %d 项%s"
+                         % (cfg.get("maxStar"), len(rec.get("items") or []),
+                            " · 仅清单（超 64MB 未复制）" if rec.get("tombstone") else ""),
+                    via="system")
+            except Exception:                               # noqa: BLE001
+                pass
+            print("[opencode] 低风险删除自动隔离放行（%s）→ %s" % (pid, rec.get("id")))
+            return {"ok": True, "auto": True, "reason": tr.get("reason"),
+                    "id": rec.get("id"), "count": len(rec.get("items") or []),
+                    "stars": tr.get("max_star"), "tombstone": bool(rec.get("tombstone"))}
+        except Exception as exc:                            # noqa: BLE001
+            return {"ok": True, "auto": False,
+                    "reason": "低风险删除检查失败：%s: %s" % (type(exc).__name__, exc)}
+
     def handle_api(self, handler, method: str) -> None:
         url, auth, _ = read_service()
 
@@ -260,6 +401,13 @@ class OpenCodeEngine(Engine):
         try:
             audit.note_permission_reply(handler.path, method, body, agent_id=self.id)
         except Exception:  # noqa: BLE001 - 审计绝不能挡住反代
+            pass
+
+        # ★先隔离再放行（单聊 · `ui 0.2.85`）：点「允许」时先把这条**破坏性**命令
+        #   要动的目标复制进忏悔室 → 「工具 → 忏悔室」能一键恢复。
+        try:
+            self._quarantine_on_allow(handler.path, method, body)
+        except Exception:  # noqa: BLE001 - 安全网不该变成新的故障点
             pass
 
         headers = {}

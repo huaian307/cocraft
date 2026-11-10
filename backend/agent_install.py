@@ -57,7 +57,8 @@ _PKG_RE = re.compile(r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$", re.I)
 _LOCK = threading.RLock()
 _JOB = {"running": False, "id": "", "phase": "", "log": [], "error": "",
         "started": 0.0, "finished": 0.0, "ok": False, "command": [], "agent": "",
-        "kind": "install", "version": "", "toVersion": ""}
+        "kind": "install", "version": "", "toVersion": "", "backup": "",
+        "percent": None, "packages": 0, "detail": ""}
 
 # 「最新版」检查结果（内存缓存；catalog() / entry_for() 会读它，前端就能直接显示"有新版"）
 _VER = {"ts": 0.0, "items": []}
@@ -65,15 +66,42 @@ _VER = {"ts": 0.0, "items": []}
 
 # ---------------------------------------------------------------- 小工具
 
+def _node_candidates() -> list:
+    """按优先级列出本机可用的 node.exe（去重；只返回存在的）。"""
+    out = []
+    try:
+        out.append(agents._glob_node_exe())
+    except Exception:                           # noqa: BLE001
+        pass
+    import shutil as _sh
+    out.append(_sh.which("node") or "")
+    out.append(os.path.join(os.environ.get("ProgramFiles", ""), "nodejs", "node.exe"))
+    out.append(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "nodejs", "node.exe"))
+    seen, res = set(), []
+    for p in out:
+        if not p or not os.path.isfile(p):
+            continue
+        k = os.path.normcase(os.path.realpath(p))
+        if k not in seen:
+            seen.add(k)
+            res.append(p)
+    return res
+
+
 def node_and_npm() -> tuple:
-    """(node.exe, npm-cli.js)。npm 就在 node 同级的 `node_modules/npm/bin/` 里（随包 node 自带）。"""
-    node = agents._glob_node_exe()
-    if not node:
-        return "", ""
-    npm = os.path.join(os.path.dirname(node), "node_modules", "npm", "bin", "npm-cli.js")
-    if not os.path.isfile(npm):
-        npm = ""
-    return node, npm
+    """(node.exe, npm-cli.js)。npm 在同级 `node_modules/npm/bin/`。
+
+    ★优先随包 node；如果它没带 npm（老安装包 / 裁剪过的 node），
+      继续找系统 node，而不是直接判"缺 Node"。
+    """
+    first = ""
+    for node in _node_candidates():
+        if not first:
+            first = node
+        npm = os.path.join(os.path.dirname(node), "node_modules", "npm", "bin", "npm-cli.js")
+        if os.path.isfile(npm):
+            return node, npm
+    return first, ""
 
 
 def _job_log(line: str) -> None:
@@ -95,7 +123,10 @@ def status() -> dict:
     with _LOCK:
         out = dict(_JOB)
         out["log"] = list(_JOB["log"])
-    out["busy"] = bool(out.pop("running", False))
+    busy = bool(out.pop("running", False))
+    out["busy"] = busy
+    t0 = float(out.get("started") or 0)
+    out["elapsed"] = round(max(0.0, time.time() - t0), 1) if busy and t0 else 0.0
     return out
 
 
@@ -220,6 +251,15 @@ def entry_for(spec: dict, _cache: bool = True) -> dict:
            "latest": "", "hasUpdate": False,
            "ready": bool(node and npm), "reason": "" if (node and npm)
            else "这台机器没有 Node（随包 node 或系统 node）——先装带 node 的安装包"}
+    bak = _latest_backup(dest) if os.path.isdir(dest) else ""
+    out["hasBackup"] = bool(bak)
+    out["backup"] = os.path.basename(bak) if bak else ""
+    bver = ""
+    pkg0 = str(spec.get("pkg") or "")
+    if bak and pkg0:
+        bver = str(_read_json(os.path.join(bak, "node_modules", *pkg0.split("/"),
+                                           "package.json")).get("version") or "")
+    out["backupVersion"] = bver
     if _cache:
         with _LOCK:
             c = next((x for x in _VER["items"] if str(x.get("id")) == aid), None)
@@ -233,13 +273,40 @@ def catalog() -> list:
     return [entry_for(s) for s in _specs()]
 
 
-def versions(force: bool = False) -> dict:
+def bundled() -> list:
+    """随安装包自带的 agent（只读；要独立更新就装同名的 npm 版）。"""
+    items = [
+        ("bundled-codex", "自带 Codex", "codex-acp",
+         os.path.join(agents.ROOT_DIR, "agents", "codex", "node_modules",
+                      "@agentclientprotocol", "codex-acp", "package.json")),
+        ("bundled-claude", "自带 Claude 适配器", "claude-code-acp",
+         os.path.join(agents.ROOT_DIR, "agents", "claude", "node_modules",
+                      "@zed-industries", "claude-code-acp", "package.json")),
+        ("bundled-opencode", "自带 OpenCode", "opencode-ai",
+         os.path.join(agents.ROOT_DIR, "agents", "opencode", "node_modules",
+                      "opencode-ai", "package.json")),
+    ]
+    out = []
+    for bid, label, managed, pj in items:
+        ver = str(_read_json(pj).get("version") or "")
+        out.append({"id": bid, "label": label, "managed": managed,
+                    "version": ver, "installed": bool(ver),
+                    "channel": "bundled",
+                    "note": "随 cocraft 安装包更新（可复现）" if ver else "安装包里没有这一个"})
+    return out
+
+
+def versions(force: bool = False, cached_only: bool = False) -> dict:
     """检查「装了的有没有新版」（**网络**；结果缓存 VER_TTL）。
 
     只对**已装**的项去问 registry（没装的没必要占带宽），每个包**并行**问，
     整体最多等 ~12s（两个源各自超时 6s）。任何一项失败只记空，不影响别的。
+    `cached_only=True` = 只回缓存，**绝不联网**（启动横幅用）。
     """
     now = time.time()
+    if cached_only and not force:
+        with _LOCK:
+            return {"items": [dict(x) for x in _VER["items"]], "cached": True, "ts": _VER["ts"]}
     with _LOCK:
         if not force and _VER["items"] and (now - _VER["ts"]) < VER_TTL:
             return {"items": [dict(x) for x in _VER["items"]], "cached": True, "ts": _VER["ts"]}
@@ -273,10 +340,183 @@ def _forget_versions() -> None:
         _VER["ts"] = 0.0
 
 
+STATE_DIR = os.path.join(agents.ROOT_DIR, "runtime", "state")
+AUTO_FILE = os.path.join(STATE_DIR, "_agent_auto.json")
+AUTO_DEFAULT = {"check": True, "autoInstall": False, "channel": "patch", "ids": []}
+
+
+def auto_config() -> dict:
+    cfg = dict(AUTO_DEFAULT)
+    try:
+        with open(AUTO_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            cfg["check"] = bool(d.get("check", True))
+            cfg["autoInstall"] = bool(d.get("autoInstall", False))
+            cfg["channel"] = "patch" if str(d.get("channel") or "patch") != "all" else "all"
+            ids = d.get("ids")
+            cfg["ids"] = [str(x) for x in ids] if isinstance(ids, list) else []
+    except Exception:                       # noqa: BLE001
+        pass
+    return cfg
+
+
+def set_auto_config(**kw) -> dict:
+    cfg = auto_config()
+    for k, v in (kw or {}).items():
+        if k in ("check", "autoInstall") and isinstance(v, bool):
+            cfg[k] = v
+        elif k == "channel" and str(v) in ("patch", "all"):
+            cfg[k] = str(v)
+        elif k == "ids" and isinstance(v, list):
+            cfg[k] = [str(x) for x in v]
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = AUTO_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, AUTO_FILE)
+    except Exception:                       # noqa: BLE001
+        pass
+    return cfg
+
+
+def _engine_idle() -> bool:
+    """ACP 当前没有正在跑的轮次（自动更新只在空闲时做）。"""
+    try:
+        from engines import existing_engine
+        eng = existing_engine("acp")
+        if eng is None:
+            return True
+        fn = getattr(eng, "has_active_turns", None)
+        if callable(fn):
+            return not bool(fn())
+        return not bool(getattr(eng, "service_running", lambda: False)())
+    except Exception:                       # noqa: BLE001
+        return False
+
+
+def _is_patch(cur: str, latest: str) -> bool:
+    a, b = _vkey(cur), _vkey(latest)
+    if not a or not b:
+        return False
+    return a[0][:2] == b[0][:2] and b > a
+
+
+def updates_summary(force: bool = False, cached_only: bool = False) -> dict:
+    """给面板/后台用：哪些 agent 有新版 + Node 状态 + 自动更新配置。"""
+    data = versions(force=force, cached_only=cached_only)
+    items = [it for it in (data.get("items") or []) if it.get("hasUpdate")]
+    node = None
+    try:
+        import node_update
+        if cached_only:
+            cur = node_update.current()
+            latest = str(node_update._CACHE.get("latest") or "")
+            has = bool(latest and cur.get("version")
+                       and node_update._ver(latest) > node_update._ver(cur.get("version")))
+            node = {"current": cur.get("version") or "", "latest": latest, "hasUpdate": has}
+        else:
+            node = node_update.check(force=False)
+    except Exception:                       # noqa: BLE001
+        node = None
+    return {"items": items, "all": data.get("items") or [],
+            "cached": bool(data.get("cached")), "ts": data.get("ts") or 0,
+            "auto": auto_config(), "idle": _engine_idle(), "node": node}
+
+
+def auto_tick() -> dict:
+    """后台自动检查；开了 autoInstall 且空闲时，一次只更新一个（避免并发 npm）。"""
+    cfg = auto_config()
+    if not cfg.get("check"):
+        return {"ok": True, "checked": False, "reason": "后台检查关闭"}
+    summ = updates_summary(force=False)
+    pending = summ.get("items") or []
+    started = ""
+    if pending and cfg.get("autoInstall") and summ.get("idle"):
+        allow = set(cfg.get("ids") or [])
+        for it in pending:
+            aid = str(it.get("id") or "")
+            if allow and aid not in allow:
+                continue
+            if cfg.get("channel") == "patch" and not _is_patch(it.get("version"), it.get("latest")):
+                continue
+            try:
+                update(aid)
+                started = aid
+                break
+            except Exception:               # noqa: BLE001
+                continue
+    return {"ok": True, "checked": True, "pending": len(pending),
+            "started": started, "idle": bool(summ.get("idle")),
+            "items": [{"id": it.get("id"), "version": it.get("version"),
+                       "latest": it.get("latest")} for it in pending]}
+
+
 def _dest(aid: str) -> str:
     if not re.match(r"^[a-z0-9][a-z0-9._-]{1,40}$", str(aid or ""), re.I):
         raise ValueError("非法的安装 id：%s" % aid)
     return os.path.join(INSTALL_ROOT, aid)
+
+
+def _backup_dest(dest: str) -> str:
+    """更新前把旧目录**改名**备份（同盘 rename，几乎零成本）。保留最近 1 份。"""
+    if not os.path.isdir(dest):
+        return ""
+    parent, name = os.path.dirname(dest), os.path.basename(dest)
+    bak = os.path.join(parent, "%s.bak-%s" % (name, time.strftime("%Y%m%d-%H%M%S", time.localtime())))
+    os.rename(dest, bak)
+    try:
+        olds = sorted([d for d in os.listdir(parent)
+                       if d.startswith(name + ".bak-") and os.path.isdir(os.path.join(parent, d))],
+                      reverse=True)
+        for old in olds[1:]:
+            shutil.rmtree(os.path.join(parent, old), ignore_errors=True)
+    except OSError:
+        pass
+    return bak
+
+
+def _latest_backup(dest: str) -> str:
+    parent, name = os.path.dirname(dest), os.path.basename(dest)
+    try:
+        olds = sorted([d for d in os.listdir(parent)
+                       if d.startswith(name + ".bak-") and os.path.isdir(os.path.join(parent, d))],
+                      reverse=True)
+    except OSError:
+        return ""
+    return os.path.join(parent, olds[0]) if olds else ""
+
+
+def _restore_backup(dest: str, backup: str = "") -> str:
+    """把备份放回 dest（当前 dest 若存在先删）。返回用到的备份路径。"""
+    bak = backup or _latest_backup(dest)
+    if not bak or not os.path.isdir(bak):
+        return ""
+    if os.path.isdir(dest):
+        try:
+            _kill_under(dest)
+        except Exception:                       # noqa: BLE001
+            pass
+        shutil.rmtree(dest, ignore_errors=True)
+    try:
+        os.rename(bak, dest)
+    except OSError:
+        return ""
+    return dest
+
+
+def _reregister(dest: str, spec: dict, node: str) -> dict:
+    """恢复/回滚后，按目录里的 package.json 重新写出注册命令。"""
+    pkg = str(spec.get("pkg") or "") or _pkg_of_dest(dest)
+    cmd = _entry_for_dest(dest, pkg, node)
+    if not cmd:
+        return {}
+    env = {}
+    home = os.path.join(dest, "codex-home")
+    if os.path.isdir(home):
+        env["CODEX_HOME"] = home
+    return _register(spec, cmd, dest, env)
 
 
 def _id_for_pkg(pkg: str) -> str:
@@ -309,7 +549,9 @@ def _ensure_pkg_json(dest: str, aid: str) -> None:
 
 
 def _run_npm(node: str, npm: str, args, registry: str = "") -> tuple:
-    cmd = [node, npm] + list(args) + ["--no-audit", "--no-fund", "--loglevel", "error"]
+    # ★loglevel=http：npm 会逐行打印 "http fetch GET 200 ..."，
+    #   我们靠它估算"已经抓了多少个包"（npm 不提供总字节数，这是最接近进度的信号）。
+    cmd = [node, npm] + list(args) + ["--no-audit", "--no-fund", "--loglevel", "http"]
     if registry:
         cmd += ["--registry", registry]
     _job_log("$ " + " ".join(cmd))
@@ -321,6 +563,7 @@ def _run_npm(node: str, npm: str, args, registry: str = "") -> tuple:
         return 1, "启动 npm 失败：%s" % exc
     t0 = time.time()
     out = []
+    n_fetch = 0
     while True:
         if time.time() - t0 > NPM_TIMEOUT:
             try:
@@ -337,7 +580,17 @@ def _run_npm(node: str, npm: str, args, registry: str = "") -> tuple:
         s = line.decode("utf-8", "replace").rstrip()
         if s:
             out.append(s)
-            _job_log(s)
+            is_fetch = bool(re.search(r"http fetch", s, re.I))
+            if not is_fetch:
+                _job_log(s)
+            if is_fetch:
+                n_fetch += 1
+                _set(packages=n_fetch,
+                     percent=min(88, 12 + n_fetch * 2),
+                     detail="已获取 %d 个包" % n_fetch)
+            m = re.search(r"added (\d+) packages?", s, re.I)
+            if m:
+                _set(packages=int(m.group(1)), percent=90, detail="依赖下载完成")
     try:
         rc = p.wait(timeout=20)
     except Exception:                           # noqa: BLE001
@@ -417,7 +670,8 @@ def install(spec_id: str, pkg: str = "", registry: str = "") -> dict:
             raise RuntimeError("没找到 Node / npm（随包 node 里自带 npm）—— 先装带 node 的安装包")
         _set(running=True, id=str(spec["id"]), phase="准备", log=[], error="", ok=False,
              started=time.time(), finished=0.0, command=[], agent="",
-             kind="install", version="", toVersion="")
+             kind="install", version="", toVersion="", percent=2, packages=0,
+             detail="准备安装", backup="")
     th = threading.Thread(target=_worker, args=(spec, pkg_name, node, npm, registry), daemon=True)
     th.start()
     return {"ok": True, "id": spec["id"], "dest": os.path.join(INSTALL_ROOT, spec["id"])}
@@ -479,18 +733,18 @@ def _worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str) -> No
     try:
         dest = _dest(aid)
         _ensure_pkg_json(dest, aid)
-        _set(phase="下载安装（npm）")
+        _set(phase="下载安装（npm）", percent=5, detail="准备下载依赖")
         rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, pkg_name], registry)
         if rc != 0 and not registry:
             _job_log("[i] 直连 registry 失败（rc=%d）→ 换镜像 registry.npmmirror.com 再试" % rc)
-            _set(phase="下载安装（国内镜像）")
+            _set(phase="下载安装（国内镜像）", percent=8, detail="换国内镜像重试")
             rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, pkg_name], MIRROR)
         if rc != 0:
             _set(running=False, phase="失败", error="npm 失败（rc=%d）：%s" % (rc, tail[-800:]),
                  finished=time.time())
             return
         # 找入口
-        _set(phase="识别入口")
+        _set(phase="识别入口", percent=90, detail="识别启动入口")
         cmd = _entry_for_dest(dest, pkg_name, node)
         err = _cmd_error(cmd, dest)
         if err:
@@ -500,12 +754,12 @@ def _worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str) -> No
             return
         env = {}
         if spec.get("codex_home"):
-            _set(phase="写 CODEX_HOME 模板")
+            _set(phase="写 CODEX_HOME 模板", percent=95, detail="写 CODEX_HOME 模板")
             env["CODEX_HOME"] = _write_codex_template(dest)
-        _set(phase="注册到 agentlist")
+        _set(phase="注册到 agentlist", percent=98, detail="注册到 agentlist")
         a = _register(spec, cmd, dest, env)
         _forget_versions()
-        _set(running=False, phase="完成", ok=True, finished=time.time(),
+        _set(running=False, phase="完成", percent=100, detail="完成", ok=True, finished=time.time(),
              command=cmd, agent=str((a or {}).get("id") or ""),
              version=installed_version(spec), toVersion=installed_version(spec))
         _job_log("[OK] 已注册：%s" % ((a or {}).get("id") or "?"))
@@ -605,7 +859,8 @@ def update(spec_id: str, pkg: str = "", registry: str = "") -> dict:
             raise RuntimeError("已经有一个安装/更新任务在跑：%s" % (_JOB["id"] or "?"))
         _set(running=True, id=aid, phase="准备更新", log=[], error="", ok=False,
              started=time.time(), finished=0.0, command=[], agent="", kind="update",
-             version=installed_version(spec), toVersion="")
+             version=installed_version(spec), toVersion="", percent=2, packages=0,
+             detail="准备更新", backup="")
     threading.Thread(target=_update_worker, args=(spec, pkg_name, node, npm, registry),
                      daemon=True).start()
     return {"ok": True, "id": aid, "dest": dest, "kind": "update",
@@ -622,11 +877,29 @@ def _update_worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str
     aid = str(spec["id"])
     dest = _dest(aid)
     target = _update_target(pkg_name)
+    bak = ""
     try:
         cur = installed_version(spec)
         _job_log("[i] %s：%s → %s" % (aid, cur or "?", target))
         _release_agent(dest)
-        _set(phase="下载安装（npm）")
+        # ★先备份旧目录：更新失败能原样放回去（同盘 rename，几乎零成本）
+        try:
+            bak = _backup_dest(dest)
+            if bak:
+                _job_log("[i] 已备份旧版本 → %s" % os.path.basename(bak))
+        except OSError as exc:
+            # 文件被占用时 rename 会失败：再收一次进程 + 清残留，然后重试
+            try:
+                _release_agent(dest, force=True)
+                _kill_under(dest)
+                bak = _backup_dest(dest)
+                if bak:
+                    _job_log("[i] 已备份旧版本（重试成功）→ %s" % os.path.basename(bak))
+            except OSError:
+                _job_log("[!] 备份失败（继续更新，但这次无法回滚）：%s" % exc)
+                bak = ""
+        _ensure_pkg_json(dest, aid)
+        _set(phase="下载安装（npm）", backup=bak, percent=12, detail="开始下载依赖")
         rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, target], registry)
         if rc != 0 and _busy_tail(tail):
             _job_log("[i] npm 报文件被占用 → 再收一次进程（含该目录下的残留）后重试")
@@ -635,32 +908,77 @@ def _update_worker(spec: dict, pkg_name: str, node: str, npm: str, registry: str
             rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, target], registry)
         if rc != 0 and not registry:
             _job_log("[i] 直连 registry 失败（rc=%d）→ 换镜像 registry.npmmirror.com 再试" % rc)
-            _set(phase="下载安装（国内镜像）")
+            _set(phase="下载安装（国内镜像）", percent=15, detail="换国内镜像重试")
             rc, tail = _run_npm(node, npm, ["install", "--prefix", dest, target], MIRROR)
         if rc != 0:
+            if bak:
+                _restore_backup(dest, bak)
+                _reregister(dest, spec, node)
+                _job_log("[i] 更新失败，已回滚到上一版")
             _set(running=False, phase="失败",
-                 error="npm 更新失败（rc=%d）：%s" % (rc, tail[-800:]), finished=time.time())
+                 error="npm 更新失败（rc=%d）：%s" % (rc, tail[-800:]), finished=time.time(),
+                 backup=bak)
             return
-        _set(phase="识别入口")
+        _set(phase="识别入口", percent=90, detail="识别启动入口")
         cmd = _entry_for_dest(dest, pkg_name, node)
         err = _cmd_error(cmd, dest)
         if err:
-            _set(running=False, phase="失败", error=err, finished=time.time())
+            if bak:
+                _restore_backup(dest, bak)
+                _reregister(dest, spec, node)
+                _job_log("[i] 入口检查失败，已回滚到上一版")
+            _set(running=False, phase="失败", error=err, finished=time.time(), backup=bak)
             return
         env = {}
         if spec.get("codex_home"):
-            _set(phase="写 CODEX_HOME 模板")
+            _set(phase="写 CODEX_HOME 模板", percent=95, detail="写 CODEX_HOME 模板")
             env["CODEX_HOME"] = _write_codex_template(dest)
-        _set(phase="注册到 agentlist")
+        _set(phase="注册到 agentlist", percent=98, detail="注册到 agentlist")
         a = _register(spec, cmd, dest, env)
         newv = installed_version(spec)
         _forget_versions()
-        _set(running=False, phase="完成", ok=True, finished=time.time(), command=cmd,
-             agent=str((a or {}).get("id") or ""), version=newv, toVersion=newv)
+        _set(running=False, phase="完成", percent=100, detail="完成", ok=True, finished=time.time(), command=cmd,
+             agent=str((a or {}).get("id") or ""), version=newv, toVersion=newv, backup=bak)
         _job_log("[OK] 已更新到 %s（%s）" % (newv or "?", (a or {}).get("id") or "?"))
     except Exception as exc:                    # noqa: BLE001
+        if bak:
+            try:
+                _restore_backup(dest, bak)
+                _reregister(dest, spec, node)
+                _job_log("[i] 异常，已回滚到上一版")
+            except Exception:                   # noqa: BLE001
+                pass
         _set(running=False, phase="失败", error="%s: %s" % (type(exc).__name__, exc),
-             finished=time.time())
+             finished=time.time(), backup=bak)
+
+def rollback(spec_id: str) -> dict:
+    """把最近一次更新回滚到上一版（目录级 rename，不重新下载）。"""
+    aid = str(spec_id or "")
+    dest = _dest(aid)
+    bak = _latest_backup(dest)
+    if not bak:
+        raise RuntimeError("没有可回滚的备份：%s" % aid)
+    spec = next((dict(s) for s in CATALOG if str(s.get("id")) == aid), None)
+    if spec is None:
+        spec = {"id": aid, "label": aid, "pkg": "", "provider": "", "note": "自定义 npm 包"}
+    node, _npm = node_and_npm()
+    if not node:
+        raise RuntimeError("没找到 Node，无法重建启动命令")
+    with _LOCK:
+        if _JOB["running"]:
+            raise RuntimeError("已经有一个安装/更新任务在跑：%s" % (_JOB["id"] or "?"))
+    _release_agent(dest)
+    if os.path.isdir(dest):
+        _kill_under(dest)
+        shutil.rmtree(dest, ignore_errors=True)
+    if os.path.isdir(dest):
+        raise RuntimeError("旧目录删不掉（可能仍被进程占用）：%s" % dest)
+    os.rename(bak, dest)
+    a = _reregister(dest, spec, node)
+    _forget_versions()
+    v = installed_version(spec)
+    return {"ok": True, "id": aid, "version": v,
+            "agent": str((a or {}).get("id") or ""), "backup": os.path.basename(bak)}
 
 
 def uninstall(spec_id: str, delete_files: bool = True) -> dict:

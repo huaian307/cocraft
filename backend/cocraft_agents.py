@@ -41,7 +41,9 @@ import urllib.request
 
 import netsafe
 import snapshots
+import errkind
 from engines import STATE_DIR
+from engines.base import capture_before_allow
 from engines.acp import agents as acp_agents
 import audit
 from engines.acp.engine import acp_log
@@ -75,8 +77,16 @@ _RE_NET = re.compile(r"network|internet|联网|网络|外网|上网|域名|domai
 #   2026-10-13：桌面被清空那次，就是"自动放行 + 弹窗只写 Run command（看不到命令）"两个问题叠加。
 _RE_DESTRUCTIVE = re.compile(
     r"remove-item|\brm\b|\brd\b|rmdir|\bdel\b|\berase\b|delete|recycle|"
-    r"\bformat\b|diskpart|shutdown|taskkill|stop-process|kill\b|reg\s+delete|"
+    # ★`Format-Table` / `Format-List` 等是只读格式化 cmdlet，不是磁盘 format（2026-10-26 修）
+    r"\bformat\b(?!-(?:table|list|wide|custom|hex))|diskpart|shutdown|taskkill|stop-process|kill\b|reg\s+delete|"
     r"清空|删除|格式化|抹掉|重置|卸载", re.I)
+
+# ★敏感读取：**即使 trust 也不自动放行**（API Key / 登录 Cookie / 邮件授权码都在 runtime/state）
+#   只认"读整个环境变量"和"读这些具体文件"，不把普通的 `$env:TEMP` 也拦下来。
+_RE_SECRET = re.compile(
+    r"\b(?:get-childitem|gci|ls|dir)\b[^\n]{0,40}\benv:|getenvironmentvariables|"
+    r"(?:_credentials|_acp_agents|_mail|_github_token|_music_cookie)\.json", re.I)
+
 _CONFIRM = re.compile(r"确认|確定|确定|confirm|我确认|真的删|确定执行", re.I)
 
 # ---------------- ★主动编排（方向 2）：角色预设 ----------------
@@ -329,6 +339,14 @@ def _is_destructive(*texts) -> bool:
     return False
 
 
+def _is_secret(*texts) -> bool:
+    """读 API Key / Cookie / 授权码这类敏感内容？**即使 trust 也要人确认**。"""
+    for t in texts:
+        if t and _RE_SECRET.search(str(t)):
+            return True
+    return False
+
+
 def _looks_like_net(resources) -> bool:
     """资源里有没有 URL（`scheme://…`）—— 有就说明这是网络动作，不是文件路径。"""
     for x in (resources or []):
@@ -426,6 +444,9 @@ def allowed_by_level(level, kind, action, message, resources, workspace) -> bool
       **不套工作区约束**（网络不是文件路径）；等级只要不是「全部询问」就放行。
     """
     if not level or level == "ask":
+        return False
+    # ★敏感读取永不自动放行（即便等级很宽；必须人确认）
+    if _is_secret(action, message):
         return False
     if level == "all":
         return True
@@ -555,8 +576,25 @@ def _perm_ctx_now(aid, net=True):
     return owner, ws, chat
 
 
-def _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root) -> dict:
-    """★ 可逆执行：破坏性操作**放行前**，把要动的目标复制进面板隔离区。
+def _capture_change(aid, chat, kind, title, cmd, locations, ws_root) -> str:
+    """★忏悔室（`ui 0.2.99`）：群聊自动/手动放行前，把修改前旧版静默留存。"""
+    try:
+        scope = ("chat-%s" % chat) if chat not in (None, "") else ("agent-%s" % aid)
+        qid = capture_before_allow(
+            ws_root, cmd, title or "", locations, scope=scope,
+            note=str(title or "")[:200], kind=kind or "")
+        if qid:
+            _act_add(chat, str((find(aid) or {}).get("name") or ""), "忏悔室留存旧版",
+                     "已留存", "completed", detail=str(qid))
+            acp_log("[cocraft-agents] %s 忏悔室留存旧版：%s" % (aid, qid))
+        return qid
+    except Exception as exc:  # noqa: BLE001 - 不挡放行
+        acp_log("[cocraft-agents] %s 忏悔室留存失败（不影响放行）：%r" % (aid, exc))
+        return ""
+
+
+def _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root, kind="delete") -> dict:
+    """★ 可逆执行：破坏性操作**放行前**，把要动的目标复制进面板忏悔室。
 
     为什么不用 OS 回收站：2026-10-13 那次事故里，回收站 `$I` 元数据说删了 62 项，
     但**没有任何 `$R` 内容实体** → 21 项真没了、救不回来。所以这里**自己复制一份**。
@@ -595,14 +633,14 @@ def _quarantine_before_allow(aid, chat, cmd, title, locations, ws_root) -> dict:
                 targets.append(rp)
         rec = snapshots.quarantine_paths(
             root, targets, scope=("chat-%s" % chat) if chat not in (None, "") else ("agent-%s" % aid),
-            note="破坏性操作放行前隔离：%s" % title, cmd=cmd)
+            note="破坏性操作放行前隔离：%s" % title, cmd=cmd, kind=kind)
         n = len(rec.get("items") or [])
         missed = len(rec.get("skipped") or [])
         out.update({"items": n, "missed": missed, "id": rec.get("id"), "unresolved": unresolved[:8]})
         if n:
             names = "、".join(os.path.basename(str(it.get("src") or "")) for it in rec["items"][:6])
-            msg = ("🛡 **已隔离（可恢复）**：%d 项已备份进面板隔离区 —— %s%s\n"
-                   "（面板「工具 → 隔离区」可**一键恢复**；隔离只是备份，命令仍照常执行）"
+            msg = ("🛡 **已隔离（可恢复）**：%d 项已备份进面板忏悔室 —— %s%s\n"
+                   "（面板「工具 → 忏悔室」可**一键恢复**；隔离只是备份，命令仍照常执行）"
                    % (n, names, "…" if n > 6 else ""))
         else:
             msg = ("⚠️ **这次没能预先隔离**：命令里没能识别出要动的文件（通配符 / 变量 / 工作区外…），"
@@ -646,18 +684,25 @@ def _turn_scope(aid, chat) -> str:
 
 
 def _snap_before_turn(aid, chat) -> dict:
-    """★群聊派活：在 agent **动手之前**记一份快照（只记路径 + 哈希 → 不占磁盘）。
+    """★群聊派活：在 agent **动手之前**记一份快照。
 
-    返回 `{scope, ts}`（拿不到工作目录 / 快照失败 → `{}`），`ts` 之后用于
-    「这一轮到底改了什么」的归属（C3 时间线）；**不带内容** → 只能看、不能一键回滚。
+    默认**只记路径 + 哈希**（不占磁盘、只能看「改了哪些文件」）；
+    设置里打开「轮快照带内容」后连内容一起进仓 → 之后能**一键退回**（`ui 0.2.85`）。
+    返回 `{scope, ts, with_content}`（拿不到工作目录 / 快照失败 → `{}`）。
     """
     root = _ws_root(aid)
     if not root or not os.path.isdir(root):
         return {}
     scope = _turn_scope(aid, chat)
+    want = False
     try:
-        res = snapshots.take_turn_snapshot(root, scope, label="群聊派活")
-        return {"scope": scope, "ts": str((res or {}).get("ts") or "")}
+        want = snapshots.turn_with_content(group=True)
+    except Exception:                            # noqa: BLE001
+        want = False
+    try:
+        res = snapshots.take_turn_snapshot(root, scope, label="群聊派活", with_content=want)
+        return {"scope": scope, "ts": str((res or {}).get("ts") or ""),
+                "with_content": bool(want)}
     except Exception as exc:                     # noqa: BLE001 - 快照失败绝不能挡住回帖
         acp_log("[cocraft-agents] %s 轮快照失败：%r" % (aid, exc))
         return {}
@@ -825,12 +870,19 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
     ★ `destructive=True`（破坏性/不可逆）：**必须拥有者回「确认」**才放行（回「可以」不算），
       并且申请里带上**命令原文** —— 不做盲签。
     ★ 拥有者确认后、**放行前**先做一次「**先隔离再放行**」（`_quarantine_before_allow`）：
-      把这条命令要动的目标复制进面板隔离区 `runtime/quarantine/`，之后可一键恢复（不走 OS 回收站）。
+      把这条命令要动的目标复制进面板忏悔室 `runtime/quarantine/`，之后可一键恢复（不走 OS 回收站）。
     """
     if level_ok and not destructive:
         # 等级已放行 → 不打扰拥有者（破坏性除外：永远要问）。
         # ⚠ **不写审计**：这类是"策略自动放行"，不是"谁批准了"；写进去会把真正的审批记录冲掉，
         #   而且每个读/命令都重写一遍审计文件（IO 放大）。活动流里已经能看到这些操作。
+        # ★忏悔室：自动放行前也把修改前旧版静默留存（编辑类更需要这个）。
+        _c0 = None
+        try:
+            _c0 = (list((find(aid) or {}).get("chats") or []) or [None])[0]
+        except Exception:  # noqa: BLE001
+            _c0 = None
+        _capture_change(aid, _c0, kind, title, cmd, locations, ws_root)
         return "always"
     # ★ 建桥 / 冷启动太早 → **等 perm_ctx 就绪**（WS 连上、群已知），别静默拒绝。
     owner, ws, chat = _perm_ctx_now(aid)
@@ -911,7 +963,9 @@ def _perm_ask_group(aid, kind, title, locations, level_ok: bool,
                             _qitems = int((_q or {}).get("items") or 0)
                             _qmissed = int((_q or {}).get("missed") or 0)
                         else:
-                            _qid, _qitems, _qmissed = "", 0, 0
+                            _qid = _capture_change(aid, chat, kind, title, cmd, locations, ws_root)
+                            _qitems = len((snapshots.load_quarantine(_qid) or {}).get("items") or []) if _qid else 0
+                            _qmissed = 0
                         _act_finish(chat, _ptcid, "allowed", detail="拥有者回复：%s" % c[:120])
                         _perm_log_add(aid, chat, {"kind": kind, "title": title, "cmd": cmd,
                                                   "locations": locations,
@@ -1047,6 +1101,55 @@ def public(a: dict) -> dict:
 
 def list_agents() -> list:
     return [public(a) for a in _entries()]
+
+
+def list_member_sessions(chat=None) -> dict:
+    """群聊 AI 成员会话列表（群聊管理界面专用，不混进单聊）。
+
+    会话名按用户指定：**群里创建时的名字**（不是 `群聊AI·名字`）。
+    旧桥会话文件里的标题会在读取时迁移。
+    """
+    try:
+        with open(BRIDGE_SESSIONS_FILE, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception:  # noqa: BLE001
+        doc = {"sessions": []}
+    sessions = [s for s in (doc.get("sessions") or []) if isinstance(s, dict)]
+    chat_s = str(chat if chat is not None else "")
+    items, changed = [], False
+    for a in list_agents():
+        aid = str(a.get("id") or "")
+        name = str(a.get("name") or aid)
+        chats = [str(x) for x in (a.get("chats") or [])]
+        if chat_s and chats and chat_s not in chats:
+            continue
+        sid = str(((_bridges.get(aid) or {}).get("sid")) or "")
+        chosen = next((s for s in sessions if sid and str(s.get("id")) == sid), None)
+        if chosen is None:
+            chosen = next((s for s in sessions
+                           if str(s.get("title") or "") in (name, "群聊AI·" + name)), None)
+        if chosen is None:
+            continue
+        if str(chosen.get("title") or "") != name:
+            chosen["title"] = name
+            changed = True
+        items.append({"agentId": aid, "name": name, "engine": a.get("engine") or "",
+                      "roleLabel": a.get("roleLabel") or "",
+                      "sessionID": str(chosen.get("id") or ""),
+                      "title": name,
+                      "messageCount": len(chosen.get("messages") or []),
+                      "updated": (chosen.get("time") or {}).get("updated") or 0,
+                      "chats": chats})
+    if changed:
+        try:
+            tmp = BRIDGE_SESSIONS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(doc, fh, ensure_ascii=False)
+            os.replace(tmp, BRIDGE_SESSIONS_FILE)
+        except Exception:  # noqa: BLE001
+            pass
+    return {"chat": chat_s, "items": items}
+
 
 
 # ---------------- 上游 REST（用**用户令牌**；管理操作用）----------------
@@ -1216,16 +1319,18 @@ def _build_bridge(aid) -> dict:
         _level, _src = effective_perm_level(a_now)
         cmd = str((info or {}).get("command") or "")
         destructive = _is_destructive(cmd, title)
+        secret = _is_secret(cmd, title)
         net = _is_net(kind, title, cmd, locations)
-        # ★ 破坏性：**永不自动放行**（等级再宽也要拥有者回「确认」）
-        ok = (not destructive) and ((net and allow_network())
+        # ★ 破坏性 / 敏感读取：**永不自动放行**（等级再宽也要拥有者确认）
+        ok = (not destructive) and (not secret) and ((net and allow_network())
                                     or allowed_by_level(_level, kind, title, cmd, locations, _ws_root))
         verdict = _perm_ask_group(aid, kind, title, locations, ok, cmd=cmd,
                                   destructive=destructive, ws_root=_ws_root)
-        acp_log("[cocraft-agents] %s 权限 -> %s（等级=%s，%s%s%s，%s）"
+        acp_log("[cocraft-agents] %s 权限 -> %s（等级=%s，%s%s%s%s，%s）"
                 % (aid, verdict, _level, _src,
-                   "，联网放行" if (net and allow_network() and not destructive) else "",
-                   "，破坏性→必须确认" if destructive else "", title))
+                   "，联网放行" if (net and allow_network() and not destructive and not secret) else "",
+                   "，破坏性→必须确认" if destructive else "",
+                   "，敏感读取→必须确认" if secret else "", title))
         return verdict or None
 
     svc.auto_permission = _auto_perm
@@ -1235,7 +1340,7 @@ def _build_bridge(aid) -> dict:
         model = (_load_ok_models() or {}).get(eng) or None
     except Exception:  # noqa: BLE001
         model = None
-    pub = svc.create_session(title="群聊AI·%s" % (a.get("name") or aid),
+    pub = svc.create_session(title=str(a.get("name") or aid),
                              cwd=cfg_cwd or None, model=({"id": model} if model else None))
     if model:
         acp_log("[cocraft-agents] %s 会话模型=%s" % (aid, model))
@@ -1749,6 +1854,7 @@ def _handle_event(aid, frame) -> None:
                                   % (len(files), "、".join(f.get("name") or "?" for f in files))) if files else "")
     prompt = base_prompt + attach_note
     snap = {}
+    err_text = ""
     try:
         snap = _snap_before_turn(aid, chat)   # ★派活前记一份（之后能并排看"谁改了哪些文件"）
         reply = _ask(aid, prompt, files=files, chat=chat)
@@ -1765,6 +1871,7 @@ def _handle_event(aid, frame) -> None:
                                            "请**只用中文回一句话**，不要输出思考过程。）",
                          files=None, chat=chat)
     except Exception as e:  # noqa: BLE001
+        err_text = "%s: %s" % (type(e).__name__, e)
         acp_log("[cocraft-agents] %s 生成失败：%r" % (aid, e))
         reply = ""
     # ★C3：这一轮**到底改了什么**（文件级）→ 写进审计链；没出正文也照记（改了的文件是真的）
@@ -1774,6 +1881,13 @@ def _handle_event(aid, frame) -> None:
         acp_log("[cocraft-agents] %s 轮改动记录异常：%r" % (aid, e))
     if not reply:
         acp_log("[cocraft-agents] %s no reply (%.1fs)" % (aid, time.time() - t_msg))
+        # ★别在群里"沉默"：把失败**分类后**说一句人话（以前只在 acp.log 里，
+        #   用户看到的就是"它不回我"）。账户类（余额不足 / Key）也终于能认出来了。
+        try:
+            k = errkind.classify(err_text or "这一轮没有输出正文")
+            _send_message(aid, chat, "（这一轮没跑起来：%s —— %s）" % (k["label"], k["hint"]), mid)
+        except Exception as exc:                 # noqa: BLE001 - 报错提示本身失败就算了
+            acp_log("[cocraft-agents] %s 失败提示发送异常：%r" % (aid, exc))
         return
     _send_message(aid, chat, reply, mid)
     acp_log("[cocraft-agents] %s replied in %.1fs (total)" % (aid, time.time() - t_msg))

@@ -233,6 +233,17 @@ class AcpEngine(Engine):
             svc = self._services.get(self.active_agent_id())
         return bool(svc and svc.running())
 
+    def has_active_turns(self) -> bool:
+        """当前 agent 有没有正在跑的轮次（自动更新只在空闲时做）。"""
+        with self._services_lock:
+            svc = self._services.get(self.active_agent_id())
+        if svc is None:
+            return False
+        try:
+            return bool(svc.any_busy())
+        except Exception:                       # noqa: BLE001
+            return False
+
     def service(self) -> AcpService:
         """当前 agent 的 AcpService（按 agent id 缓存，切回不重启）。"""
         aid = self.active_agent_id()
@@ -330,6 +341,14 @@ class AcpEngine(Engine):
                     cwd=(q.get("cwd") or [""])[0] or None,
                     cursor=(q.get("cursor") or [""])[0] or "",
                     include_internal=(q.get("internal") or [""])[0] in ("1", "true", "yes", "on")))
+            if path == "/api/session/remote/delete" and method == "POST":
+                # ★「接续」列表里删一条 **agent 侧**会话（不碰面板本地记录）
+                b = handler._read_json_body() or {}
+                try:
+                    self.service().delete_remote(b.get("id") or b.get("sessionId"))
+                except Exception as exc:  # noqa: BLE001
+                    return handler._send_json(400, {"error": str(exc)})
+                return handler._send_json(200, {"ok": True, "deleted": True})
             if path == "/api/session/import" and method == "POST":
                 b = handler._read_json_body() or {}
                 try:
@@ -373,12 +392,15 @@ class AcpEngine(Engine):
                     return handler._send_json(404, {"error": "会话不存在"})
                 return _empty(handler, 204)
             if method == "DELETE":
+                # ★先把 agent 侧删掉（delete 优先、失败才 close），再删本地。
+                #   返回值告诉前端"对面到底删没删"——只 close 的话，它还会出现在「接续」里。
+                side = ""
                 try:
-                    svc.close_agent_session(sid)   # best-effort：告诉 agent 侧 close/delete
+                    side = svc.close_agent_session(sid)
                 except Exception:  # noqa: BLE001
-                    pass
+                    side = ""
                 svc.delete_session(sid)
-                return _empty(handler, 204)
+                return handler._send_json(200, {"ok": True, "agentSide": side or "none"})
             return handler._send_json(405, {"error": "GET/PATCH/DELETE only"})
 
         if rest == "message" and method == "GET":

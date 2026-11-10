@@ -16,6 +16,51 @@ import os
 
 MAX_READ = 2 * 1024 * 1024          # 2 MB
 MAX_WRITE = 4 * 1024 * 1024         # 4 MB
+MAX_RAW = 256 * 1024 * 1024         # 256 MB（预览：图片 / PDF / 音视频）
+
+# ★能在面板里**直接预览**的类型（`/fs/raw` 只发这几类 + 其它非文本二进制）
+MEDIA_KIND = {
+    "image": (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".avif", ".ico"),
+    "pdf": (".pdf",),
+    "video": (".mp4", ".webm", ".m4v", ".mov", ".mkv"),
+    "audio": (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus"),
+}
+MEDIA_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".svg": "image/svg+xml", ".avif": "image/avif", ".ico": "image/x-icon",
+    ".pdf": "application/pdf",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".m4v": "video/x-m4v",
+    ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".flac": "audio/flac", ".ogg": "audio/ogg", ".opus": "audio/opus",
+}
+
+
+def media_kind(path: str) -> str:
+    """按扩展名判"能不能直接预览"：image / pdf / video / audio / text。"""
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    for kind, exts in MEDIA_KIND.items():
+        if ext in exts:
+            return kind
+    return "text"
+
+
+def raw_file(root: str, path: str) -> dict:
+    """预览用的原始文件：返回 `{path, size, kind, mime}`（**只做校验，不发内容**）。
+
+    ⚠ 和 `read_file` 同一套越界校验（`realpath` 前缀）；文本类不走这里（见 server 的 `/fs/raw`）。
+    """
+    r, t = resolve(root, path)
+    if not os.path.isfile(t):
+        raise ValueError("不是文件：%s" % path)
+    size = os.path.getsize(t)
+    if size > MAX_RAW:
+        raise ValueError("文件太大（%.1f MB > %.0f MB），不能在这里预览"
+                         % (size / 1048576.0, MAX_RAW / 1048576.0))
+    ext = os.path.splitext(t)[1].lower()
+    return {"root": r, "path": t, "size": size, "kind": media_kind(t),
+            "mime": MEDIA_MIME.get(ext) or ""}
 
 # 文件树里默认不展开的“重”目录（VS Code 默认也隐藏这些）
 SKIP_DIRS = {

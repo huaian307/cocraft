@@ -126,6 +126,14 @@ def main() -> int:
         storage = None
     base = "http://127.0.0.1:%d" % args.port
 
+    # ★应用标识：任务栏分组 / 固定到任务栏后用我们自己的图标（否则归到 python.exe 名下）
+    try:
+        sys.path.insert(0, os.path.join(root, "backend"))
+        from computer import winapi as _wa
+        _wa.set_app_user_model_id("Cocraft.Panel")
+    except Exception:  # noqa: BLE001
+        pass
+
     win = webview.create_window(args.title, base + "/", width=args.width, height=args.height,
                                 min_size=(900, 600))
     state = {"really_quit": False, "tray": None, "visible": True}
@@ -150,6 +158,32 @@ def main() -> int:
             win.set_title(args.title)
         except Exception:  # noqa: BLE001
             pass
+        # ⚠ 换图标要轮询（WinForms/WebView2 起来后会自己再设一次）→ **别在 UI 线程里等**
+        threading.Thread(target=_apply_icon, daemon=True).start()
+
+    def _apply_icon():
+        """把**窗口**图标换成官方 cocraft.ico（标题栏 / 任务栏 / Alt-Tab / 任务管理器「应用」）。
+
+        ⚠ 任务管理器「详细信息」里的进程图标来自 exe 文件本身（我们是 pythonw.exe），
+          改不了；这里能保证的是"用户看得见的那一层"是我们的图标。
+        ⚠ WinForms / WebView2 起来后会自己再设一次图标，所以多试几次（loaded 之后 6 秒内）。
+        """
+        try:
+            from computer import winapi
+        except Exception:  # noqa: BLE001
+            return False
+        me = os.getpid()
+        for _ in range(12):
+            try:
+                for w in winapi.list_windows(limit=80):
+                    if int(w.get("pid") or 0) == me and \
+                            (args.title or "") in (w.get("title") or args.title or ""):
+                        if winapi.set_window_icon(w["hwnd"], ico):
+                            return True
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.5)
+        return False
 
     try:
         win.events.closing += _on_closing
@@ -165,7 +199,8 @@ def main() -> int:
             try:
                 state["tray"] = subprocess.Popen(
                     [sys.executable, tray_py, "--title", args.title,
-                     "--state", state_dir, "--parent-pid", str(os.getpid())],
+                     "--state", state_dir, "--port", str(args.port),
+                     "--parent-pid", str(os.getpid())],
                     cwd=root, env=dict(os.environ), creationflags=CREATE_NO_WINDOW)
             except Exception:  # noqa: BLE001
                 state["tray"] = None

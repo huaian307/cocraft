@@ -50,6 +50,10 @@ if HERE in sys.path:
 sys.path.insert(0, HERE)
 
 import agent_install
+import node_update
+import restore_center
+import confessional_git
+import session_scope
 import cleanup
 import engines
 import external
@@ -62,6 +66,7 @@ import snapshots
 import themes
 import updater
 import audit
+import planner
 from engines.base import HOP_BY_HOP, EngineError
 from engines.acp import agents as acp_agents
 from engines.acp import credentials as acp_credentials
@@ -202,6 +207,9 @@ def _component_env(extra_site: str) -> dict:
 AUDIO_PY, AUDIO_SITE = _component_python("audio")
 _spectrum_proc = None
 _spectrum_lock = threading.Lock()
+_spectrum_last_req = 0.0          # 最近一次「正在放歌」的 /qq/spectrum 请求（秒）
+_spectrum_next_try = 0.0          # 启动失败/刚启动的退避，别每个 70ms 请求都 Popen
+SPECTRUM_IDLE_STOP = float(os.environ.get("COCRAFT_SPECTRUM_IDLE_STOP") or 8)
 MUSIC = {"state": {}, "updated": 0.0}
 _music_proc = None
 _music_lock = threading.Lock()
@@ -1508,8 +1516,11 @@ def start_spectrum(force: bool = False) -> None:
     装法有两种（见 `_component_python`）：`runtime/venvs/audio`（开发机）或
     `runtime/site-packages/audio`（安装包）。没装时前端自动退回 CSS 合成动画。
     """
-    global _spectrum_proc
+    global _spectrum_proc, _spectrum_next_try
     if not AUDIO_PY:
+        return
+    now = time.time()
+    if now < _spectrum_next_try:
         return
     if not force:
         age = spectrum_age()
@@ -1527,18 +1538,22 @@ def start_spectrum(force: bool = False) -> None:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                 env=_component_env(AUDIO_SITE),
                 creationflags=NO_WINDOW)
+            _spectrum_next_try = time.time() + 2.0
         except Exception:  # noqa: BLE001
             _spectrum_proc = None
+            _spectrum_next_try = time.time() + 5.0
 
 
 def spectrum_keeper() -> None:
-    """频谱文件超过 8 秒没更新就重新拉起采集进程。"""
+    """有「正在放歌」的请求才保持采集；空闲超过 SPECTRUM_IDLE_STOP 秒就停掉。"""
     while True:
-        time.sleep(5)
+        time.sleep(2)
         try:
-            age = spectrum_age()
-            if age is None or age > 8:
-                start_spectrum()
+            idle = time.time() - float(_spectrum_last_req or 0.0)
+            if _spectrum_last_req and idle <= SPECTRUM_IDLE_STOP:
+                start_spectrum(force=True)
+            else:
+                stop_spectrum()
         except Exception:  # noqa: BLE001
             pass
 
@@ -1552,6 +1567,11 @@ def stop_spectrum() -> None:
             except Exception:  # noqa: BLE001
                 pass
         _spectrum_proc = None
+        try:
+            if os.path.exists(SPECTRUM_FILE):
+                os.remove(SPECTRUM_FILE)
+        except OSError:
+            pass
 
 
 def music_svc_alive() -> bool:
@@ -1792,6 +1812,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/agent/catalog":
                 # ★面板内「安装 Agent」：可装的 npm 适配器 + 现在能不能装
                 self._send_json(200, {"ok": True, "data": {"items": agent_install.catalog(),
+                                                           "bundled": agent_install.bundled(),
                                                            "root": agent_install.INSTALL_ROOT,
                                                            "status": agent_install.status()}})
             elif path == "/agent/install/status":
@@ -1815,6 +1836,24 @@ class Handler(BaseHTTPRequestHandler):
                 force = str((q.get("force") or [""])[0]).lower() in ("1", "true", "yes")
                 self._send_json(200, {"ok": True,
                                       "data": agent_install.versions(force=force)})
+            elif path == "/agent/updates":
+                # ★ 给启动横幅用：只回"有更新"的摘要（默认只读缓存，不联网；?force=1 才查）
+                q = parse_qs(urlsplit(self.path).query)
+                force = str((q.get("force") or [""])[0]).lower() in ("1", "true", "yes")
+                cached = str((q.get("cached") or [""])[0]).lower() in ("1", "true", "yes")
+                self._send_json(200, {"ok": True,
+                                      "data": agent_install.updates_summary(
+                                          force=force, cached_only=(cached and not force))})
+            elif path == "/agent/auto":
+                # ★ 后台检查 / 自动更新配置（默认：检查开、自动装关）
+                if method == "GET":
+                    self._send_json(200, {"ok": True, "data": agent_install.auto_config()})
+                    return
+                if method != "POST":
+                    self._send_json(405, {"error": "GET or POST only"})
+                    return
+                b = self._read_json_body() or {}
+                self._send_json(200, {"ok": True, "data": agent_install.set_auto_config(**b)})
             elif path == "/agent/update":
                 # ★ 把已装的 npm agent 更新到最新（异步：立刻回，进度看 /agent/install/status）
                 if method != "POST":
@@ -1828,6 +1867,72 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, RuntimeError) as exc:
                     self._send_json(400, {"ok": False, "error": str(exc)})
                     return
+                self._send_json(200, res)
+            elif path == "/agent/rollback":
+                # ★ 把最近一次更新回滚到上一版（目录级 rename，不重新下载）
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                b = self._read_json_body() or {}
+                try:
+                    res = agent_install.rollback(str(b.get("id") or ""))
+                except (ValueError, RuntimeError) as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                try:
+                    audit.append("agent", actor={"kind": "user", "id": "local", "name": "owner"},
+                                 action={"kind": "rollback", "title": "回滚 agent 更新"},
+                                 decision="rollback", result="ok",
+                                 note="回滚 %s → %s" % (res.get("id"), res.get("version")),
+                                 via=self._via())
+                except Exception:                  # noqa: BLE001
+                    pass
+                self._send_json(200, res)
+            elif path == "/node/info":
+                self._send_json(200, {"ok": True, "data": node_update.info()})
+            elif path == "/node/check":
+                q = parse_qs(urlsplit(self.path).query)
+                force = str((q.get("force") or [""])[0]).lower() in ("1", "true", "yes")
+                self._send_json(200, {"ok": True, "data": node_update.check(force=force)})
+            elif path == "/node/status":
+                self._send_json(200, {"ok": True, "data": node_update.status()})
+            elif path == "/node/apply":
+                # ★异步更新 Node（下载 / SHA256 / 备份 / 替换）；进度看 /node/status
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                b = self._read_json_body() or {}
+                try:
+                    res = node_update.apply_async(str(b.get("version") or ""))
+                except (ValueError, RuntimeError, OSError) as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                try:
+                    audit.append("node", actor={"kind": "user", "id": "local", "name": "owner"},
+                                 action={"kind": "node-update", "title": "更新 Node 运行时"},
+                                 decision="apply", result="started",
+                                 note="Node %s" % (b.get("version") or "latest"),
+                                 via=self._via())
+                except Exception:                  # noqa: BLE001
+                    pass
+                self._send_json(200, res)
+            elif path == "/node/rollback":
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                try:
+                    res = node_update.rollback()
+                except (ValueError, RuntimeError, OSError) as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                try:
+                    audit.append("node", actor={"kind": "user", "id": "local", "name": "owner"},
+                                 action={"kind": "node-rollback", "title": "回滚 Node 运行时"},
+                                 decision="rollback", result="ok",
+                                 note="Node %s" % (res.get("version") or "?"),
+                                 via=self._via())
+                except Exception:                  # noqa: BLE001
+                    pass
                 self._send_json(200, res)
             elif path == "/agent/uninstall":
                 if method != "POST":
@@ -1863,6 +1968,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._pick_image(method)
             elif path == "/pick/folder":
                 self._pick_folder(method)
+            elif path == "/save/text":
+                # 前端已有内容、只想让用户选保存位置（运行记录等；不走浏览器 blob 下载）
+                self._save_text(method)
             elif path == "/open/dir":
                 # 在外部程序里打开目录：终端 / VS Code / 资源管理器（与引擎无关）
                 self._open_dir(method)
@@ -1875,6 +1983,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._fs_list()
             elif path == "/fs/read":
                 self._fs_read()
+            elif path == "/fs/raw":
+                # ★文件查看（`ui 0.2.86`）：原始字节 —— 图片 / PDF / 音视频在面板里直接预览
+                self._fs_raw()
             elif path == "/fs/write":
                 self._fs_write(method)
             elif path == "/mkdir":
@@ -1884,14 +1995,125 @@ class Handler(BaseHTTPRequestHandler):
                 # 新建项目的默认位置 = 对应 agent 的目录
                 self._projectroot()
             elif path == "/quarantine" or path.startswith("/quarantine/"):
-                # ★可逆执行：隔离区（破坏性操作放行前的备份 → 一键恢复）
+                # ★可逆执行：忏悔室（破坏性操作放行前的备份 → 一键恢复）
                 self._quarantine_api(method, path)
             elif path == "/snapshot" or path.startswith("/snapshot/"):
                 # ★可逆执行：工作区快照（引擎无关；diff / 撤销这一轮 的底座）
                 self._snapshot_api(method, path)
+            elif path == "/session/managed":
+                # ★单聊列表过滤：工作流成员 / 群聊 AI 成员不混进单聊
+                if method != "GET":
+                    self._send_json(405, {"error": "GET only"})
+                    return
+                self._send_json(200, {"ok": True, "ids": sorted(session_scope.managed_ids())})
+            elif path == "/sessions/workflow":
+                # ★工作流成员会话（只给工作流管理界面）
+                if method != "GET":
+                    self._send_json(405, {"error": "GET only"})
+                    return
+                import orchestrator as _orch
+                wid = (parse_qs(urlsplit(self.path).query).get("workflow") or [""])[0]
+                self._send_json(200, {"ok": True, "data": _orch.list_member_sessions(wid)})
+            elif path == "/sessions/group":
+                # ★群聊 AI 成员会话（只给群聊管理界面）
+                if method != "GET":
+                    self._send_json(405, {"error": "GET only"})
+                    return
+                cid = (parse_qs(urlsplit(self.path).query).get("chat") or [""])[0]
+                import cocraft_agents as _ca
+                self._send_json(200, {"ok": True, "data": _ca.list_member_sessions(cid)})
+            elif path == "/restore/overview":
+                # ★忏悔室：群聊 / 工作流 / 单聊 → 项目
+                if method != "GET":
+                    self._send_json(405, {"error": "GET only"})
+                    return
+                self._send_json(200, {"ok": True, "data": restore_center.overview()})
+            elif path == "/restore/timeline":
+                # ★忏悔室：某分类/项目下的文件版本时间线
+                if method != "GET":
+                    self._send_json(405, {"error": "GET only"})
+                    return
+                q = parse_qs(urlsplit(self.path).query)
+                cat = str((q.get("category") or [""])[0])
+                proj = str((q.get("project") or [""])[0])
+                one = str((q.get("path") or [""])[0])
+                try:
+                    lim = int((q.get("limit") or ["120"])[0])
+                except ValueError:
+                    lim = 120
+                try:
+                    data = restore_center.timeline(cat, proj, one, lim)
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                self._send_json(200, {"ok": True, "data": data})
+            elif path == "/restore/file":
+                # ★把**一个文件**回滚到**一个版本**（回滚前先备份当前文件）
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                b = self._read_json_body() or {}
+                try:
+                    res = restore_center.restore_file(b)
+                except (ValueError, RuntimeError, OSError) as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                    return
+                try:
+                    audit.append("snapshot", actor=self._actor_by_via(),
+                                 action={"kind": "restore-file", "title": "忏悔室：回滚单个文件",
+                                         "targets": [res.get("path") or ""]},
+                                 decision="restore", result="ok",
+                                 ref={"scope": str(b.get("scope") or b.get("id") or "")},
+                                 quarantine=str(res.get("backup") or ""),
+                                 note="回滚 %s（%s）" % (res.get("path"), res.get("source")),
+                                 via=self._via())
+                except Exception:                  # noqa: BLE001
+                    pass
+                self._send_json(200, {"ok": True, "data": res})
+            elif path == "/confessional/git-status":
+                if method != "GET":
+                    self._send_json(405, {"error": "GET only"})
+                    return
+                self._send_json(200, {"ok": True, "data": confessional_git.status()})
+            elif path == "/confessional/git-clean":
+                # ★git 提交后出清：只清「提交前、且旧内容已在 git 对象库」的旧版
+                if method != "POST":
+                    self._send_json(405, {"error": "POST only"})
+                    return
+                b = self._read_json_body() or {}
+                root = str(b.get("root") or "")
+                try:
+                    res = (confessional_git.clean_project(root, force=True)
+                           if root else confessional_git.clean_all(force=True))
+                except Exception as exc:               # noqa: BLE001
+                    self._send_json(400, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+                    return
+                try:
+                    if res.get("dropped") or res.get("snapshots_dropped"):
+                        audit.append(
+                            "snapshot", actor=self._actor_by_via(),
+                            action={"kind": "git-clean", "title": "忏悔室：按 git 提交出清",
+                                    "targets": [root] if root else []},
+                            decision="cleanup", result="ok",
+                            ref={"scope": root or "all"},
+                            note="清理旧版 %s 条 / 旧快照 %s 条（只清 git 已有内容的）"
+                                 % (res.get("dropped") or 0, res.get("snapshots_dropped") or 0),
+                            via=self._via())
+                except Exception:                      # noqa: BLE001
+                    pass
+                self._send_json(200, {"ok": True, "data": res})
+            elif path == "/permission/ticket":
+                # ★低风险删除（`ui 0.2.95`）：先隔离再自动放行（OpenCode 前端轮询到申请时调用）
+                self._permission_ticket_api(method)
             elif path == "/audit" or path.startswith("/audit/"):
                 # ★审计链：append-only 哈希链（列表 / 统计 / 导出 / 校验）—— 本地路由，不走上游
                 self._audit_api(method, path)
+            elif path == "/cu/status":
+                # ★通用工具（桌面 / 浏览器）：只读状态 + 工具目录（面板「通用工具」列表用）
+                self._cu_status()
+            elif path == "/cu/config":
+                # ★「允许桌面操作」开关（只写 _cu.json 的 actions；黑名单/危险词不动）
+                self._cu_config(method)
             elif path == "/update/check":
                 self._update_check()
             elif path == "/update/status":
@@ -1944,6 +2166,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/orchestrate"):
                 # ★本地协作（无需登录）：任务派发 / 结果 / 待批 / 仲裁
                 self._orchestrate(method, path)
+            elif path.startswith("/planner"):
+                # ★策划会话（P0）：计划/运行/汇报；CLI 走 X-Planner-Token，UI 同源
+                self._planner(method, path)
             elif path == "/skills/preview":
                 self._skills_preview(method)
             elif path == "/skills/install":
@@ -2316,6 +2541,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, qq_search(kw))
 
     def _qq_spectrum(self):
+        global _spectrum_last_req
+        q = parse_qs(urlsplit(self.path).query)
+        # ★只有「正在放歌」的前端会带 ?playing=1；空闲轮询不再拉起采集进程
+        if (q.get("playing", [""])[0] or "").lower() in ("1", "true", "yes"):
+            _spectrum_last_req = time.time()
+            start_spectrum(force=True)
         data = _read_spectrum()
         age = spectrum_age()
         bars = data.get("bars") or []
@@ -2388,6 +2619,93 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def _pick_save_path(self, name: str, flt: str, title: str, initial_dir: str = "") -> str:
+        """弹一个 Windows 原生「另存为」框，返回用户选定的路径；取消 → 空串。
+
+        ⚠ 只让**用户选路径**，接口本身不接受 path 参数 —— 避免本地脚本借接口往任意位置写文件。
+        """
+        script = os.path.join(TOOLS_DIR, "pick_save.ps1")
+        if not os.path.isfile(script):
+            raise RuntimeError("缺少 tools/pick_save.ps1")
+        out = os.path.join(tempfile.gettempdir(),
+                           "cocraft-save-%d-%d.txt" % (os.getpid(), int(time.time() * 1000)))
+        proc = None
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass",
+                 "-File", script, "-OutFile", out,
+                 "-Name", str(name or "export.txt"),
+                 "-Filter", str(flt or "All files (*.*)|*.*"),
+                 "-Title", str(title or "Save file"),
+                 "-InitialDir", str(initial_dir or "")],
+                capture_output=True, text=True, timeout=600, creationflags=NO_WINDOW,
+            )
+            try:
+                with open(out, "r", encoding="utf-8", errors="replace") as fh:
+                    return fh.read().strip().lstrip("\ufeff")
+            except OSError:
+                return ""
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("保存对话框超时（600s）")
+        except Exception as exc:  # noqa: BLE001
+            detail = (proc.stderr or "")[:300] if proc is not None else ""
+            raise RuntimeError(("%s: %s%s" % (type(exc).__name__, exc,
+                                              (" · " + detail) if detail else "")))
+        finally:
+            try:
+                if os.path.exists(out):
+                    os.remove(out)
+            except OSError:
+                pass
+
+    def _save_text(self, method: str):
+        """把前端已经拼好的文本用原生「另存为」框落盘（运行记录等）。"""
+        if method != "POST":
+            self._send_json(405, {"ok": False, "error": "POST only"})
+            return
+        b = self._read_json_body() or {}
+        text = str(b.get("text") or "")
+        raw = text.encode("utf-8")
+        if len(raw) > 20 * 1024 * 1024:
+            self._send_json(413, {"ok": False, "error": "内容太大（>20 MB）"})
+            return
+        name = os.path.basename(str(b.get("name") or "cocraft-export.txt").replace("\\", "/"))
+        if not name:
+            name = "cocraft-export.txt"
+        ext = os.path.splitext(name)[1].lower()
+        filters = {
+            ".json": "JSON (*.json)|*.json|All files (*.*)|*.*",
+            ".csv": "CSV (*.csv)|*.csv|All files (*.*)|*.*",
+            ".md": "Markdown (*.md)|*.md|All files (*.*)|*.*",
+            ".txt": "Text (*.txt)|*.txt|All files (*.*)|*.*",
+        }
+        flt = filters.get(ext, "All files (*.*)|*.*")
+        home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        desktop = ""
+        for cand in (os.path.join(home, "Desktop"), os.path.join(home, "OneDrive", "Desktop")):
+            if os.path.isdir(cand):
+                desktop = cand
+                break
+        if not desktop:
+            desktop = home
+        try:
+            path = self._pick_save_path(name, flt, "Save export", desktop)
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "error": "保存对话框没能打开：%s" % exc})
+            return
+        if not path:
+            self._send_json(200, {"ok": False, "canceled": True})
+            return
+        if ext and not path.lower().endswith(ext):
+            path += ext
+        try:
+            with open(path, "wb") as fh:
+                fh.write(raw)
+        except OSError as exc:
+            self._send_json(500, {"ok": False, "error": "写入失败：%s" % exc, "path": path})
+            return
+        self._send_json(200, {"ok": True, "canceled": False, "path": path, "bytes": len(raw)})
+
     def _live_root_pick(self, method: str):
         """弹一个 Windows 原生文件夹选择框；取消返回 {ok:false, canceled:true}。"""
         if method != "POST":
@@ -2410,17 +2728,36 @@ class Handler(BaseHTTPRequestHandler):
         self._pick_path("pick_folder.ps1", "pickdir", "选择文件夹")
 
     def _projectroot(self):
-        """新建项目的默认位置：ACP = 当前 agent 的生效工作目录（agent 自己的 cwd，无则共享基线）；
-        其它引擎（opencode）= ""，由前端用「当前会话目录」（agent 正在工作的目录）兜底。"""
-        eng = ""
-        root = ""
+        """新建项目的默认父目录。`?scope=session|workflow`（`ui 0.2.109`）
+
+        · session  → 该 agent **自己的客户端/桌面端目录**（`<home>/projects`）；
+                     没有（随包 node / 面板内装的 agent）→ `cocraft/runtime/projects/<agent>`（按 agent 分类）
+        · workflow → `cocraft/runtime/workflow-projects`（工作流专用大文件夹，所有成员共用）
+
+        覆盖：`runtime/state/_project_roots.json`（见 `backend/project_roots.py`）。
+        """
+        import project_roots
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        scope = (q.get("scope") or ["session"])[0] or "session"
+        eng, agent, cfg = "", "", None
         try:
             eng = engines.active_engine_id()
             if eng == "acp":
-                root = str((engines.get_engine("acp").config() or {}).get("cwd") or "")
+                e = engines.get_engine("acp")
+                cfg = e.config() or {}
+                agent = str(cfg.get("id") or e.active_agent_id() or "")
+            elif eng == "opencode":
+                agent = "opencode"
         except Exception:  # noqa: BLE001
-            root = ""
-        self._send_json(200, {"ok": True, "engine": eng, "root": root})
+            cfg = None
+        try:
+            info = project_roots.resolve(scope=scope, agent_id=agent, cfg=cfg)
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "engine": eng, "error": str(exc)})
+            return
+        out = {"ok": True, "engine": eng, "agent": agent}
+        out.update(info)
+        self._send_json(200, out)
 
     def _mkdir(self, method: str):
         """新建项目目录：{base, name} → 在 base 下真正创建一个长期目录（不是缓存）。"""
@@ -2559,6 +2896,23 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
 
+    def _fs_raw(self):
+        """原始字节（图片 / PDF / 音视频预览用）。
+
+        ⚠ 只发 `kind != "text"` 的文件 —— 文本走 `/fs/read`（要的是可编辑的 JSON），
+        这里再发一遍没有意义，还容易被当成"下载任意文件"的口子。
+        """
+        root, path = self._fs_q()
+        try:
+            info = fsview.raw_file(root, path)
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if info.get("kind") == "text":
+            self._send_json(400, {"ok": False, "error": "文本文件请用 /fs/read（这个接口只发预览用的原始字节）"})
+            return
+        self._send_file(info["path"], ctype=info.get("mime") or None)
+
     def _fs_write(self, method: str):
         if method != "POST":
             self._send_json(405, {"error": "POST only"})
@@ -2573,10 +2927,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "data": data})
 
-    # ---------- ★可逆执行：隔离区 + 工作区快照（引擎无关） ----------
+    # ---------- ★可逆执行：忏悔室 + 工作区快照（引擎无关） ----------
 
     def _quarantine_api(self, method: str, path: str):
-        """隔离区：列出 / 详情 / 一键恢复 / 删除 / 手动追加。
+        """忏悔室：列出 / 详情 / 一键恢复 / 删除 / 手动追加。
 
         「先隔离再放行」的产物在这里；恢复 = 把备份拷回**原路径**（目标已存在则不静默覆盖）。
         """
@@ -2588,6 +2942,62 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "data": {
                 "items": snapshots.list_quarantine(),
                 "stats": snapshots.stats()}})
+            return
+        if sub == "policy":
+            # ★低风险删除策略：开不开 / 阈值几星 / 保留几天 / 到期清不清
+            if method == "GET":
+                self._send_json(200, {"ok": True, "data": snapshots.quarantine_config()})
+                return
+            if method != "POST":
+                self._send_json(405, {"error": "GET or POST only"})
+                return
+            b = self._read_json_body() or {}
+            data = snapshots.set_quarantine_config(**b)
+            try:
+                audit.append(
+                    "quarantine",
+                    actor={"kind": "user", "id": "local", "name": "owner"},
+                    action={"kind": "policy", "title": "低风险删除自动隔离策略"},
+                    decision="set", result="ok",
+                    note="启用=%s · 阈值=★%s · 保留=%s 天 · 到期自动清=%s"
+                         % (data.get("enabled"), data.get("maxStar"),
+                            data.get("days"), data.get("cleanup")),
+                    via=self._via())
+            except Exception:                          # noqa: BLE001
+                pass
+            self._send_json(200, {"ok": True, "data": data})
+            return
+        if sub == "plan":
+            if method != "GET":
+                self._send_json(405, {"error": "GET only"})
+                return
+            self._send_json(200, {"ok": True, "data": snapshots.quarantine_plan()})
+            return
+        if sub == "cleanup":
+            # ★按保留期清理：**只清安全项**（hold 永远留着，等用户确认）
+            if method != "POST":
+                self._send_json(405, {"error": "POST only"})
+                return
+            b = self._read_json_body() or {}
+            res = snapshots.cleanup_quarantine(dry_run=bool(b.get("dry_run")))
+            if not res.get("dry_run"):
+                try:
+                    audit.append(
+                        "quarantine",
+                        actor={"kind": "system", "name": "quarantine_keeper"},
+                        action={"kind": "cleanup", "title": "忏悔室到期清理"},
+                        decision="cleanup",
+                        result="ok" if res.get("dropped") else "skipped",
+                        ref={"scope": ",".join(res.get("ids") or [])[:300]},
+                        quarantine=",".join(res.get("dropped") or [])[:300],
+                        note="清理 %d 条 · 释放 %.1f MB · 保留风险项 %d 条"
+                             % (len(res.get("dropped") or []),
+                                (res.get("freed") or 0) / 1048576.0,
+                                len(res.get("held") or [])),
+                        via=self._via())
+                except Exception:                      # noqa: BLE001
+                    pass
+            self._send_json(200, {"ok": True, "data": res})
             return
         if sub == "get":
             qid = (parse_qs(urlsplit(self.path).query).get("id") or [""])[0]
@@ -2610,7 +3020,7 @@ class Handler(BaseHTTPRequestHandler):
             audit.append(
                 "snapshot",
                 actor=self._actor_by_via(),
-                action={"kind": "restore", "title": "从隔离区恢复"},
+                action={"kind": "restore", "title": "从忏悔室恢复"},
                 decision="restore",
                 result=("ok" if res.get("restored") else "failed"),
                 ref={"scope": str(res.get("id") or "")},
@@ -2667,6 +3077,33 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"ok": False, "error": "unknown quarantine route"})
 
+    def _permission_ticket_api(self, method: str):
+        """POST {sessionID, id} → **低风险删除：先隔离，再自动放行**（`ui 0.2.95`）。
+
+        ACP 在 `_ask_permission` 里已经由后端直接处理；这个接口主要给 **OpenCode**
+        （它只有"前端轮询到申请"这一条路）。返回 `{ok, auto, reason, ...}`；
+        任何异常都回 `auto=False`（前端照旧弹窗），**绝不挡住正常审批**。
+        """
+        if method != "POST":
+            self._send_json(405, {"ok": False, "error": "POST only"})
+            return
+        b = self._read_json_body() or {}
+        sid = str(b.get("sessionID") or b.get("session") or "")
+        pid = str(b.get("id") or b.get("perm") or "")
+        if not sid or not pid:
+            self._send_json(400, {"ok": False, "error": "需要 sessionID 与 id"})
+            return
+        try:
+            eng = engines.active_engine()
+            fn = getattr(eng, "auto_ticket", None)
+            res = fn(sid, pid) if callable(fn) else {"ok": True, "auto": False,
+                                                     "reason": "该引擎不支持低风险删除自动隔离"}
+        except Exception as exc:                       # noqa: BLE001
+            self._send_json(200, {"ok": True, "auto": False,
+                                  "reason": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        self._send_json(200, res if isinstance(res, dict) else {"ok": True, "auto": False})
+
     def _snapshot_api(self, method: str, path: str):
         """工作区快照：列 / 落 / 比 / 撤销（引擎无关，不依赖 git）。"""
         sub = path[len("/snapshot"):].strip("/")
@@ -2678,6 +3115,21 @@ class Handler(BaseHTTPRequestHandler):
         if sub == "info":
             self._send_json(200, {"ok": True, "data": {"latest": snapshots.list_snapshots(scope)[:1],
                                                        "stats": snapshots.stats()}})
+            return
+        # ★轮快照配置（`ui 0.2.85`）：群聊 / 工作流的轮快照要不要带内容（带内容才能一键退回）
+        if sub == "config":
+            if method == "POST":
+                b = self._read_json_body() or {}
+                cfg = snapshots.set_turn_config(
+                    groupContent=b.get("groupContent") if isinstance(b.get("groupContent"), bool) else None,
+                    panelContent=b.get("panelContent") if isinstance(b.get("panelContent"), bool) else None)
+                self._send_json(200, {"ok": True, "data": cfg})
+            else:
+                self._send_json(200, {"ok": True, "data": snapshots.turn_config()})
+            return
+        # ★所有 scope 的最新一次快照（审计页「轮快照」列表；with_content 才能退回）
+        if sub == "scopes":
+            self._send_json(200, {"ok": True, "data": {"items": snapshots.list_scopes(40)}})
             return
         if sub == "take" and method == "POST":
             b = self._read_json_body() or {}
@@ -2754,10 +3206,88 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- ★审计链（append-only + 哈希链：谁批准了什么、能不能证明没被改过） ----------
 
+    def _cu_status(self):
+        """★通用工具（cu）：工具目录 + 当前权限/租约/宿主状态。
+
+        ⚠ **只读**：不启动 UIA 宿主、不启动浏览器、不抢租约 —— 面板打开列表不该有副作用。
+        ⚠ 目录来自 `backend/computer/catalog.py`（唯一一份说明，面板/文档都读它）。
+        """
+        try:
+            from computer import catalog, cdp, gate, lease, uia
+            out = {"ok": True,
+                   "catalog": catalog.public(),
+                   "gate": gate.status(),
+                   "lease": lease.current()}
+            try:
+                out["uia"] = uia.host_state()
+            except Exception as exc:  # noqa: BLE001
+                out["uia"] = {"running": False, "error": str(exc)[:200]}
+            try:
+                st = cdp.status()
+                out["browser"] = {"running": bool(st.get("running")),
+                                  "port": st.get("port"),
+                                  "headless": bool(st.get("headless")),
+                                  "exe": st.get("exe") or "",
+                                  "started": st.get("started") or ""}
+            except Exception as exc:  # noqa: BLE001
+                out["browser"] = {"running": False, "error": str(exc)[:200]}
+            try:
+                from computer import macro as cu_macro
+                out["macros"] = cu_macro.summary()
+            except Exception as exc:  # noqa: BLE001
+                out["macros"] = {"count": 0, "error": str(exc)[:200]}
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+        self._send_json(200, out)
+
+    def _cu_config(self, method: str):
+        """★「允许桌面操作」开关（面板 → 通用工具）。
+
+        只改 `runtime/state/_cu.json` 的 `actions`（allow / deny），黑名单 / 危险词原样保留。
+        ⚠ 这是**本机治理开关**：开了以后单聊 agent 的动作仍建议带 `--allow-actions`（= 面板会弹一次确认）；
+          工作流按成员自己的权限走，**不受这里影响**（`orchestrator` 注入的是成员等级）。
+        """
+        from computer import gate
+        if method != "POST":
+            self._send_json(200, {"ok": True, "gate": gate.status()})
+            return
+        body = self._read_json_body() or {}
+        want = str(body.get("actions") or "").strip().lower()
+        if want not in ("allow", "deny"):
+            self._send_json(400, {"ok": False, "error": "actions 只能是 allow 或 deny"})
+            return
+        path = gate.CONFIG_FILE
+        try:
+            data = {}
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            if not isinstance(data, dict):
+                data = {}
+            data["actions"] = want
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "error": "写 _cu.json 失败：%s" % exc})
+            return
+        try:  # 治理动作也留痕（谁把开关打开了）
+            from computer import audit as cu_audit
+            via = "ui" if self.headers.get("X-Cocraft-UI") else "api"
+            cu_audit.record("config", True, action_kind="action", decision="allowed",
+                            note="actions=%s via=%s" % (want, via))
+        except Exception:  # noqa: BLE001
+            pass
+        self._send_json(200, {"ok": True, "actions": want, "gate": gate.status(),
+                              "file": path})
+
     def _audit_api(self, method: str, path: str):
         """列表 / 统计 / 导出 / 校验。
 
-        ⚠ 这里**只读** —— 写入口是 `audit.append()`（工作台审批、群聊桥、隔离区恢复/撤销）。
+        ⚠ 这里**只读** —— 写入口是 `audit.append()`（工作台审批、群聊桥、忏悔室恢复/撤销）。
         ⚠ 不记成员正文，只有决定 + 命令原文 + 目标路径 + 隔离记录 id（见 `backend/audit.py`）。
         """
         sub = path[len("/audit"):].strip("/")
@@ -2818,6 +3348,45 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, {"ok": True, "data": {"markdown": text}})
             return
+        if sub == "brief":
+            # ★人话简报（L2）：**确定性生成**，同一份记录永远同一份正文（只有生成时间会变）。
+            #   format=md（默认，一页纸）/ csv（9 列人话版，给 Excel 看）
+            fmt = (_one("format", "md") or "md").lower()
+            if fmt in ("markdown", "human", "text", "md"):
+                fmt = "md"
+            elif fmt in ("csv", "humancsv", "human-csv"):
+                fmt = "humancsv"
+            else:
+                self._send_json(400, {"ok": False, "error": "format 只支持 md / csv"})
+                return
+            try:
+                limit = int(_one("limit", "0") or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            since, until = _num("since"), _num("until")
+            items = audit.records(limit=limit, since=since, until=until, **_flt())
+            if fmt == "humancsv":
+                text = audit.human_csv(items)
+                ctype, ext, base = "text/csv; charset=utf-8", ".csv", "cocraft-audit-human"
+            else:
+                facts = audit.brief(items=items, since=since, until=until, limit=limit)
+                text = audit.render_brief(facts)
+                ctype, ext, base = "text/markdown; charset=utf-8", ".md", "cocraft-audit-brief"
+            if _one("download") in ("1", "true", "yes"):
+                body = text.encode("utf-8") if fmt == "humancsv" else text.encode("utf-8-sig")
+                stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="%s-%s%s"' % (base, stamp, ext))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._send_json(200, {"ok": True, "data": {
+                ("csv" if fmt == "humancsv" else "markdown"): text}})
+            return
         if sub == "archive" and method == "POST":
             # ★保留期：手动把最旧的一段移进归档（平时追加时也会自动检查阈值）
             b = self._read_json_body() or {}
@@ -2832,6 +3401,99 @@ class Handler(BaseHTTPRequestHandler):
                 keep_bytes=(int(keep_mb * 1024 * 1024) if keep_mb is not None else None),
                 via=self._via())
             self._send_json(200 if res.get("ok") else 400, res)
+            return
+        if sub == "export/save" and method == "POST":
+            # ★「另存为…」：弹原生保存框，由**用户**选路径；接口不接受 path 参数。
+            fmt = (_one("format", "json") or "json").lower()
+            if fmt == "markdown":
+                fmt = "md"
+            if fmt in ("human", "humancsv", "human-csv"):
+                fmt = "humancsv"
+            if fmt in ("brief", "report-human"):
+                fmt = "brief"
+            if fmt not in ("json", "csv", "md", "brief", "humancsv"):
+                self._send_json(400, {"ok": False, "error": "format 只支持 json / csv / md / brief / humancsv"})
+                return
+            try:
+                limit = int(_one("limit", "0") or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            run_id = str(_one("run", "") or "").strip()
+            safe_run = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in run_id)
+            suffix = ("-" + safe_run) if safe_run else ""
+            if fmt == "json":
+                name = "cocraft-audit%s-%s.json" % (suffix, stamp)
+                flt = "JSON (*.json)|*.json|All files (*.*)|*.*"
+                title = "Save audit export (JSON)"
+                ext = ".json"
+            elif fmt == "csv":
+                name = "cocraft-audit%s-%s.csv" % (suffix, stamp)
+                flt = "CSV (*.csv)|*.csv|All files (*.*)|*.*"
+                title = "Save audit export (CSV)"
+                ext = ".csv"
+            elif fmt == "brief":
+                name = "cocraft-audit-brief%s-%s.md" % (suffix, stamp)
+                flt = "Markdown (*.md)|*.md|All files (*.*)|*.*"
+                title = "Save AI operation brief (Markdown)"
+                ext = ".md"
+            elif fmt == "humancsv":
+                name = "cocraft-audit-human%s-%s.csv" % (suffix, stamp)
+                flt = "CSV (*.csv)|*.csv|All files (*.*)|*.*"
+                title = "Save AI operation brief (CSV, human)"
+                ext = ".csv"
+            else:
+                name = "cocraft-audit-report%s-%s.md" % (suffix, stamp)
+                flt = "Markdown (*.md)|*.md|All files (*.*)|*.*"
+                title = "Save audit report (Markdown)"
+                ext = ".md"
+            home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+            desktop = ""
+            for cand in (os.path.join(home, "Desktop"), os.path.join(home, "OneDrive", "Desktop")):
+                if os.path.isdir(cand):
+                    desktop = cand
+                    break
+            if not desktop:
+                desktop = home
+            try:
+                path = self._pick_save_path(name, flt, title, desktop)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(500, {"ok": False, "error": "保存对话框没能打开：%s" % exc})
+                return
+            if not path:
+                self._send_json(200, {"ok": False, "canceled": True})
+                return
+            if not path.lower().endswith(ext):
+                path += ext
+            records = None
+            if fmt == "md":
+                body = audit.report(since=_num("since"), until=_num("until"),
+                                    limit=limit, **_flt()).encode("utf-8-sig")
+            elif fmt == "brief":
+                facts = audit.brief(since=_num("since"), until=_num("until"),
+                                    limit=limit, **_flt())
+                body = audit.render_brief(facts).encode("utf-8-sig")
+            elif fmt == "humancsv":
+                items = audit.records(limit=limit, since=_num("since"),
+                                      until=_num("until"), **_flt())
+                records = len(items)
+                body = audit.human_csv(items).encode("utf-8")
+            else:
+                data = audit.export(since=_num("since"), until=_num("until"),
+                                    limit=limit, **_flt())
+                records = data.get("records")
+                if fmt == "csv":
+                    body = audit.to_csv(data["items"]).encode("utf-8-sig")
+                else:
+                    body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(body)
+            except OSError as exc:
+                self._send_json(500, {"ok": False, "error": "写入失败：%s" % exc, "path": path})
+                return
+            self._send_json(200, {"ok": True, "canceled": False, "path": path,
+                                  "bytes": len(body), "records": records, "format": fmt})
             return
         if sub == "export":
             if method != "GET":
@@ -3180,6 +3842,241 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True, "level": write_perm_level(body.get("level"))})
         return self._send_json(405, {"error": "GET/POST only"})
 
+    # ---------- 策划会话（Planner，P0） ----------
+
+    def _planner_auth_ok(self, sid: str) -> bool:
+        """CLI 用 X-Planner-Token；同源面板 UI（localhost）默认放行。"""
+        tok = str(self.headers.get("X-Planner-Token") or "").strip()
+        if tok and sid:
+            try:
+                return bool(planner.auth_token(sid, tok))
+            except Exception:
+                return False
+        host = str(self.headers.get("Host") or "")
+        return host.startswith("127.0.0.1") or host.startswith("localhost") or host.startswith("[::1]")
+
+    def _planner(self, method: str, path: str):
+        """策划会话 HTTP API（本机）。
+        GET  /planner/sessions?cwd=&limit=
+        POST /planner/session          {title,cwd,goal,plannerAgent} -> 含 token（仅创建时返回）
+        GET  /planner/session?id=
+        DELETE /planner/session?id=
+        GET  /planner/plan?id=
+        POST /planner/plan             {id, plan, confirm?, expectVersion?}
+        POST /planner/run/start        {id, note?}
+        POST /planner/run/cancel       {id}
+        GET  /planner/status?id=
+        GET  /planner/report?id=
+        """
+        try:
+            qs = parse_qs(urlsplit(self.path).query)
+            qid = (qs.get("id") or [""])[0]
+            if path == "/planner/sessions":
+                if method != "GET":
+                    self._send_json(405, {"ok": False, "error": "GET only"}); return
+                cwd = (qs.get("cwd") or [""])[0]
+                limit = int((qs.get("limit") or ["50"])[0] or 50)
+                self._send_json(200, {"ok": True, "sessions": planner.list_sessions(limit=limit, cwd=cwd)}); return
+
+            if path == "/planner/session":
+                if method == "POST":
+                    b = self._read_json_body() or {}
+                    sess = planner.create_session(title=b.get("title") or "", cwd=b.get("cwd") or "",
+                                                  goal=b.get("goal") or "", planner_agent=b.get("plannerAgent") or b.get("agent") or "")
+                    self._send_json(200, {"ok": True, "session": planner.public_session(sess), "token": sess.get("token"),
+                                          "env": {"COCRAFT_PLANNER_SESSION": sess.get("id"), "COCRAFT_PLANNER_TOKEN": sess.get("token")}}); return
+                sid = qid or str((self._read_json_body() or {}).get("id") or "")
+                if not sid:
+                    self._send_json(400, {"ok": False, "error": "缺少 id"}); return
+                if not self._planner_auth_ok(sid):
+                    self._send_json(401, {"ok": False, "error": "planner token 无效"}); return
+                if method == "GET":
+                    sess = planner.get_session(sid)
+                    if not sess:
+                        self._send_json(404, {"ok": False, "error": "策划会话不存在"}); return
+                    self._send_json(200, {"ok": True, "session": sess}); return
+                if method == "DELETE":
+                    ok = planner.delete_session(sid)
+                    self._send_json(200, {"ok": ok}); return
+                self._send_json(405, {"ok": False, "error": "GET/POST/DELETE only"}); return
+
+            if path == "/planner/plan":
+                if method == "GET":
+                    sid = qid
+                    if not sid:
+                        self._send_json(400, {"ok": False, "error": "缺少 id"}); return
+                    if not self._planner_auth_ok(sid):
+                        self._send_json(401, {"ok": False, "error": "planner token 无效"}); return
+                    res = planner.get_plan(sid)
+                    self._send_json(200, {"ok": True, **res}); return
+                if method == "POST":
+                    b = self._read_json_body() or {}
+                    sid = str(b.get("id") or qid or "").strip()
+                    if not sid:
+                        self._send_json(400, {"ok": False, "error": "缺少 id"}); return
+                    if not self._planner_auth_ok(sid):
+                        self._send_json(401, {"ok": False, "error": "planner token 无效"}); return
+                    plan_obj = b.get("plan")
+                    if plan_obj is None:
+                        self._send_json(400, {"ok": False, "error": "缺少 plan"}); return
+                    status = "confirmed" if b.get("confirm") else None
+                    res = planner.set_plan(sid, plan_obj, expect_version=b.get("expectVersion"), status=status)
+                    self._send_json(200, {"ok": True, **res}); return
+                self._send_json(405, {"ok": False, "error": "GET/POST only"}); return
+
+            if path == "/planner/plan/diff" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                plan_obj = b.get("plan")
+                if plan_obj is None:
+                    self._send_json(400, {"ok": False, "error": "缺少 plan"}); return
+                res = planner.plan_diff(sid, plan_obj)
+                self._send_json(200, res); return
+
+            if path == "/planner/run/start" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                res = planner.start_run(sid, note=b.get("note") or "")
+                self._send_json(200, res); return
+
+            if path == "/planner/run/cancel" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                res = planner.cancel_run(sid)
+                self._send_json(200, res); return
+
+            if path == "/planner/status" and method == "GET":
+                sid = qid
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                res = planner.status(sid)
+                self._send_json(200, {"ok": True, **res}); return
+
+            if path == "/planner/report" and method == "GET":
+                sid = qid
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                rep = planner.report(sid)
+                self._send_json(200, {"ok": True, "report": rep, "markdown": rep.get("markdown")}); return
+
+            # ---- P0.5 接力（HANDOFF.md / 换策划 agent） ----
+            if path == "/planner/handoff":
+                if method == "GET":
+                    sid = qid
+                    if not sid or not self._planner_auth_ok(sid):
+                        self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                    if (qs.get("context") or [""])[0] == "1":
+                        self._send_json(200, planner.handoff_context(sid)); return
+                    self._send_json(200, planner.load_handoff(sid)); return
+                if method == "POST":
+                    b = self._read_json_body() or {}
+                    sid = str(b.get("id") or qid or "").strip()
+                    if not sid or not self._planner_auth_ok(sid):
+                        self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                    res = planner.write_handoff(sid, reason=b.get("reason") or "manual", note=b.get("note") or "", to_agent=b.get("toAgent") or "")
+                    self._send_json(200, res); return
+                self._send_json(405, {"ok": False, "error": "GET/POST only"}); return
+
+            if path == "/planner/switch-agent" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                res = planner.switch_planner_agent(sid, b.get("agent") or b.get("toAgent") or b.get("newAgent") or "", note=b.get("note") or "")
+                self._send_json(200, res); return
+
+            if path == "/planner/handoff/auto" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                res = planner.maybe_auto_handoff(sid, b.get("used") or 0, b.get("size") or 0, threshold=float(b.get("threshold") or 0.8), note=b.get("note") or "")
+                self._send_json(200, res); return
+
+            if path == "/planner/recover" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if sid and not self._planner_auth_ok(sid):
+                    self._send_json(401, {"ok": False, "error": "planner token 无效"}); return
+                res = planner.recover(sid or None)
+                self._send_json(200, res); return
+
+            if path == "/planner/bind" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                res = planner.bind_chat_session(sid, b.get("chatSessionId") or b.get("sessionId") or "", engine=b.get("engine") or "")
+                self._send_json(200, res); return
+
+            if path == "/planner/resume" and method == "GET":
+                sid = qid
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                rec = planner.recover(sid)
+                ctx = planner.handoff_context(sid)
+                self._send_json(200, {"ok": True, "session": planner.get_session(sid), "recovered": rec, "context": ctx, "plan": planner.load_plan(sid)}); return
+
+
+            if path == "/planner/run/retry" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                res = planner.run_retry(sid, mode=b.get("mode") or "retry", note=b.get("note") or "")
+                self._send_json(200, res); return
+
+            if path == "/planner/approvals" and method == "GET":
+                sid = qid
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                self._send_json(200, planner.approvals(sid)); return
+
+            if path == "/planner/isolation/list" and method == "GET":
+                sid = qid
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                self._send_json(200, planner.isolation_list(sid)); return
+
+            if path == "/planner/isolation/apply" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                self._send_json(200, planner.isolation_apply(sid, member_id=b.get("memberId") or "", all_members=bool(b.get("all")), force=bool(b.get("force")))); return
+
+            if path == "/planner/isolation/cleanup" and method == "POST":
+                b = self._read_json_body() or {}
+                sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid):
+                    self._send_json(401 if sid else 400, {"ok": False, "error": "planner token 无效" if sid else "缺少 id"}); return
+                self._send_json(200, planner.isolation_cleanup(sid)); return
+
+
+            if path == "/planner/plans" and method == "GET":
+                sid = qid
+                if not sid or not self._planner_auth_ok(sid): self._send_json(401 if sid else 400, {"ok":False,"error":"planner token 无效" if sid else "缺少 id"}); return
+                self._send_json(200, planner.list_plan_variants(sid)); return
+            if path == "/planner/plans/create" and method == "POST":
+                b = self._read_json_body() or {}; sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid): self._send_json(401 if sid else 400, {"ok":False,"error":"planner token 无效" if sid else "缺少 id"}); return
+                self._send_json(200, planner.create_plan_variant(sid, b.get("key") or "", b.get("name") or "", b.get("fromKey") or b.get("from") or "")); return
+            if path == "/planner/plans/switch" and method == "POST":
+                b = self._read_json_body() or {}; sid = str(b.get("id") or qid or "").strip()
+                if not sid or not self._planner_auth_ok(sid): self._send_json(401 if sid else 400, {"ok":False,"error":"planner token 无效" if sid else "缺少 id"}); return
+                self._send_json(200, planner.switch_plan_variant(sid, b.get("key") or "main")); return
+            self._send_json(404, {"ok": False, "error": "unknown planner route: %s" % path})
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
+
     def _skills_preview(self, method: str):
         """技能安装·预览：给一个来源，列出里面有啥技能（不写盘）。引擎无关。"""
         if method != "POST":
@@ -3474,10 +4371,12 @@ class Handler(BaseHTTPRequestHandler):
         POST /orchestrate/workflows/from-run {id, name?}      ★旧 run 另存为工作流（按成员去重）
         GET  /orchestrate/run?id=          单个任务（含成员结果 / 待批 / 仲裁）
         GET  /orchestrate/pending?run=     待批权限
+        GET  /orchestrate/forms?run=       待回答的表单（agent 追问）
         POST /orchestrate/start            {task, cwd?, members:[{engine,name,role}]}
         POST /orchestrate/cancel           {id, member?}
         POST /orchestrate/member           {run, member, permLevel}
         POST /orchestrate/permission       {id, decision: once|always|reject}
+        POST /orchestrate/form             {id, answer? , decline?}
         POST /orchestrate/arbitrate        {id, engine, name?}
         POST /orchestrate/delete           {id}         删除已结束的运行记录
         """
@@ -3507,6 +4406,10 @@ class Handler(BaseHTTPRequestHandler):
                 rid = (q.get("run") or [""])[0]
                 self._send_json(200, {"ok": True, "pending": orch.pending_permissions(rid)})
                 return
+            if method == "GET" and sub == "forms":
+                rid = (q.get("run") or [""])[0]
+                self._send_json(200, {"ok": True, "forms": orch.pending_forms(rid)})
+                return
             body = self._read_json_body() or {}
             if method == "POST" and sub == "workflows/save":
                 wf = orch.save_workflow(body)
@@ -3535,7 +4438,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and sub == "start":
                 run = orch.start_run(body.get("task"), body.get("cwd") or "",
                                      body.get("members"), body.get("title") or "",
-                                     body.get("workflowId") or "")
+                                     body.get("workflowId") or "",
+                                     body.get("fromRunId") or "")
                 self._send_json(200, {"ok": True, "run": run})
                 return
             if method == "POST" and sub == "cancel":
@@ -3547,10 +4451,31 @@ class Handler(BaseHTTPRequestHandler):
                                       body.get("member") or "", body)
                 self._send_json(200, {"ok": True, "run": run})
                 return
+            if method == "POST" and sub == "apply":
+                # ★并行隔离（P0-1）：把某个成员的独立工作区改动应用回主目录。
+                #   冲突不报 4xx —— 让前端拿到 conflicts 列表自己决定（force 再试）。
+                res = orch.apply_member_isolation(
+                    body.get("id") or body.get("run") or "",
+                    body.get("member") or "", bool(body.get("force")))
+                self._send_json(200, dict({"ok": bool(res.get("ok"))}, **res))
+                return
+            if method == "POST" and sub == "isolation/cleanup":
+                res = orch.cleanup_isolation(body.get("id") or body.get("run") or "")
+                self._send_json(200, dict({"ok": True}, **res))
+                return
             if method == "POST" and sub == "permission":
-                okv = orch.reply_permission(body.get("id"), body.get("decision") or "")
+                okv = orch.reply_permission(body.get("id"), body.get("decision") or "",
+                                            via=str(body.get("via") or self._via() or "api"))
                 if not okv:
                     self._send_json(404, {"ok": False, "error": "这条申请已结算或不存在"})
+                    return
+                self._send_json(200, {"ok": True})
+                return
+            if method == "POST" and sub == "form":
+                okv = orch.reply_form(body.get("id"), body.get("answer"),
+                                      bool(body.get("decline")))
+                if not okv:
+                    self._send_json(404, {"ok": False, "error": "这个表单已结算或不存在"})
                     return
                 self._send_json(200, {"ok": True})
                 return
@@ -3733,6 +4658,162 @@ class Server(ThreadingHTTPServer):
         super().server_bind()
 
 
+QUAR_REPORT_FILE = os.path.join(STATE_DIR, "_quarantine_report.json")
+QUAR_REMIND_FILE = os.path.join(STATE_DIR, "_quarantine_remind.json")
+AGENT_UPD_NOTIFY_FILE = os.path.join(STATE_DIR, "_agent_updates_notify.json")
+
+
+def agent_updates_keeper() -> None:
+    """★后台检查 agent 新版（默认每 6 小时；不自动装，除非用户在面板里打开）。
+
+    只写系统气泡 + `_agent_updates_notify.json` 去重；面板启动时还会通过
+    `/agent/updates` 再拿一次（10 分钟缓存），所以不依赖这个线程。
+    """
+    import time as _t
+    while True:
+        try:
+            res = agent_install.auto_tick()
+            items = res.get("items") or []
+            node = None
+            try:
+                node = node_update.check(force=False)
+            except Exception:                  # noqa: BLE001
+                node = None
+            has_node = bool(node and node.get("hasUpdate"))
+            total = len(items) + (1 if has_node else 0)
+            if total:
+                sig = "|".join("%s@%s" % (x.get("id"), x.get("latest")) for x in items)
+                if has_node:
+                    sig += "|node@" + str(node.get("latest") or "")
+                old = ""
+                try:
+                    with open(AGENT_UPD_NOTIFY_FILE, "r", encoding="utf-8") as fh:
+                        old = str((json.load(fh) or {}).get("sig") or "")
+                except Exception:              # noqa: BLE001
+                    old = ""
+                if sig != old:
+                    write_notify("有 %d 项可以更新（Agent / Node）" % total,
+                                 "打开「设置 → 安装 Agent」查看；自动更新默认关闭。", True)
+                    try:
+                        with open(AGENT_UPD_NOTIFY_FILE, "w", encoding="utf-8", newline="\n") as fh:
+                            json.dump({"sig": sig, "ts": _t.time()}, fh, ensure_ascii=False)
+                    except Exception:          # noqa: BLE001
+                        pass
+        except Exception:                          # noqa: BLE001
+            pass
+        _t.sleep(6 * 3600)
+
+
+def quarantine_keeper() -> None:
+    """★忏悔室保留期（`ui 0.2.95`）：每 30 分钟算一次。
+
+    * **到期前**（默认 24h）：发一次系统气泡 + 横幅，提醒用户检查项目是否完整；
+    * **到期**：先提醒，**宽限 `remindHours` 小时**后再清 `plan.due`
+      （原件已恢复 / 本来就是 ★ 可再生成）；机器关机也不会"一开机就清掉"；
+      `plan.hold`（git 跟踪文件已缺失 / 无法判定）**永久保留**，每天最多提醒一次；
+    * 结果写 `runtime/state/_quarantine_report.json`，面板启动时读它显示横幅。
+    """
+    import time as _t
+    while True:
+        try:
+            plan = snapshots.quarantine_plan()
+            cfg = plan.get("config") or {}
+            now = _t.time()
+            reminded = {}
+            try:
+                with open(QUAR_REMIND_FILE, "r", encoding="utf-8") as fh:
+                    reminded = json.load(fh) or {}
+            except Exception:                          # noqa: BLE001
+                reminded = {}
+            soon_all = {str(e.get("id")): (reminded.get("soon") or {}).get(str(e.get("id"))) or 0
+                        for e in (plan.get("soon") or []) if e.get("id")}
+            new_soon = [qid for qid, ts in soon_all.items() if not ts]
+            if new_soon:
+                for qid in new_soon:
+                    soon_all[qid] = now
+                write_notify("忏悔室即将清理",
+                             "有 %d 条「低风险删除」记录快到期了。点开「工具 → 忏悔室」"
+                             "确认项目文件是否完整；不确定就点「恢复全部」。" % len(new_soon),
+                             True)
+            remind_h = float(cfg.get("remindHours") if cfg.get("remindHours") is not None else 24)
+            remind_h = max(1.0, remind_h)
+
+            # ★到期不立刻清：先提醒，宽限 remind_h 小时后再清。
+            #   （机器在提醒窗口里一直关机时，下次启动也不会"一开机就清掉"）
+            due_seen = dict(reminded.get("due") or {})
+            fresh_due, ready, live_due = [], [], set()
+            for e in (plan.get("due") or []):
+                qid = str(e.get("id") or "")
+                if not qid:
+                    continue
+                live_due.add(qid)
+                t0 = float(due_seen.get(qid) or 0)
+                if not t0:
+                    due_seen[qid] = now
+                    fresh_due.append(qid)
+                elif now - t0 >= remind_h * 3600.0:
+                    ready.append(qid)
+            due_seen = {k: v for k, v in due_seen.items() if k in live_due}
+            if fresh_due:
+                write_notify("忏悔室有 %d 条已到期" % len(fresh_due),
+                             "为了让你先检查项目文件是否完整，**%d 小时后**才会自动清理"
+                             "（只清安全项）。现在打开「工具 → 忏悔室」可恢复或手动删除。"
+                             % int(remind_h), True)
+
+            hold_n = len(plan.get("hold") or [])
+            today = _t.strftime("%Y-%m-%d", _t.localtime(now))
+            if hold_n and (reminded.get("holdDay") != today):
+                write_notify("忏悔室有 %d 条需要你确认" % hold_n,
+                             "这些记录已到期，但涉及 git 跟踪文件或无法判断能否再生成，"
+                             "**不会自动清理**。请打开「工具 → 忏悔室」检查后手动删除。", True)
+            reminded = {"soon": soon_all, "holdDay": today if hold_n else reminded.get("holdDay"),
+                        "due": due_seen}
+            try:
+                with open(QUAR_REMIND_FILE, "w", encoding="utf-8", newline="\n") as fh:
+                    json.dump(reminded, fh, ensure_ascii=False)
+            except Exception:                          # noqa: BLE001
+                pass
+
+            report = {"at": now, "counts": plan.get("counts"),
+                      "next_expire_at": plan.get("next_expire_at"),
+                      "held": hold_n, "dropped": 0, "freed": 0}
+            if ready and cfg.get("cleanup"):
+                res = snapshots.cleanup_quarantine(ids=ready)
+                report["dropped"] = len(res.get("dropped") or [])
+                report["freed"] = res.get("freed") or 0
+                if report["dropped"]:
+                    write_notify("忏悔室已自动清理",
+                                 "清理 %d 条（释放 %.1f MB）；%d 条风险项仍保留。"
+                                 % (report["dropped"], report["freed"] / 1048576.0,
+                                    len(res.get("held") or [])), False)
+            try:
+                tmp = QUAR_REPORT_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                    json.dump(report, fh, ensure_ascii=False)
+                os.replace(tmp, QUAR_REPORT_FILE)
+            except Exception:                          # noqa: BLE001
+                pass
+        except Exception:                              # noqa: BLE001
+            pass
+        _t.sleep(1800)
+
+
+def confessional_git_keeper() -> None:
+    """★忏悔室按 git 提交出清（`ui 0.2.100`）：每分钟看一次 HEAD。
+
+    首次见到项目只记基线（不会把旧记录突然清空）；之后检测到新 commit 才清。
+    只清提交前、且旧内容能在 git 对象库找到的记录；找不到的保留并提示。
+    """
+    import time as _t
+    _t.sleep(5)
+    while True:
+        try:
+            confessional_git.clean_all()
+        except Exception:                          # noqa: BLE001
+            pass
+        _t.sleep(60)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="OpenCode 自建界面的本地代理")
     parser.add_argument("--host", default="127.0.0.1")
@@ -3812,11 +4893,14 @@ def main() -> int:
 
     start_music_daemon()                      # 拉起 SMTC 采集进程（QQ音乐联动）
     threading.Thread(target=music_keeper, daemon=True).start()
-    start_spectrum()                          # 拉起频谱采集进程（真·音频条）
+    # ★频谱不再开机常驻：等前端「正在放歌」的 /qq/spectrum?playing=1 再拉起（空闲省 CPU）
     threading.Thread(target=spectrum_keeper, daemon=True).start()
     start_music_service()                     # 拉起网易云音乐服务（面板内搜歌/放歌）
     threading.Thread(target=music_service_keeper, daemon=True).start()
     threading.Thread(target=pty_term.warmup, daemon=True).start()   # 预热面板内终端（可选组件，别让首次点开卡探测）
+    threading.Thread(target=quarantine_keeper, daemon=True).start() # ★忏悔室保留期（提醒 + 到期只清安全项）
+    threading.Thread(target=confessional_git_keeper, daemon=True).start() # ★忏悔室按 git 提交出清
+    threading.Thread(target=agent_updates_keeper, daemon=True).start() # ★后台检查 agent 新版（6h）
 
     # ★预热 ACP agent 探测：detect_all() 要扫盘（冷机实测 2~9s）。
     #   不预热的话，重启后**第一次打开 agent 列表**会明显卡（列表迟迟不出来）。

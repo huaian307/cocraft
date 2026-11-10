@@ -4,8 +4,8 @@ r"""★本地协作编排（不依赖群聊 / 云端账号）—— 第一刀：
 设计目标（见 docs/本地协作-方案.md）：
   * **本机**把一条任务同时派给多个 agent（各自独立 AcpService + 独立会话），收集结果；
   * **不经过 cocraft / WS / 登录**，数据只落 `runtime/state/_orchestrator/`；
-  * 权限与面板**同一份等级**；命中自动放行，否则进**任务级待批队列**等用户逐条批准
-    （fail-closed；破坏性永远要确认）；
+  * **权限由工作流自己持有**（`members[].permLevel`，不再跟随面板）；命中自动放行，否则进
+    **任务级待批队列**等用户逐条批准（fail-closed；破坏性 / 敏感读取永远要确认）；
   * 支持取消 / 超时 / 失败隔离 / 结果持久化；
   * 结果里的「对比 / 逐行差异 / 仲裁」在本地做（前端复用现有渲染函数），
     仲裁 = 再跑一个 reviewer 成员。
@@ -25,9 +25,12 @@ import uuid
 
 import snapshots
 import audit
+import errkind
+import isolation
 from cocraft_agents import (ROLES, allowed_by_level, allow_network, _is_destructive,
-                            _is_net, norm_role, perm_level, role_line)
+                            _is_secret, _is_net, norm_role, role_line)
 from engines import STATE_DIR
+from engines.base import capture_before_allow
 from engines.acp import agents as acp_agents
 from engines.acp.engine import acp_log
 from engines.acp.map_events import now_ms
@@ -38,8 +41,10 @@ RUNS_DIR = os.path.join(ROOT, "runs")
 WORKFLOWS_FILE = os.path.join(STATE_DIR, "_collab_workflows.json")   # ★可复用的工作流（成员/默认任务/画布布局）
 KEEP_WORKFLOWS = 200
 KEEP_RUNS = 60
-ASK_TIMEOUT = float(os.environ.get("COCRAFT_ORCH_ASK_TIMEOUT") or 180)   # 等批准（秒）
-RUN_TIMEOUT = float(os.environ.get("COCRAFT_ORCH_TIMEOUT") or 600)       # 单个成员上限（秒）
+ASK_TIMEOUT = float(os.environ.get("COCRAFT_ORCH_ASK_TIMEOUT") or 1800)   # 等批准（秒；0=不限）
+RUN_TIMEOUT = float(os.environ.get("COCRAFT_ORCH_TIMEOUT") or 1800)       # 单个成员上限（秒；**不含等批准**）
+APPROVALS_FILE = os.path.join(STATE_DIR, "_approvals.json")   # 托盘/热键读取的待批快照
+NOTIFY_FILE = os.path.join(STATE_DIR, "_notify.json")         # 托盘气泡（与前端 B3 共用）
 
 _LOCK = threading.RLock()
 _WF_LOCK = threading.RLock()
@@ -47,6 +52,9 @@ _RUNS: dict = {}          # run_id -> run dict（内存权威；落盘用于重�
 _ACTIVE: dict = {}        # (run_id, member_id) -> {"svc":..., "sid":...}
 _CANCEL: dict = {}        # (run_id, member_id) -> Event
 _PENDING: dict = {}       # perm_id -> {"event": Event, "decision": None, "run":..., "member":...}
+_PENDING_FORMS: dict = {} # form_id -> {"event": Event, "answer": ..., "declined": ...}
+_NOTIFY_STATE = {"run": "", "ts": 0.0}   # 待批气泡节流（同一 run 30s 内不重复弹）
+_FORM_NOTIFY_STATE = {"run": "", "ts": 0.0}
 
 
 # ---------------- 小工具 ----------------
@@ -92,7 +100,8 @@ def _member_public(m: dict) -> dict:
             ("id", "name", "role", "roleLabel", "engine", "status", "output", "error",
              "created", "started", "ended", "tokens", "context", "activities",
              "kind", "sessionID", "cancelled", "files", "pick", "permLevel",
-             "stage", "retryCount")}
+             "stage", "retryCount", "changes", "continuedFrom", "resumed",
+             "isolation", "applied")}
 
 
 def public_run(run: dict) -> dict:
@@ -103,13 +112,67 @@ def public_run(run: dict) -> dict:
             "workflowId": run.get("workflowId") or "",
             "workflowName": run.get("workflowName") or "",
             "created": run.get("created"), "updated": run.get("updated"),
+            "continuedFrom": run.get("continuedFrom") or "",
+            "exploration": bool(run.get("exploration")),
+            "resumedMembers": int(run.get("resumedMembers") or 0),
+            # ★并行隔离（P0-1）：模式 / 原因 / 是否已清理（前端据此显示"独立工作区"徽章）
+            "isolation": dict(run.get("isolation") or {}),
             # ★阶段快照（P4）：状态 / 条件 / 失败策略 / 重试都在里面
             "stages": [dict(s) for s in (run.get("stages") or []) if isinstance(s, dict)],
             "members": [_member_public(m) for m in (run.get("members") or [])],
             # 全部申请（pending + 已结算）都回；「谁批准了什么」要能追溯
             "permissions": [p for p in (run.get("permissions") or [])],
+            # 工作流里的 agent 追问（pending + 已结算）
+            "forms": [f for f in (run.get("forms") or [])],
             "arbitration": run.get("arbitration"),
+            # ★上游账户问题（余额不足 / 凭据无效）：前端在任务头显示一行红字
+            "failReason": run.get("failReason") or "",
             "error": run.get("error") or ""}
+
+
+def _reconcile_stale_run(run: dict) -> bool:
+    """把「已经没有执行线程、却还停在 running」的 run 收尾。
+
+    典型场景：任务跑到一半，面板服务被重启（`_ACTIVE`/线程全没了），但 run 文件里
+    成员还是 `running` —— 之后点「取消全部」也只会改 run.status，成员永远转圈。
+    **只处理超过 30 秒没更新、且没有 `_ACTIVE` 的 run**，避免误伤刚启动的。
+    """
+    try:
+        if not run:
+            return False
+        rid = str(run.get("id") or "")
+        if any(str(k[0]) == rid for k in _ACTIVE):
+            return False
+        updated = float(run.get("updated") or 0)
+        if updated and (_now() - updated) < 30000:
+            return False
+        members = run.get("members") or []
+        stages = run.get("stages") or []
+        live_m = [m for m in members if m.get("status") in ("running", "wait")]
+        live_s = [s for s in stages if s.get("status") in ("running", "wait")]
+        if not live_m and not live_s and str(run.get("status") or "") != "running":
+            return False
+        cancelled = str(run.get("status") or "") == "cancelled"
+        now = _now()
+        for m in live_m:
+            m["status"] = "cancelled" if cancelled else "failed"
+            m["error"] = "任务已取消" if cancelled else "面板服务重启，执行线程已中断"
+            if cancelled:
+                m["cancelled"] = True
+            m["ended"] = now
+        for s in live_s:
+            s["status"] = "cancelled" if cancelled else "failed"
+            s["note"] = "任务已取消" if cancelled else "面板服务重启，执行线程已中断"
+            s["ended"] = now
+        if str(run.get("status") or "") == "running":
+            run["status"] = "cancelled" if any(m.get("cancelled") for m in members) else "failed"
+        run["updated"] = now
+        _save(run)
+        acp_log("[orchestrator] 已收尾中断的运行 %s（%s）"
+                % (rid, "cancelled" if cancelled else "failed"))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def list_runs(limit: int = 30) -> list:
@@ -135,6 +198,7 @@ def list_runs(limit: int = 30) -> list:
     runs.sort(key=lambda r: r.get("created") or 0, reverse=True)
     out = []
     for r in runs[:limit]:
+        _reconcile_stale_run(r)
         ms = r.get("members") or []
         states = [m.get("status") for m in ms]
         out.append({"id": r.get("id"), "task": r.get("task"), "title": r.get("title"),
@@ -158,6 +222,8 @@ def get_run(run_id: str) -> dict:
         if run:
             with _LOCK:
                 _RUNS[rid] = run
+    if run:
+        _reconcile_stale_run(run)
     return public_run(run)
 
 
@@ -279,17 +345,76 @@ def norm_stages(raw_stages, members) -> tuple:
     return stages, ms
 
 
+def _wf_key(cwd) -> str:
+    """项目画布的键：目录归一（大小写 / 斜杠）；没目录用 __default__。"""
+    s = str(cwd or "").replace("\\", "/").rstrip("/").strip()
+    return s.lower() if s else "__default__"
+
+
+def _project_name(cwd) -> str:
+    """项目名：目录 basename；没目录时给中性名。"""
+    s = str(cwd or "").strip()
+    if not s:
+        return "未指定项目"
+    try:
+        return os.path.basename(os.path.realpath(s).rstrip("\\/")) or s
+    except Exception:  # noqa: BLE001
+        return s
+
+
+def _member_session_title(run: dict, member: dict) -> str:
+    """工作流成员会话名：`<项目名> · <结点名>`（用户 2026-11-05 指定）。"""
+    return "%s · %s" % (_project_name((run or {}).get("cwd")),
+                        str((member or {}).get("name") or (member or {}).get("id") or "成员"))
+
+
+def _wf_canvas_from(raw) -> dict:
+    """把任意 layout 归一成 {zoom, nodes}（坐标越界夹回）。"""
+    raw = raw if isinstance(raw, dict) else {}
+    nodes = {}
+    for k, v in (raw.get("nodes") or {}).items():
+        if isinstance(v, dict):
+            nodes[str(k)[:24]] = _wf_pos(v)
+    try:
+        zoom = float(raw.get("zoom") or 1)
+    except (TypeError, ValueError):
+        zoom = 1.0
+    return {"zoom": max(0.6, min(1.6, zoom)), "nodes": nodes}
+
+
+def _project_canvas(d: dict, cwd) -> dict:
+    """项目的**唯一画布**：优先 `projects[key]`，老数据回落到该项目第一个工作流的 layout。"""
+    key = _wf_key(cwd)
+    proj = (d.get("projects") or {}).get(key)
+    if isinstance(proj, dict):
+        one = _wf_canvas_from(proj)
+        if one["nodes"] or proj.get("zoom"):
+            return one
+    # 兼容老版本：每个 workflow 各有一份 layout
+    for w in (d.get("workflows") or []):
+        if not isinstance(w, dict):
+            continue
+        if _wf_key(w.get("cwd")) != key:
+            continue
+        one = _wf_canvas_from(w.get("layout"))
+        if one["nodes"]:
+            return one
+    return {"zoom": 1.0, "nodes": {}}
+
+
 def _wf_load() -> dict:
     try:
         with _WF_LOCK:
             with open(WORKFLOWS_FILE, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
     except Exception:  # noqa: BLE001
-        return {"version": 1, "workflows": []}
+        return {"version": 1, "workflows": [], "projects": {}}
     if not isinstance(d, dict):
-        return {"version": 1, "workflows": []}
+        return {"version": 1, "workflows": [], "projects": {}}
     if not isinstance(d.get("workflows"), list):
         d["workflows"] = []
+    if not isinstance(d.get("projects"), dict):
+        d["projects"] = {}
     return d
 
 
@@ -307,6 +432,8 @@ def list_workflows(cwd: str = "") -> list:
         # ★老工作流没有 stages → 内存里补一个默认阶段（不写盘，真正的归一发生在 save）
         st, ms = norm_stages(w.get("stages"), w.get("members"))
         w["stages"], w["members"] = st, ms
+        # ★项目级画布（0.2.103）：同一 cwd 的所有工作流共享同一张画布
+        w["projectCanvas"] = _project_canvas(d, w.get("cwd"))
     if cwd:
         key = str(cwd).replace("\\", "/").rstrip("/").lower()
         out = [w for w in out
@@ -324,18 +451,25 @@ def save_workflow(data) -> dict:
     cwd = str(data.get("cwd") or "").strip()
     task = str(data.get("taskTemplate") or "").strip()[:2000]
     layout = data.get("layout") if isinstance(data.get("layout"), dict) else {}
-    nodes = {}
-    for k, v in (layout.get("nodes") or {}).items():
-        if isinstance(v, dict):
-            nodes[str(k)[:24]] = _wf_pos(v)
-    try:
-        zoom = float(layout.get("zoom") or 1)
-    except (TypeError, ValueError):
-        zoom = 1.0
-    zoom = max(0.6, min(1.6, zoom))
+    payload_canvas = _wf_canvas_from(layout)
     now = _now()
     with _WF_LOCK:
         d = _wf_load()
+        projects = d.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            projects = {}
+            d["projects"] = projects
+        key = _wf_key(cwd)
+        proj = _project_canvas(d, cwd)
+        # ★项目画布 + 本次提交的节点（同一项目的工作流共享坐标；新工作流不另起一张空画布）
+        nodes = dict(proj.get("nodes") or {})
+        nodes.update(payload_canvas.get("nodes") or {})
+        zoom = payload_canvas.get("zoom") if payload_canvas.get("nodes") else proj.get("zoom")
+        try:
+            zoom = max(0.6, min(1.6, float(zoom or 1)))
+        except (TypeError, ValueError):
+            zoom = 1.0
+        projects[key] = {"zoom": zoom, "nodes": nodes, "updated": now}
         wfs = d.get("workflows") or []
         wid = str(data.get("id") or "").strip()
         cur = next((w for w in wfs if isinstance(w, dict)
@@ -349,7 +483,9 @@ def save_workflow(data) -> dict:
         cur.setdefault("archived", False)
         cur.update({"name": name, "cwd": cwd, "taskTemplate": task,
                     "stages": stages,
-                    "members": members, "layout": {"zoom": zoom, "nodes": nodes},
+                    "members": members,
+                    "layout": {"zoom": zoom, "nodes": dict(nodes)},
+                    "projectCanvas": {"zoom": zoom, "nodes": dict(nodes)},
                     "updated": now})
         wfs.sort(key=lambda w: w.get("updated") or 0, reverse=True)
         d["workflows"] = wfs[:KEEP_WORKFLOWS]
@@ -392,6 +528,8 @@ def duplicate_workflow(wid: str, name: str = "") -> dict:
         cp["runCount"] = 0
         cp["lastRunId"] = ""
         cp["archived"] = False        # ★副本不继承归档状态（复制通常是想用）
+        cp["layout"] = _project_canvas(d, src.get("cwd"))
+        cp["projectCanvas"] = dict(cp["layout"])
         d.setdefault("workflows", []).append(cp)
         d["workflows"].sort(key=lambda w: w.get("updated") or 0, reverse=True)
         d["workflows"] = d["workflows"][:KEEP_WORKFLOWS]
@@ -512,6 +650,65 @@ def _wf_touch_run(wid: str, rid: str) -> None:
             _atomic_write(WORKFLOWS_FILE, d)
 
 
+def apply_member_isolation(run_id: str, member_id: str, force: bool = False) -> dict:
+    """把一个成员在**独立工作区**里的改动应用回主目录（先隔离旧版；冲突默认拒绝）。"""
+    rid = str(run_id or "").strip()
+    with _LOCK:
+        run = _RUNS.get(rid) or _load_file(rid)
+    if not run:
+        raise ValueError("没有这个任务：%s" % rid)
+    if str(run.get("status") or "") == "running":
+        raise ValueError("任务还在跑：等它结束再应用")
+    m = next((x for x in (run.get("members") or [])
+              if str(x.get("id")) == str(member_id)), None)
+    if m is None:
+        raise ValueError("没有这个成员：%s" % member_id)
+    plan = isolation.load(rid)
+    res = isolation.apply_member(plan, member_id, force=bool(force))
+    if res.get("ok"):
+        with _LOCK:
+            m["applied"] = {"at": _now(),
+                            "applied": len(res.get("applied") or []),
+                            "deleted": len(res.get("deleted") or []),
+                            "skipped": len(res.get("skipped") or [])}
+            run["time"] = run.get("time") or {}
+            run["updated"] = _now()
+            _save(run)
+        try:
+            audit.append(
+                "collab",
+                actor={"kind": "agent", "id": str(m.get("engine") or ""),
+                       "name": m.get("name") or "", "member": m.get("id") or "",
+                       "engine": m.get("engine") or ""},
+                action={"kind": "files", "title": "应用成员改动回主目录",
+                        "targets": (res.get("applied") or [])[:20] + (res.get("deleted") or [])[:20],
+                        "destructive": bool(res.get("deleted"))},
+                decision="manual", result="ok" if not res.get("skipped") else "partial",
+                ref={"run": rid, "member": m.get("id")},
+                note="+%d -%d skipped=%d" % (len(res.get("applied") or []),
+                                             len(res.get("deleted") or []),
+                                             len(res.get("skipped") or [])))
+        except Exception:  # noqa: BLE001
+            pass
+    return res
+
+
+def cleanup_isolation(run_id: str) -> dict:
+    """删掉这次运行的隔离目录（worktree / 影子副本）—— 不影响主目录、不影响运行记录。"""
+    rid = str(run_id or "").strip()
+    res = isolation.cleanup(rid)
+    with _LOCK:
+        run = _RUNS.get(rid) or _load_file(rid)
+        if run:
+            for m in (run.get("members") or []):
+                m.pop("isoCwd", None)
+                if isinstance(m.get("isolation"), dict):
+                    m["isolation"] = dict(m["isolation"], cleaned=True)
+            run["isolation"] = dict(run.get("isolation") or {}, cleaned=True)
+            _save(run)
+    return res
+
+
 def delete_run(run_id: str) -> bool:
     """删除一条**已结束**的运行记录（JSON + 该任务的成员会话文件）。
 
@@ -537,6 +734,11 @@ def delete_run(run_id: str) -> bool:
             _CANCEL.pop(key, None)
         run["_deleted"] = True          # 让还在收尾的线程别再 _save（否则文件会被写回来）
         _RUNS.pop(rid, None)
+    # 顺手清掉隔离目录（worktree / 影子副本）；失败不影响删除
+    try:
+        isolation.cleanup(rid)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         os.remove(_run_path(rid))
     except FileNotFoundError:
@@ -555,14 +757,13 @@ def delete_run(run_id: str) -> bool:
 
 # ---------------- 权限队列 ----------------
 
-# ★每个成员可以有自己的权限等级（节点级）：""=跟随面板；trust=信任（非破坏性自动放行）
+# ★每个成员**必须**有自己的权限等级（节点级，不再跟随面板）；trust=信任（非破坏性自动放行）
 PERM_LEVELS = [
-    {"id": "", "label": "跟随面板", "note": "用面板当前等级"},
     {"id": "ask", "label": "全部询问", "note": "每条命令都问"},
     {"id": "read", "label": "只读自动", "note": "读自动；写/执行要问"},
     {"id": "edit", "label": "读写自动", "note": "工作区内读写自动"},
     {"id": "exec", "label": "执行自动", "note": "工作区内读写执行自动"},
-    {"id": "trust", "label": "信任（非破坏性自动）", "note": "不再逐条问；破坏性操作仍然必须你确认"},
+    {"id": "trust", "label": "信任（非破坏性自动）", "note": "不再逐条问；破坏性 / 敏感读取仍然必须你确认"},
 ]
 _PERM_IDS = {x["id"] for x in PERM_LEVELS}
 
@@ -576,7 +777,46 @@ def norm_perm_level(v) -> str:
 def _pending_public(p: dict) -> dict:
     return {k: p.get(k) for k in
             ("id", "run", "member", "memberName", "kind", "title", "locations",
-             "command", "destructive", "created", "status", "decision", "decidedAt")}
+             "command", "destructive", "secret", "created", "status", "decision", "decidedAt")}
+
+
+def _write_approvals() -> int:
+    """把「待批」快照写给托盘/热键（`_approvals.json`）。返回当前条数。"""
+    with _LOCK:
+        items = [_pending_public(p) for p in _PENDING.values()
+                 if p.get("status") == "pending"]
+    try:
+        _atomic_write(APPROVALS_FILE, {"ts": time.time(), "items": items})
+    except Exception as exc:  # noqa: BLE001
+        acp_log("[orchestrator] 写待批快照失败：%s" % exc)
+    return len(items)
+
+
+def _notify_approval(p: dict, total: int) -> None:
+    """新待批 → 系统气泡 + 闪任务栏（托盘进程读 `_notify.json`；不抢焦点）。"""
+    rid = str(p.get("run") or "")
+    now = time.time()
+    # 同一 run 30 秒内只弹一次；新 run / 单条立即弹
+    if rid == _NOTIFY_STATE.get("run") and (now - float(_NOTIFY_STATE.get("ts") or 0)) < 30:
+        return
+    _NOTIFY_STATE["run"] = rid
+    _NOTIFY_STATE["ts"] = now
+    who = str(p.get("memberName") or p.get("member") or "工作流")
+    title = str(p.get("title") or p.get("kind") or "权限申请")
+    cmd = " ".join(str(p.get("command") or "").split())[:160]
+    flag = "破坏性" if p.get("destructive") else ("敏感读取" if p.get("secret") else "")
+    body = "%s：%s" % (who, title)
+    if cmd:
+        body += " · " + cmd
+    if flag:
+        body += " · " + flag
+    if total > 1:
+        body += "（共 %d 条待批）" % total
+    try:
+        _atomic_write(NOTIFY_FILE, {"ts": now, "title": "协作待批：" + who,
+                                    "body": body, "flash": True})
+    except Exception as exc:  # noqa: BLE001
+        acp_log("[orchestrator] 写待批通知失败：%s" % exc)
 
 
 def pending_permissions(run_id: str = "") -> list:
@@ -586,79 +826,321 @@ def pending_permissions(run_id: str = "") -> list:
     return [_pending_public(p) for p in items]
 
 
-def reply_permission(perm_id: str, decision: str) -> bool:
+def _member_waiting(run_id: str, member_id: str) -> bool:
+    """这个成员此刻是不是在等批准 / 等回答？（等人**不算** RUN_TIMEOUT 的算力时间）"""
+    with _LOCK:
+        return (any(str(p.get("run")) == str(run_id)
+                    and str(p.get("member")) == str(member_id)
+                    and p.get("status") == "pending"
+                    for p in _PENDING.values())
+                or any(str(f.get("run")) == str(run_id)
+                       and str(f.get("member")) == str(member_id)
+                       and f.get("status") == "pending"
+                       for f in _PENDING_FORMS.values()))
+
+
+def reply_permission(perm_id: str, decision: str, via: str = "") -> bool:
     d = str(decision or "").strip().lower()
     if d not in ("once", "always", "reject"):
         raise ValueError("decision 只能是 once / always / reject")
+    via = str(via or "").strip().lower()
     with _LOCK:
         p = _PENDING.get(str(perm_id))
         if not p:
             return False
+        # ★破坏性 / 敏感读取：热键只能拒绝，不能批准（必须回工作台看命令原文）
+        if via == "hotkey" and d in ("once", "always"):
+            if p.get("destructive"):
+                raise ValueError("破坏性操作不能用热键批准，请打开工作台确认")
+            if p.get("secret"):
+                raise ValueError("敏感读取不能用热键批准，请打开工作台确认")
         p["decision"] = d
         p["status"] = "allowed" if d in ("once", "always") else "denied"
         p["decidedAt"] = _now()
+        p["via"] = via or "unknown"
         run = _RUNS.get(p["run"])
         if run:
             for item in (run.get("permissions") or []):
                 if item.get("id") == p["id"]:
                     item.update({"status": p["status"], "decision": d,
-                                 "decidedAt": p["decidedAt"]})
+                                 "decidedAt": p["decidedAt"], "via": p["via"]})
                     break
             _save(run)
         p["event"].set()
+    _write_approvals()
     return True
+
+
+def _form_public(f: dict) -> dict:
+    return {k: f.get(k) for k in
+            ("id", "run", "member", "memberName", "title", "fields",
+             "created", "status", "decidedAt")}
+
+
+def pending_forms(run_id: str = "") -> list:
+    with _LOCK:
+        items = [f for f in _PENDING_FORMS.values()
+                 if f.get("run") and (not run_id or str(f["run"]) == str(run_id))]
+    return [_form_public(f) for f in items]
+
+
+def reply_form(form_id: str, answer=None, decline: bool = False) -> bool:
+    with _LOCK:
+        f = _PENDING_FORMS.get(str(form_id))
+        if not f:
+            return False
+        f["answer"] = None if decline else (answer if isinstance(answer, dict) else {})
+        f["declined"] = bool(decline)
+        f["event"].set()
+    return True
+
+
+def _notify_form(f: dict, total: int) -> None:
+    rid = str(f.get("run") or "")
+    now = time.time()
+    if rid == _FORM_NOTIFY_STATE.get("run") and (now - float(_FORM_NOTIFY_STATE.get("ts") or 0)) < 30:
+        return
+    _FORM_NOTIFY_STATE["run"] = rid
+    _FORM_NOTIFY_STATE["ts"] = now
+    who = str(f.get("memberName") or f.get("member") or "工作流")
+    title = str(f.get("title") or "需要你回答")
+    body = "%s：%s" % (who, title)
+    if total > 1:
+        body += "（共 %d 条待回答）" % total
+    try:
+        _atomic_write(NOTIFY_FILE, {"ts": now, "title": "协作待回答",
+                                    "body": body, "flash": True})
+    except Exception as exc:  # noqa: BLE001
+        acp_log("[orchestrator] 写待回答通知失败：%s" % exc)
+
+
+def _ask_form(run: dict, member: dict, form: dict, params) -> dict:
+    """工作流里的 agent 追问（elicitation）：排队到工作台，等人回答；超时/取消→拒绝。"""
+    if str((params or {}).get("mode") or "form") != "form":
+        return {"action": "decline"}
+    fid = "oform_%s" % uuid.uuid4().hex[:10]
+    created = _now()
+    title = str(form.get("title") or "需要你回答")
+    item = {"id": fid, "run": run["id"], "member": member["id"],
+            "memberName": member.get("name") or member["id"],
+            "title": title, "fields": form.get("fields") or [], "created": created,
+            "status": "pending", "decidedAt": 0, "answer": None, "declined": False,
+            "event": threading.Event()}
+    with _LOCK:
+        _PENDING_FORMS[fid] = item
+        run.setdefault("forms", []).append(
+            {k: item.get(k) for k in ("id", "run", "member", "memberName",
+                                      "title", "fields", "created", "status", "decidedAt")})
+        _save(run)
+    member.setdefault("activities", []).append({
+        "ts": _now(), "kind": "form", "name": title, "status": "waiting"})
+    member["activities"] = member["activities"][-100:]
+    acp_log("[orchestrator] %s/%s 等待回答：%s"
+            % (run["id"], member["id"], title))
+    _notify_form(item, len(pending_forms(run["id"])))
+    cancel_evt = _CANCEL.get((run["id"], member["id"]))
+    deadline = (time.time() + ASK_TIMEOUT) if ASK_TIMEOUT > 0 else None
+    while True:
+        if item["event"].wait(0.5):
+            break
+        if cancel_evt is not None and cancel_evt.is_set():
+            break
+        if deadline is not None and time.time() >= deadline:
+            break
+    answered = bool(item["event"].is_set())
+    declined = bool(item.get("declined"))
+    answer = item.get("answer")
+    cancelled = bool(cancel_evt is not None and cancel_evt.is_set())
+    if not answered:
+        status = "timeout"
+    elif declined or answer is None:
+        status = "declined"
+    else:
+        status = "answered"
+    decided = _now()
+    with _LOCK:
+        for row in (run.get("forms") or []):
+            if row.get("id") == fid:
+                row.update({"status": status, "decidedAt": decided})
+                break
+        _save(run)
+        _PENDING_FORMS.pop(fid, None)
+        member["_waitSec"] = float(member.get("_waitSec") or 0) + max(
+            0.0, (time.time() * 1000.0 - created) / 1000.0)
+    if cancelled:
+        return {"action": "cancel"}
+    if status == "answered":
+        return {"action": "accept", "content": answer or {}}
+    return {"action": "decline"}
+
+
+def _wf_scope(run: dict, member: dict) -> str:
+    """工作流每轮快照的 scope：一条 run 里每个成员各自一条，互不串味。"""
+    return "wf-%s-%s" % (str(run.get("id") or "")[:20], str(member.get("id") or "")[:12])
+
+
+def _turn_snapshot(run: dict, member: dict) -> dict:
+    """★动手前给**成员自己的工作区**落一次快照（只记路径+哈希）。
+
+    ⚠ 隔离（worktree / shadow）开着时，成员的 root 是它自己的目录 —— 快照跟它走，
+      否则"这一轮改了哪些文件"会统计成主目录（错的）。
+    """
+    root = str(member.get("isoCwd") or run.get("cwd") or "")
+    if not root or not os.path.isdir(root):
+        return {}
+    scope = _wf_scope(run, member)
+    want = False
+    try:
+        want = snapshots.turn_with_content(group=True)
+    except Exception:  # noqa: BLE001
+        want = False
+    try:
+        res = snapshots.take_turn_snapshot(root, scope, label="工作流派活", with_content=want)
+        return {"scope": scope, "ts": str((res or {}).get("ts") or ""), "with_content": bool(want)}
+    except Exception as exc:  # noqa: BLE001 - 快照只是安全网
+        acp_log("[orchestrator] %s/%s 轮快照失败：%r" % (run.get("id"), member.get("id"), exc))
+        return {}
+
+
+def _turn_changes(run: dict, member: dict, snap: dict) -> dict:
+    """这一轮**改了哪些文件**（文件级；只回名字 + 计数，不存内容 → 不能一键回滚）。"""
+    root = str(member.get("isoCwd") or run.get("cwd") or "")
+    scope = str((snap or {}).get("scope") or "")
+    if not root or not scope:
+        return {"files": 0}
+    try:
+        res = snapshots.changes_since_latest(root, scope)
+    except Exception as exc:  # noqa: BLE001 - 统计失败不影响结果
+        acp_log("[orchestrator] %s/%s 轮改动统计失败：%r" % (run.get("id"), member.get("id"), exc))
+        return {"files": 0}
+    added = [str(x.get("path") or "") for x in (res.get("added") or [])]
+    changed = [str(x.get("path") or "") for x in (res.get("changed") or [])]
+    deleted = [str(x.get("path") or "") for x in (res.get("deleted") or [])]
+    renamed = ["%s → %s" % (x.get("from") or "", x.get("to") or "")
+               for x in (res.get("renamed") or [])]
+    paths = [p for p in (added + changed + renamed + deleted) if p][:20]
+    out = {"files": int(res.get("files") or 0),
+           "added": len(added), "changed": len(changed),
+           "deleted": len(deleted), "renamed": len(renamed),
+           "paths": paths, "since": res.get("since")}
+    if out["files"]:
+        # 进审计链：和工作流审批同一本账（谁、哪一轮、改了哪几个文件）
+        try:
+            audit.append(
+                "collab",
+                actor={"kind": "agent", "id": str(member.get("engine") or ""),
+                       "name": member.get("name") or "", "member": member.get("id") or "",
+                       "role": member.get("role") or "",
+                       "engine": member.get("engine") or ""},
+                action={"kind": "files", "title": "改了 %d 个文件" % out["files"],
+                        "targets": paths, "destructive": False},
+                decision="auto", result="ok",
+                ref={"run": run.get("id"), "member": member.get("id"),
+                     "scope": scope, "ts": str((snap or {}).get("ts") or "")},
+                note="+%d ~%d -%d%s" % (out["added"], out["changed"], out["deleted"],
+                                       (" ⇄%d" % out["renamed"]) if out["renamed"] else ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - 审计失败不影响运行
+            acp_log("[orchestrator] %s/%s 改动入链失败：%r" % (run.get("id"), member.get("id"), exc))
+    return out
+
+
+def _quarantine_before_allow(run: dict, member: dict, cmd, title, locations,
+                             kind="") -> str:
+    """★忏悔室（`ui 0.2.99`）：工作流放行前把「修改前 / 删除前」的旧版复制进库。
+
+    修改类只存单文件（目录改动交给删除类）；删除类目录也存。
+    失败只记日志、**绝不挡放行**（安全网不该变成新的故障点）。
+    """
+    root = str(run.get("cwd") or "")
+    try:
+        qid = capture_before_allow(
+            root, cmd, title or "", locations,
+            scope=str(run.get("id") or "")[:24] or "wf",
+            note=str(title or cmd or "")[:200], kind=kind or "")
+    except Exception as exc:  # noqa: BLE001
+        acp_log("[orchestrator] %s/%s 忏悔室留存失败（不影响放行）：%r"
+                % (run.get("id"), member.get("id"), exc))
+        return ""
+    if qid:
+        try:
+            n = len((snapshots.load_quarantine(qid) or {}).get("items") or [])
+        except Exception:  # noqa: BLE001
+            n = 0
+        member.setdefault("activities", []).append({
+            "ts": _now(), "kind": "tool", "name": "忏悔室留存旧版",
+            "status": "done", "detail": "留存 %d 项 → %s" % (n, qid)})
+        member["activities"] = member["activities"][-100:]
+        acp_log("[orchestrator] %s/%s 忏悔室留存 %d 项（%s）"
+                % (run.get("id"), member.get("id"), n, qid))
+    return qid
 
 
 def _ask_permission(run: dict, member: dict, kind, title, locations, options, info) -> str:
     """auto_permission 钩子：等级命中→放行；否则排队等 UI（超时/取消→拒绝）。"""
     cmd = str((info or {}).get("command") or "")
     destructive = _is_destructive(cmd, title)
+    secret = _is_secret(cmd, title)
     net = _is_net(kind, title, cmd, locations)
-    # ★节点级权限：成员自己的 permLevel 优先（"trust" = 非破坏性一律放行，破坏性仍然要问）
+    # ★工作流权限：只认成员自己的 permLevel；**绝不回落到面板等级**（空 = 全部询问，fail-closed）
     mlevel = norm_perm_level(member.get("permLevel"))
-    level = mlevel or perm_level()
-    ok = (not destructive) and (mlevel == "trust"
-                                or (net and allow_network())
-                                or allowed_by_level(level, kind, title, cmd, locations,
-                                                    run.get("cwd") or ""))
+    level = mlevel or "ask"
+    ok = ((not destructive) and (not secret)
+          and (mlevel == "trust"
+               or (net and allow_network())
+               or allowed_by_level(level, kind, title, cmd, locations,
+                                   member.get("isoCwd") or run.get("cwd") or "")))
     if ok:
         if mlevel == "trust":
             acp_log("[orchestrator] %s/%s 自动放行（成员信任，非破坏性）：%s"
                     % (run["id"], member["id"], title or kind or ""))
+        _quarantine_before_allow(run, member, cmd, title, locations, kind=kind)
         return "once"
     pid = "operm_%s" % uuid.uuid4().hex[:10]
     created = _now()
     p = {"id": pid, "run": run["id"], "member": member["id"],
          "memberName": member.get("name") or member["id"], "kind": kind or "",
          "title": title or "", "locations": list(locations or []),
-         "command": cmd, "destructive": bool(destructive), "created": created,
-         "status": "pending", "decision": None, "event": threading.Event()}
+         "command": cmd, "destructive": bool(destructive), "secret": bool(secret),
+         "created": created, "status": "pending", "decision": None,
+         "via": "", "event": threading.Event()}
     with _LOCK:
         _PENDING[pid] = p
         run.setdefault("permissions", []).append(
             {k: p.get(k) for k in ("id", "run", "member", "memberName", "kind", "title",
-                                   "locations", "command", "destructive", "created",
+                                   "locations", "command", "destructive", "secret", "created",
                                    "status", "decision", "decidedAt")})
         _save(run)
     # 记一条活动，UI 即使不看待批列表也能看到"卡在哪"
     member.setdefault("activities", []).append({
         "ts": _now(), "kind": "permission", "name": title or kind or "权限",
         "status": "waiting", "command": cmd,
-        "destructive": bool(destructive)})
+        "destructive": bool(destructive), "secret": bool(secret)})
     member["activities"] = member["activities"][-100:]
-    acp_log("[orchestrator] %s/%s 权限等待：%s%s"
-            % (run["id"], member["id"], title, "（破坏性）" if destructive else ""))
+    acp_log("[orchestrator] %s/%s 权限等待：%s%s%s"
+            % (run["id"], member["id"], title,
+               "（破坏性）" if destructive else "",
+               "（敏感读取）" if secret else ""))
+    total = _write_approvals()
+    _notify_approval(p, total)
     cancel_evt = _CANCEL.get((run["id"], member["id"]))
-    deadline = time.time() + ASK_TIMEOUT
-    while time.time() < deadline:
+    deadline = (time.time() + ASK_TIMEOUT) if ASK_TIMEOUT > 0 else None
+    while True:
         if p["event"].wait(0.5):
             break
         if cancel_evt is not None and cancel_evt.is_set():
+            break
+        if deadline is not None and time.time() >= deadline:
             break
     decision = p.get("decision") or "reject"
     answered = bool(p.get("event") is not None and p["event"].is_set())
     if cancel_evt is not None and cancel_evt.is_set():
         decision = "reject"
+    # ★忏悔室（`ui 0.2.99`）：批准之后、真正执行之前，把**修改前 / 删除前**的旧版
+    #   复制进隔离库（不再只限破坏性命令；编辑类也会留旧版）。
+    qid = ""
+    if decision in ("once", "always"):
+        qid = _quarantine_before_allow(run, member, cmd, title, locations, kind=kind)
     if p.get("status") == "pending":
         p["status"] = "timeout" if decision == "reject" and not cancel_evt else "denied"
         p["decision"] = decision
@@ -667,12 +1149,15 @@ def _ask_permission(run: dict, member: dict, kind, title, locations, options, in
             for item in (run.get("permissions") or []):
                 if item.get("id") == pid:
                     item.update({"status": p["status"], "decision": decision,
-                                 "decidedAt": p["decidedAt"]})
+                                 "decidedAt": p["decidedAt"], "quarantine": qid})
             _save(run)
     waited = round((time.time() * 1000.0 - created) / 1000.0, 1)
     _cancelled = bool(cancel_evt is not None and cancel_evt.is_set())
+    via = str(p.get("via") or "")
     with _LOCK:
         _PENDING.pop(pid, None)
+        member["_waitSec"] = float(member.get("_waitSec") or 0) + max(0.0, waited)
+    _write_approvals()
     # ★审计链：**只记结论**（谁批准/拒绝了哪一条 + 命令原文 + 等了多久）。
     #   策略自动放行（等级/trust）刻意不入链 —— 见 backend/audit.py 顶部「口径」。
     audit.append(
@@ -682,13 +1167,17 @@ def _ask_permission(run: dict, member: dict, kind, title, locations, options, in
                "role": member.get("role") or "",
                "engine": member.get("engine") or ""},
         action={"kind": kind or "", "title": title or "", "command": cmd,
-                "targets": locations, "destructive": bool(destructive)},
+                "targets": locations, "destructive": bool(destructive),
+                "secret": bool(secret)},
         decision=decision,
         result=("ok" if decision in ("once", "always") else
                 "denied" if answered else "timeout"),
         approver=({"kind": "user", "id": "local", "name": "owner"} if answered else None),
         ref={"run": run["id"], "member": member["id"], "perm": pid},
-        note=("等待 %.1fs" % waited) + (" · 已取消" if _cancelled else "")
+        quarantine=qid,
+        note=("等待 %.1fs" % waited) + ((" · via=" + via) if via else "")
+             + (" · 已取消" if _cancelled else "")
+             + (" · 已隔离 " + qid if qid else "")
              + ("" if answered else " · 无人批准"), ts=created / 1000.0)
     # 用户选了「始终允许」→ 写进 ACP 的 always 记忆（和面板同一条）
     if decision == "always":
@@ -699,11 +1188,6 @@ def _ask_permission(run: dict, member: dict, kind, title, locations, options, in
         except Exception:  # noqa: BLE001
             pass
     return decision if decision in ("once", "always", "reject") else "reject"
-
-
-def _auto_form(form, params) -> dict:
-    """第一刀：表单自动拒绝（避免 1800s 静默挂住）。权限才排队。"""
-    return {"action": "decline"}
 
 
 # ---------------- agent 解析 / 执行 ----------------
@@ -771,6 +1255,50 @@ TERMINAL_STATES = ("done", "failed", "timeout", "cancelled", "skipped")
 TERMINAL_STAGES = ("done", "partial", "failed", "skipped", "cancelled")
 
 
+# 上游「账户 / 凭据」类错误：换模型 / 重试都没用，必须人处理（充值、换 Key、换 agent）
+_ERR_PREFIX = ("acperror", "acp 错误", "acp error", "error:", "apierror", "unexpected status",
+               "request failed", "api error", "traceback (most recent call last)")
+
+
+def _account_error_kind(text: str) -> str:
+    """上游账户/凭据问题的类型（余额不足 / 额度 / 401 / 没配 Key）；不是这类返回空串。
+
+    ⚠ 判据统一在 `backend/errkind.py` —— 各家写法差别很大（Insufficient Balance /
+      exceeded your current quota / credit balance is too low / 402 …），
+      以前只认 4 种，导致「连余额不足都没识别出来」（用户实测报过）。
+      这里只挑**账户类**返回（其余错误不需要"别换模型重试"）。
+    """
+    k = errkind.classify(text)
+    return k["label"] if k.get("account") else ""
+
+
+def _is_errorish_output(text: str) -> bool:
+    """正文其实是「错误」被 agent 当回答吐出来 → 不能算"有输出"。
+
+    ⚠ 判据要**窄**：正常回答里解释 "Insufficient Balance" 不该被误判，所以只认
+    "以错误前缀开头" 或 "短文本 + request_id / status 4xx"。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    if low.startswith(_ERR_PREFIX):
+        return True
+    if len(s) <= 400 and re.search(r"request_id\s*[:=]|status\s*40[123]\b", low):
+        return True
+    return False
+
+
+def _account_hint(kind: str) -> str:
+    return ("上游账户问题：%s —— 换模型 / 重试都没用；%s"
+            % (kind, errkind.KINDS["balance"][1]))
+
+
+def _error_hint(text: str) -> str:
+    """任意报错的人话建议（工作流 / 群聊 / 单聊共用同一套）。"""
+    return errkind.classify(text)["hint"]
+
+
 def _update_run(run: dict) -> None:
     with _LOCK:
         if run.get("status") in ("running",):
@@ -795,13 +1323,82 @@ def _update_run(run: dict) -> None:
                     run["status"] = "done"
                 else:
                     run["status"] = "partial"
+            if run.get("status") in ("failed", "partial"):
+                acct = [m for m in (run.get("members") or []) if m.get("accountError")]
+                if acct:
+                    kind2 = acct[0].get("accountErrorKind") or "余额不足（402）"
+                    names = "、".join(str(m.get("name") or m.get("id")) for m in acct)
+                    run["failReason"] = ("上游账户问题：%s —— 换模型 / 重试没用；"
+                                         "请充值或换 Key（设置 → 模型凭据），涉及成员：%s"
+                                         % (kind2, names))
+                else:
+                    run.pop("failReason", None)
         _save(run)
+
+
+_PERM_LABEL = {x["id"]: x["label"] for x in PERM_LEVELS}
+
+
+def _run_context(run: dict, member: dict, model: str = "") -> str:
+    """把「工作流 / 阶段 / 成员 / 大脑 / 其他成员 / 权限」直接告诉 agent。
+
+    这次失败的 run 前十几条命令都在翻 `_acp_sessions.json` / `_collab_workflows.json`
+    找「结点名 / 大脑名」—— 这些本来就是我们自己知道的信息，不该让 agent 去猜/去翻状态文件。
+    """
+    stages = run.get("stages") or []
+    stage_id = str(member.get("stage") or "")
+    st = next((s for s in stages if str(s.get("id")) == stage_id), None)
+    if st is not None:
+        idx = stages.index(st) + 1
+        stage_txt = "%s（%d/%d）" % (st.get("name") or st.get("id") or "阶段", idx, len(stages))
+    else:
+        stage_txt = stage_id or "（未分阶段）"
+    others = []
+    for m in (run.get("members") or []):
+        if str(m.get("id")) == str(member.get("id")) or m.get("kind") == "arbitration":
+            continue
+        lbl = (ROLES.get(norm_role(m.get("role"))) or {}).get("label") or "无角色"
+        others.append("%s（%s）· 大脑：%s" % (m.get("name") or m.get("id"), lbl,
+                                             m.get("engine") or "?"))
+    level = norm_perm_level(member.get("permLevel")) or "ask"
+    level_label = _PERM_LABEL.get(level, level)
+    my_lbl = (ROLES.get(norm_role(member.get("role"))) or {}).get("label") or "无角色"
+    wf = str(run.get("workflowName") or "").strip() or "（临时任务）"
+    wf_id = str(run.get("workflowId") or "").strip()
+    lines = [
+        "【本次运行上下文】",
+        "工作流：%s%s" % (wf, ("（%s）" % wf_id) if wf_id else ""),
+        "阶段：%s" % stage_txt,
+        "成员：%s（%s）· 大脑：%s%s" % (
+            member.get("name") or member.get("id"), my_lbl, member.get("engine") or "?",
+            (" · 模型：" + model) if model else ""),
+        "其他成员：%s" % ("；".join(others) if others else "（无）"),
+        "项目目录：%s" % (run.get("cwd") or "（未设置）"),
+        "权限：%s（%s）" % (level_label,
+                          "非破坏性自动；破坏性 / 敏感读取仍然要你确认"
+                          if level == "trust" else "按这个等级判定"),
+        "",
+        "★ 要操作本机窗口（原生应用）就用 `cu` 桌面工具（已在 PATH 里）：",
+        "  cu windows / cu tree --hwnd N / cu find --hwnd N --name X / cu click --hwnd N --name X /",
+        "  cu type --hwnd N --class-like EDIT --text ... / cu shot --hwnd N / cu status",
+        "  先 tree/find 再 click，**不要截图猜坐标**；输出都是 JSON。",
+        "★ 网页任务用浏览器 CDP，不要用桌面像素（Chromium 的 UIA 拿不到 DOM）：",
+        "  cu browser open --url URL / cu browser text --selector \"#id\" /",
+        "  cu browser click --selector \"#btn\" / cu browser type --selector \"#q\" --text ... /",
+        "  cu browser wait --selector \"#done\" / cu browser shot [--full] / cu browser list",
+        "★ 只想调一个接口（不想开页面）：cu http get --url URL（只读，可带浏览器 cookie）·",
+        "  cu http post --url URL --json '{...}'（写请求，按动作管）",
+        "★ 有 API/CLI 的优先用 API/CLI；「发送/支付/删除」这类动作会被拒绝。",
+    ]
+    return "\n".join(lines)
 
 
 def _run_member(run: dict, member: dict, prompt_override: str = "") -> None:
     rid, mid = run["id"], member["id"]
     member["status"] = "running"
     member["started"] = _now()
+    member["_waitSec"] = 0.0
+    snap: dict = {}                    # ★这一轮的轮快照（失败就是空 {}）
     with _LOCK:
         _save(run)
     svc = None
@@ -809,7 +1406,20 @@ def _run_member(run: dict, member: dict, prompt_override: str = "") -> None:
     q = None
     try:
         entry, base, env, cfg_cwd = _resolve_engine(member.get("engine") or "")
-        cwd = str(run.get("cwd") or cfg_cwd or "").strip() or None
+        # ★ 桌面工具（cu）的权限来源：只有 trust 成员才允许**动作**（点/输入/快捷键）；
+        #   只读工具（窗口/树/截图）人人可用 —— 它们不改任何东西，而且每次调用都进审计。
+        #   ⚠ env 必须拷贝：registry 里那份是共享的，直接改会污染别的成员。
+        level_now = norm_perm_level(member.get("permLevel")) or "ask"
+        env = dict(env or {})
+        env.update({
+            "COCRAFT_CU_ACTIONS": "allow" if level_now == "trust" else "deny",
+            "COCRAFT_CU_ACTOR": "%s/%s" % (member.get("engine") or "acp", mid),
+            "COCRAFT_CU_ACTOR_NAME": str(member.get("name") or mid),
+            "COCRAFT_CU_MEMBER": mid,
+            "COCRAFT_CU_ENGINE": str(member.get("engine") or ""),
+            "COCRAFT_CU_RUN": rid,
+        })
+        cwd = str(member.get("isoCwd") or run.get("cwd") or cfg_cwd or "").strip() or None
         run_dir = os.path.join(ROOT, "runs", rid)
         sessions_file = os.path.join(run_dir, "%s.sessions.json" % mid)
         # ★ 每个成员独立会话文件：不碰面板/群聊的 _acp_sessions.json
@@ -817,31 +1427,45 @@ def _run_member(run: dict, member: dict, prompt_override: str = "") -> None:
                          agent_id=str(member.get("engine") or ""),
                          provider_id=entry.get("provider") or "", baseline=base,
                          sessions_file=sessions_file)
-        svc._sessions = {}
-        svc._order = []
-        svc._bound = set()
         svc.auto_permission = (lambda kind, title, locations, options, info=None:
                                _ask_permission(run, member, kind, title, locations,
                                                options, info))
-        svc.auto_form = _auto_form
+        svc.auto_form = (lambda form, params: _ask_form(run, member, form, params))
+        resume_sid = str(member.get("resumeSessionID") or "")
+        if not resume_sid or resume_sid not in (getattr(svc, "_sessions", {}) or {}):
+            # 新探索 / 继续失败 → 干净会话
+            svc._sessions = {}
+            svc._order = []
+            svc._bound = set()
+            resume_sid = ""
+            member["resumed"] = False
         model = ""
         try:
             model = str((_load_ok_models() or {}).get(member.get("engine") or "") or "")
         except Exception:  # noqa: BLE001
             model = ""
-        pub = svc.create_session(title="协作·%s" % (member.get("name") or mid),
-                                 cwd=cwd, model=({"id": model} if model else None))
-        sid = str(pub.get("id") or "")
-        member["sessionID"] = sid
+        if resume_sid:
+            sid = resume_sid
+            member["sessionID"] = sid
+            member["resumed"] = True
+        else:
+            pub = svc.create_session(title=_member_session_title(run, member),
+                                     cwd=cwd, model=({"id": model} if model else None))
+            sid = str(pub.get("id") or "")
+            member["sessionID"] = sid
+            member["resumed"] = False
         with _LOCK:
             _ACTIVE[(rid, mid)] = {"svc": svc, "sid": sid}
             _save(run)
         body = prompt_override or str(run.get("task") or "")
         rl = role_line(member.get("role") or "")
-        prompt = (rl + "\n\n" + body).strip() if rl else body
+        ctx = _run_context(run, member, model)
+        prompt = "\n\n".join(x for x in (ctx, rl, body) if x).strip()
         q = svc.subscribe()
         t0 = time.time()
         cancel_evt = _CANCEL.get((rid, mid))
+        # ★动手前先记一份（只记路径+哈希，不占磁盘）→ 结束后就能回答「这一轮改了哪些文件」
+        snap = _turn_snapshot(run, member)
         try:
             svc.prompt(sid, prompt)
         except BusyError:
@@ -849,6 +1473,8 @@ def _run_member(run: dict, member: dict, prompt_override: str = "") -> None:
             member["error"] = "这个 agent 还在忙（上一轮未结束）"
             return
         turn_id = None
+        retry_model_pending = False
+        retry_model_done = False
         while True:
             if cancel_evt is not None and cancel_evt.is_set():
                 try:
@@ -858,7 +1484,9 @@ def _run_member(run: dict, member: dict, prompt_override: str = "") -> None:
                 member["status"] = "cancelled"
                 member["cancelled"] = True
                 break
-            if time.time() - t0 > RUN_TIMEOUT:
+            # ★等批准的时间不算成员算力时间（`_waitSec` 由 _ask_permission 累加）
+            waited = float(member.get("_waitSec") or 0)
+            if (not _member_waiting(rid, mid)) and (time.time() - t0 - waited) > RUN_TIMEOUT:
                 try:
                     svc.interrupt(sid)
                 except Exception:  # noqa: BLE001
@@ -892,15 +1520,65 @@ def _run_member(run: dict, member: dict, prompt_override: str = "") -> None:
                         a["status"] = "done" if t.endswith("success") else "error"
                         break
             elif t == "session.error":
-                member["error"] = str((d or {}).get("error") or "agent 报错")[:500]
+                err = str((d or {}).get("error") or "agent 报错")[:500]
+                member["error"] = err
+                low = err.lower()
+                kind0 = _account_error_kind(err)
+                if kind0:
+                    # ★余额不足 / 凭据无效：换模型重试 100% 还是失败，直接判死并说清原因
+                    member["accountError"] = True
+                    member["accountErrorKind"] = kind0
+                    member["error"] = _account_hint(kind0) + "\n原始报错：" + err
+                    acp_log("[orchestrator] %s/%s 上游账户问题：%s" % (rid, mid, kind0))
+                elif (not retry_model_done
+                        and any(x in low for x in ("endpoint is unavailable",
+                                                   "provider.internal",
+                                                   "upstream request failed",
+                                                   "status 503"))):
+                    note = svc._recover_model(sid, err)
+                    if note and "已自动切到" in note:
+                        retry_model_pending = True
+                        member["error"] = "模型服务端不可用，准备换模型重试：" + note
+                    elif note:
+                        member["error"] = note
             elif t in ("session.step.ended", "session.step.failed"):
                 mid_id = d.get("assistantMessageID") or turn_id
                 member["output"] = _assistant_text(svc, sid, mid_id)
-                member["status"] = "done" if t.endswith("ended") else "failed"
-                if t.endswith("failed") and not member.get("error"):
-                    member["error"] = "这一轮失败（agent 没给原因）"
+                if retry_model_pending:
+                    retry_model_pending = False
+                    retry_model_done = True
+                    try:
+                        member["status"] = "running"
+                        member["error"] = ""
+                        svc.prompt(sid, prompt)
+                        turn_id = None
+                        t0 = time.time()
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        member["status"] = "failed"
+                        member["error"] = "换模型后重试失败：%s: %s" % (type(exc).__name__, exc)
+                        break
+                out = str(member.get("output") or "").strip()
+                err0 = str(member.get("error") or "")
+                # ★「错误被当回答吐出来」也算失败：否则界面会显示「完成」+ 一段报错
+                #   （用户实测：`AcpError … Insufficient Balance` 被标成完成、run 也显示完成）
+                err_only = ((not out) or _is_errorish_output(out)
+                            or bool(err0 and out and out in err0))
+                if t.endswith("failed") or err_only:
+                    member["status"] = "failed"
+                    if not member.get("error"):
+                        member["error"] = out[:500] or "这一轮失败（agent 没给原因）"
+                    kind1 = _account_error_kind(err0 or out)
+                    if kind1 and not member.get("accountError"):
+                        member["accountError"] = True
+                        member["accountErrorKind"] = kind1
+                        member["error"] = _account_hint(kind1) + "\n原始报错：" + (err0 or out)[:400]
+                else:
+                    member["status"] = "done"
                 break
         member["ended"] = _now()
+        # ★这一轮改了哪些文件（文件级；只记名字+计数，不存内容）
+        member["changes"] = _turn_changes(run, member, snap)
         try:
             member["tokens"], member["context"] = _member_snapshot(svc, sid)
         except Exception:  # noqa: BLE001
@@ -1142,8 +1820,67 @@ def catalog() -> dict:
             "askTimeout": int(ASK_TIMEOUT), "runTimeout": int(RUN_TIMEOUT)}
 
 
+def list_member_sessions(workflow_id: str, limit: int = 30) -> dict:
+    """工作流成员会话列表（工作流管理界面专用，不混进单聊）。
+
+    只读 run 目录里的 `<run>/<member>.sessions.json`，并把旧标题迁移成
+    `<项目名> · <结点名>`（用户 2026-11-05 指定）。
+    """
+    wid = str(workflow_id or "").strip()
+    wf = next((w for w in list_workflows() if str(w.get("id")) == wid), {}) if wid else {}
+    runs = []
+    try:
+        names = os.listdir(RUNS_DIR)
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        r = _load_file(name[:-5])
+        if not r or (wid and str(r.get("workflowId") or "") != wid):
+            continue
+        runs.append(r)
+    runs.sort(key=lambda r: r.get("created") or 0, reverse=True)
+    items = []
+    for r in runs[:max(1, int(limit or 30))]:
+        rid = str(r.get("id") or "")
+        run_dir = os.path.join(ROOT, "runs", rid)
+        for m in (r.get("members") or []):
+            if not isinstance(m, dict) or str(m.get("kind") or "") == "arbitration":
+                continue
+            mid = str(m.get("id") or "")
+            title = _member_session_title(r, m)
+            sid = str(m.get("sessionID") or "")
+            p = os.path.join(run_dir, "%s.sessions.json" % mid)
+            msg_count = 0
+            chosen = None
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                sessions = [s for s in (doc.get("sessions") or []) if isinstance(s, dict)]
+                chosen = next((s for s in sessions if str(s.get("id")) == sid), None) \
+                    or (sessions[-1] if sessions else None)
+                if chosen:
+                    sid = str(chosen.get("id") or sid)
+                    msg_count = len(chosen.get("messages") or [])
+                    if str(chosen.get("title") or "") != title:
+                        chosen["title"] = title
+                        _atomic_write(p, doc)
+            except Exception:  # noqa: BLE001
+                chosen = None
+            items.append({"runId": rid, "runTitle": r.get("title") or r.get("task") or "",
+                          "runStatus": r.get("status") or "",
+                          "runCreated": r.get("created") or 0,
+                          "memberId": mid, "memberName": m.get("name") or mid,
+                          "engine": m.get("engine") or "", "status": m.get("status") or "",
+                          "sessionID": sid, "title": title,
+                          "messageCount": msg_count,
+                          "resumed": bool(m.get("resumed"))})
+    return {"workflowId": wid, "workflowName": wf.get("name") or "", "items": items}
+
+
 def start_run(task: str, cwd: str = "", members=None, title: str = "",
-              workflow_id: str = "") -> dict:
+              workflow_id: str = "", from_run_id: str = "") -> dict:
     # ★ 从工作流启动：成员/目录/标题直接用工作流的（成员快照进 run，之后改工作流不影响历史）
     wf = None
     if workflow_id:
@@ -1165,6 +1902,16 @@ def start_run(task: str, cwd: str = "", members=None, title: str = "",
         raise ValueError("至少要有一个成员")
     if len(members) > 8:
         raise ValueError("一次最多 8 个成员")
+    prev_continue = None
+    if str(from_run_id or "").strip():
+        with _LOCK:
+            prev_continue = _RUNS.get(str(from_run_id)) or _load_file(str(from_run_id))
+        if not prev_continue:
+            raise ValueError("找不到要继续的上一轮")
+        if str(prev_continue.get("status") or "") in ("running", "wait"):
+            raise ValueError("上一轮还在跑，等它结束再继续探索")
+        if _wf_key(prev_continue.get("cwd")) != _wf_key(cwd):
+            raise ValueError("只能继续同一个项目里的上一轮")
     rid = "run_%s_%s" % (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6])
     ms = []
     for i, raw in enumerate(members):
@@ -1188,13 +1935,65 @@ def start_run(task: str, cwd: str = "", members=None, title: str = "",
            "cwd": str(cwd or "").strip(), "status": "running",
            "workflowId": str((wf or {}).get("id") or ""),
            "workflowName": str((wf or {}).get("name") or ""),
+           "continuedFrom": str(from_run_id or ""),
+           "exploration": bool(str(from_run_id or "").strip()),
+           "resumedMembers": 0,
            "created": _now(), "updated": _now(), "members": ms,
            "stages": [dict(s, status="wait", started=0, ended=0, note="") for s in stages],
-           "permissions": [], "arbitration": None, "error": ""}
+           "forms": [], "permissions": [], "arbitration": None, "error": ""}
+    # ★并行隔离（P0-1）：每个成员一个独立工作区（git → worktree；非 git → 影子副本）。
+    #   失败 / 目录太大 / 只有一个成员 → mode=off + reason（前端如实显示，不假装隔离了）。
+    try:
+        iso = isolation.prepare(str(cwd or "").strip(), rid, [m["id"] for m in ms],
+                                enabled=isolation.enabled())
+    except Exception as exc:  # noqa: BLE001
+        iso = {"mode": "off", "reason": "隔离准备失败：%s" % str(exc)[:160], "members": {}}
+    run["isolation"] = {k: iso.get(k) for k in ("mode", "reason", "gitRel", "created")}
+    for m in ms:
+        mm = (iso.get("members") or {}).get(m["id"]) or {}
+        if mm.get("cwd"):
+            m["isoCwd"] = mm["cwd"]
+            m["isolation"] = {"mode": iso.get("mode"), "cwd": mm["cwd"],
+                              "branch": mm.get("branch") or ""}
     with _LOCK:
         _RUNS[rid] = run
         _save(run)
     os.makedirs(os.path.join(ROOT, "runs", rid), exist_ok=True)
+    # ★继续上一轮探索（0.2.103）：复制上一轮每个成员的会话文件到新 run 目录，
+    #   但不污染旧 run；成员匹配同 id，其次 name+engine。匹配不到就正常新建会话。
+    if str(from_run_id or "").strip():
+        prev = prev_continue
+        if prev:
+            prev_members = {str(m.get("id")): m for m in (prev.get("members") or [])
+                            if isinstance(m, dict)}
+            prev_by_sig = {}
+            for pm in prev_members.values():
+                if pm.get("engine"):
+                    prev_by_sig[(str(pm.get("name") or "").lower(),
+                                 str(pm.get("engine") or ""))] = pm
+            same_cwd = (_wf_key(prev.get("cwd")) == _wf_key(cwd))
+            if same_cwd:
+                for m in ms:
+                    pm = prev_members.get(str(m.get("id"))) \
+                        or prev_by_sig.get((str(m.get("name") or "").lower(),
+                                            str(m.get("engine") or "")))
+                    if not pm or not str(pm.get("sessionID") or ""):
+                        continue
+                    src = os.path.join(ROOT, "runs", str(prev.get("id") or ""),
+                                       "%s.sessions.json" % str(pm.get("id") or ""))
+                    dst = os.path.join(ROOT, "runs", rid, "%s.sessions.json" % str(m.get("id") or ""))
+                    try:
+                        if os.path.isfile(src):
+                            shutil.copy2(src, dst)
+                            m["resumeSessionID"] = str(pm.get("sessionID") or "")
+                            m["resumed"] = True
+                            m["continuedFrom"] = {"run": str(prev.get("id") or ""),
+                                                  "member": str(pm.get("id") or "")}
+                    except OSError:
+                        continue
+                run["resumedMembers"] = sum(1 for m in ms if m.get("resumed"))
+                if run["resumedMembers"]:
+                    _save(run)
     _start_threads(run)
     if wf:
         try:
@@ -1224,19 +2023,52 @@ def cancel_run(run_id: str, member_id: str = "") -> dict:
             except Exception:  # noqa: BLE001
                 pass
     with _LOCK:
+        now = _now()
+        for m in (run.get("members") or []):
+            if member_id and str(m.get("id")) != str(member_id):
+                continue
+            if m.get("status") in ("wait", "running"):
+                if not member_id and m.get("status") == "wait":
+                    m["status"] = "skipped"
+                    m["error"] = "任务已取消"
+                else:
+                    m["status"] = "cancelled"
+                    m["error"] = "任务已取消"
+                    m["cancelled"] = True
+                m["ended"] = now
         if not member_id:
             run["status"] = "cancelled"
-            # ★取消全部：还没开始的阶段/成员立刻标 skipped（不用等调度线程收尾）
+            # ★取消全部：还没开始的阶段标 skipped，正在跑的标 cancelled（线程没了也不会永远转圈）
             for st in (run.get("stages") or []):
                 if st.get("status") == "wait":
                     st["status"] = "skipped"
                     st["note"] = "任务已取消"
-                    st["ended"] = _now()
-            for m in (run.get("members") or []):
-                if m.get("status") == "wait":
-                    m["status"] = "skipped"
-                    m["error"] = "任务已取消"
-                    m["ended"] = _now()
+                    st["ended"] = now
+                elif st.get("status") == "running":
+                    st["status"] = "cancelled"
+                    st["note"] = "任务已取消"
+                    st["ended"] = now
+        else:
+            # 单成员取消：它所在的阶段如果已经没人跑了，也一起收尾
+            for st in (run.get("stages") or []):
+                if st.get("status") in ("running", "wait"):
+                    kids = [m for m in (run.get("members") or [])
+                            if str(m.get("stage") or "s1") == str(st.get("id"))]
+                    if kids and all(m.get("status") in TERMINAL_STATES for m in kids):
+                        st["status"] = "cancelled"
+                        st["note"] = "成员已取消"
+                        st["ended"] = now
+            states = [m.get("status") for m in (run.get("members") or [])]
+            if states and all(x in TERMINAL_STATES for x in states):
+                active = [x for x in states if x != "skipped"]
+                if not active or all(x == "cancelled" for x in active):
+                    run["status"] = "cancelled"
+                elif all(x == "done" for x in active):
+                    run["status"] = "done"
+                elif any(x == "done" for x in active):
+                    run["status"] = "partial"
+                else:
+                    run["status"] = "failed"
         _save(run)
     return public_run(run)
 
@@ -1337,3 +2169,10 @@ def _run_arbitration(run: dict, member: dict, prompt: str) -> None:
 def stats() -> dict:
     with _LOCK:
         return {"runs": len(_RUNS), "pending": len(_PENDING), "active": len(_ACTIVE)}
+
+
+# 进程启动时清掉上一次遗留的「待批」快照（托盘别显示已经不存在的申请）
+try:
+    _write_approvals()
+except Exception:  # noqa: BLE001
+    pass

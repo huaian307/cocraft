@@ -14,15 +14,15 @@ r"""可逆执行 / 工作区快照底座（**引擎无关**，纯标准库）。
   1. **快照**（`take_snapshot` / `latest_manifest` / `diff_manifests`）：
      目录树 → `{rel: {size, mtime, hash}}`；哈希按 `mtime+size` 缓存（未变文件零重算）；
      文件内容进**内容寻址仓**（`_store/<sha[:2]>/<sha>`，天然去重）→ 所以增量快照只写"新内容"。
-  2. **隔离区**（`quarantine` / `list_quarantine` / `restore_quarantine`）：
+  2. **忏悔室**（`quarantine` / `list_quarantine` / `restore_quarantine`）：
      破坏性操作**放行前**把要动的目标**复制**进 `runtime/quarantine/<scope>/<ts>/`，
      并写 `_manifest.json`（原路径 + 命令原文）→ 之后可一键「恢复」。
   3. **撤销**（`undo_snapshot`）：拿某次快照，把"被删的恢复回来、被改的写回旧内容、被新增的删掉
-     （删之前先自动进隔离区，所以撤销本身也可逆）"。
+     （删之前先自动进忏悔室，所以撤销本身也可逆）"。
 
 安全（与 `fsview.py` 同一套纪律）：
   * 所有落盘都只在 `runtime/quarantine` / `runtime/snapshots` 下；
-  * 目标路径做 `realpath` 归一，**绝不**把隔离区/快照目录自己当成操作对象；
+  * 目标路径做 `realpath` 归一，**绝不**把忏悔室/快照目录自己当成操作对象；
   * 文件数 / 单文件 / 总量都有上限（超了**如实记录"没保住"**，不假装成功）。
 
 ⚠ 诚实的边界：只看**文件内容**。命令对系统做的事（装服务、改注册表、动环境变量）看不到 —— git 也一样。
@@ -45,6 +45,42 @@ RUNTIME = os.path.join(ROOT, "runtime")
 QUARANTINE_DIR = os.path.join(RUNTIME, "quarantine")
 SNAPSHOT_DIR = os.path.join(RUNTIME, "snapshots")
 STORE_DIR = os.path.join(SNAPSHOT_DIR, "_store")
+# ★轮快照配置（`ui 0.2.85`）：`{"groupContent": bool}` —— 群聊 / 工作流的轮快照
+#   默认**只记路径+哈希**（不占磁盘、不能回滚）；打开后连内容一起进仓 → 能一键退回。
+TURN_CFG_FILE = os.path.join(RUNTIME, "state", "_turnsnap.json")
+
+
+def turn_config() -> dict:
+    """读轮快照配置（文件坏了 / 没有 → 全默认，绝不抛）。"""
+    try:
+        with open(TURN_CFG_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:                             # noqa: BLE001
+        return {}
+
+
+def set_turn_config(**kw) -> dict:
+    """合并写轮快照配置（只认 bool 键；写失败不抛）。"""
+    cur = turn_config()
+    for k, v in (kw or {}).items():
+        if isinstance(v, bool):
+            cur[str(k)] = v
+    try:
+        os.makedirs(os.path.dirname(TURN_CFG_FILE), exist_ok=True)
+        with open(TURN_CFG_FILE, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(cur, fh, ensure_ascii=False, indent=2)
+    except Exception:                             # noqa: BLE001
+        pass
+    return cur
+
+
+def turn_with_content(group: bool = True) -> bool:
+    """这一轮的轮快照要不要带内容（群聊 / 工作流共用这个开关）。"""
+    cfg = turn_config()
+    if group:
+        return bool(cfg.get("groupContent"))
+    return bool(cfg.get("panelContent"))
 
 # 与编码模式同一套忽略规则（另外把**我们自己的**两个目录也排除，免得自吞）
 SKIP_DIRS = set(fsview.SKIP_DIRS) | {"quarantine", "snapshots"}
@@ -60,6 +96,76 @@ MIN_SNAPSHOTS = 5                       # 但每个 scope 至少留这么多次�
 MAX_QUARANTINE_FILE = 64 * 1024 * 1024  # 单个文件隔离上限
 MAX_QUARANTINE_BYTES = 512 * 1024 * 1024  # 一次隔离总量上限
 MAX_QUARANTINE_ITEMS = 400              # 一次隔离的目标数上限
+
+# ★低风险删除（`ui 0.2.95`）：只有评分 ≤ maxStar 的「可再生成」目标才会「先隔离再自动放行」。
+#   保留期到了以后，**只自动清"安全项"**（原件已恢复 / 本来就是可再生成的），
+#   git 跟踪 / 无法判定的一律 hold（永久保留 + 每天提醒）。
+QUAR_CFG_FILE = os.path.join(RUNTIME, "state", "_quarantine.json")
+QUAR_CFG_DEFAULT = {"enabled": True, "maxStar": 1, "days": 7,
+                    "remindHours": 24, "cleanup": True}
+# 自动隔离时最多复制这么多内容；超过就只留「清单墓碑」（可再生目录如 node_modules 不该占磁盘）
+AUTO_COPY_MAX_BYTES = 64 * 1024 * 1024
+
+
+def quarantine_config() -> dict:
+    """读忏悔室策略（文件坏了 / 没有 → 全默认，绝不抛）。"""
+    cfg = dict(QUAR_CFG_DEFAULT)
+    try:
+        with open(QUAR_CFG_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            if "enabled" in d:
+                cfg["enabled"] = bool(d.get("enabled"))
+            if "cleanup" in d:
+                cfg["cleanup"] = bool(d.get("cleanup"))
+            try:
+                cfg["maxStar"] = max(1, min(2, int(d.get("maxStar") or 1)))
+            except Exception:                          # noqa: BLE001
+                pass
+            try:
+                cfg["days"] = max(1, min(90, int(d.get("days") or 7)))
+            except Exception:                          # noqa: BLE001
+                pass
+            try:
+                cfg["remindHours"] = max(0, min(168, int(d.get("remindHours") if d.get("remindHours") is not None else 24)))
+            except Exception:                          # noqa: BLE001
+                pass
+    except Exception:                                  # noqa: BLE001
+        pass
+    return cfg
+
+
+def set_quarantine_config(**kw) -> dict:
+    """合并写忏悔室策略（越界值归一；写失败不抛，返回当前值）。"""
+    cur = quarantine_config()
+    for k, v in (kw or {}).items():
+        if k in ("enabled", "cleanup") and isinstance(v, bool):
+            cur[k] = v
+        elif k == "maxStar":
+            try:
+                cur[k] = max(1, min(2, int(v)))
+            except Exception:                          # noqa: BLE001
+                pass
+        elif k == "days":
+            try:
+                cur[k] = max(1, min(90, int(v)))
+            except Exception:                          # noqa: BLE001
+                pass
+        elif k == "remindHours":
+            try:
+                cur[k] = max(0, min(168, int(v)))
+            except Exception:                          # noqa: BLE001
+                pass
+    try:
+        os.makedirs(os.path.dirname(QUAR_CFG_FILE), exist_ok=True)
+        tmp = QUAR_CFG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(cur, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, QUAR_CFG_FILE)
+    except Exception:                                  # noqa: BLE001
+        pass
+    return cur
+
 
 _LOCK = threading.RLock()               # 保护"写清单 + 裁剪 + 回收"（可能被并发调用）
 
@@ -111,7 +217,7 @@ def _inside(path: str, parent: str) -> bool:
 
 
 def _is_protected(path: str) -> bool:
-    """不能拿我们自己（隔离区 / 快照仓）当操作对象 —— 会自吞。"""
+    """不能拿我们自己（忏悔室 / 快照仓）当操作对象 —— 会自吞。"""
     return _inside(path, QUARANTINE_DIR) or _inside(path, SNAPSHOT_DIR)
 
 
@@ -508,7 +614,7 @@ def line_diff(base_sha: str, cur_sha: str, rel: str, root: str = "") -> dict:
 def undo_snapshot(scope: str, ts: str, paths=None, quarantine: bool = True) -> dict:
     """把工作区**回退到那次快照**：被删的恢复、被改的写回旧内容、被新增的删掉。
 
-    ⚠ 删「新增」文件前会**先自动进隔离区**（所以"撤销"本身也可逆）。
+    ⚠ 删「新增」文件前会**先自动进忏悔室**（所以"撤销"本身也可逆）。
     `paths` = 只处理这些相对路径（默认全部）。
     """
     man = load_manifest(scope, ts)
@@ -572,7 +678,7 @@ def undo_snapshot(scope: str, ts: str, paths=None, quarantine: bool = True) -> d
             "actions": actions[:500], "diff": d["stats"]}
 
 
-# ---------------------------------------------------------------- 2. 隔离区
+# ---------------------------------------------------------------- 2. 忏悔室
 
 def _q_dir(qid: str) -> str:
     return os.path.join(QUARANTINE_DIR, qid)
@@ -588,13 +694,23 @@ def _copy_target(src: str, dest: str) -> str:
     return "file"
 
 
-def quarantine_paths(root: str, targets, scope="default", note="", cmd="") -> dict:
+def quarantine_paths(root: str, targets, scope="default", note="", cmd="",
+                     auto=False, scores=None, content=True, kind="delete") -> dict:
     """把 `targets`（**绝对路径**）复制进 `runtime/quarantine/<scope>/<ts>/`。
 
     返回记录（也落 `_manifest.json`）：`{id, ts, scope, note, cmd, root, items[], bytes, skipped[]}`。
     上限：单文件 64 MB / 单次总量 512 MB / 目标数 400 —— 超了**如实记进 `skipped`**（不假装成功）。
+
+    ★`kind`（`ui 0.2.99` 起）：`delete` = 删除前副本；`modify` = 修改前旧版。
+      忏悔室时间线按它显示「删除前」/「修改前」。
+
+    ★`auto=True`（低风险删除自动隔离，`ui 0.2.95`）：
+      * 只复制 `AUTO_COPY_MAX_BYTES`（64 MB）以内的内容；超过就只写「清单墓碑」
+        （`tombstone=True`、`stored=""`、`bytes=0`）—— `node_modules` 这种再生成目录不该占磁盘；
+      * 记录里带 `auto / expires_at / scores`，供保留期清理与面板显示。
     """
     r = os.path.realpath(root) if root and os.path.isdir(root) else ""
+    kind_s = "modify" if str(kind or "").lower() == "modify" else "delete"
     scope_s = slug(scope)
     ts = _now_tag()
     qid = os.path.join(scope_s, ts)
@@ -614,7 +730,7 @@ def quarantine_paths(root: str, targets, scope="default", note="", cmd="") -> di
             skipped.append({"src": str(t), "reason": "不存在"})
             continue
         if _is_protected(p):
-            skipped.append({"src": p, "reason": "是隔离区/快照目录本身"})
+            skipped.append({"src": p, "reason": "是忏悔室/快照目录本身"})
             continue
         if _drive_root(p):
             skipped.append({"src": p, "reason": "盘符根目录（范围过大）"})
@@ -631,10 +747,55 @@ def quarantine_paths(root: str, targets, scope="default", note="", cmd="") -> di
         skipped.extend({"src": p, "reason": "超过单次目标数上限"} for p in keep[MAX_QUARANTINE_ITEMS:])
         keep = keep[:MAX_QUARANTINE_ITEMS]
 
+    def _size(p, cap=None):
+        t = 0
+        try:
+            if os.path.isfile(p):
+                return os.path.getsize(p)
+            for dp, _dn, fns in os.walk(p):
+                for f in fns:
+                    try:
+                        t += os.path.getsize(os.path.join(dp, f))
+                    except OSError:
+                        continue
+                    if cap and t > cap:
+                        return t
+            return t
+        except OSError:
+            return t
+
+    sizes = {}
+    tombstone = False
+    if auto and content:
+        try:
+            cap = AUTO_COPY_MAX_BYTES * 4
+            est = 0
+            for p in keep:
+                sizes[p] = _size(p, cap)
+                est += sizes[p]
+            if est > AUTO_COPY_MAX_BYTES:
+                tombstone = True
+                content = False
+        except Exception:  # noqa: BLE001
+            tombstone = True
+            content = False
+
     os.makedirs(files_dir, exist_ok=True)
     for i, src in enumerate(keep):
+        rel = (os.path.relpath(src, r).replace("\\", "/") if r and _inside(src, r) else "")
+        if tombstone:
+            sz = sizes.get(src) or _size(src, AUTO_COPY_MAX_BYTES)
+            items.append({"src": src, "stored": "", "kind": ("dir" if os.path.isdir(src) else "file"),
+                          "size": sz, "rel": rel, "tombstone": True, "hash": ""})
+            continue
         name = "%04d__%s" % (i + 1, os.path.basename(src) or "item")
         dest = os.path.join(files_dir, name)
+        item_hash = ""
+        try:
+            if os.path.isfile(src) and not os.path.islink(src):
+                item_hash = _sha1_file(src)[0] or ""
+        except Exception:  # noqa: BLE001
+            item_hash = ""
         try:
             if os.path.isfile(src) and not os.path.islink(src):
                 sz = os.path.getsize(src)
@@ -656,15 +817,31 @@ def quarantine_paths(root: str, targets, scope="default", note="", cmd="") -> di
             else:
                 sz = 0
             kind = _copy_target(src, dest)
-            items.append({"src": src, "stored": name, "kind": kind, "size": sz,
-                          "rel": (os.path.relpath(src, r).replace("\\", "/") if r and _inside(src, r) else "")})
+            items.append({"src": src, "stored": name, "kind": kind, "size": sz, "rel": rel,
+                          "hash": item_hash if os.path.isfile(src) else ""})
             total += sz
         except OSError as exc:
             skipped.append({"src": src, "reason": "复制失败：%s" % exc})
 
+    taken = time.time()
+    cfg = quarantine_config()
+    safe_scores = []
+    for sc in (scores or []):
+        if not isinstance(sc, dict):
+            continue
+        safe_scores.append({
+            "path": str(sc.get("path") or "")[:500],
+            "rel": str(sc.get("rel") or "")[:500],
+            "stars": int(sc.get("stars") or 0),
+            "score": int(sc.get("score") or 0),
+            "reasons": [str(x)[:120] for x in (sc.get("reasons") or [])[:4]],
+        })
     rec = {"id": qid.replace("\\", "/"), "ts": ts, "scope": scope_s, "note": str(note or "")[:600],
-           "cmd": " ".join(str(cmd or "").split())[:600], "root": r,
-           "taken_at": time.time(), "bytes": total,
+           "cmd": " ".join(str(cmd or "").split())[:600], "root": r, "kind": kind_s,
+           "taken_at": taken, "bytes": total,
+           "auto": bool(auto), "tombstone": bool(tombstone),
+           "expires_at": taken + float(cfg.get("days") or 7) * 86400.0,
+           "scores": safe_scores,
            "items": items, "skipped": skipped}
     with open(os.path.join(base, "_manifest.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(rec, fh, ensure_ascii=False, indent=1)
@@ -672,7 +849,7 @@ def quarantine_paths(root: str, targets, scope="default", note="", cmd="") -> di
 
 
 def list_quarantine(limit: int = 60) -> list:
-    """隔离区记录（新 → 旧）。"""
+    """忏悔室记录（新 → 旧）。"""
     out = []
     try:
         scopes = os.listdir(QUARANTINE_DIR)
@@ -700,8 +877,12 @@ def list_quarantine(limit: int = 60) -> list:
                 "ts": js.get("ts") or tag, "scope": js.get("scope") or sc,
                 "taken_at": js.get("taken_at") or 0, "note": js.get("note") or "",
                 "cmd": js.get("cmd") or "", "root": js.get("root") or "",
+                "kind": js.get("kind") or "delete",
                 "count": len(js.get("items") or []), "bytes": js.get("bytes") or 0,
                 "missed": len(js.get("skipped") or []),
+                "auto": bool(js.get("auto")), "tombstone": bool(js.get("tombstone")),
+                "expires_at": js.get("expires_at") or 0,
+                "max_star": max([int(x.get("stars") or 0) for x in (js.get("scores") or [])] or [0]),
             })
     out.sort(key=lambda x: x["taken_at"], reverse=True)
     return out[:max(1, int(limit))]
@@ -717,7 +898,7 @@ def load_quarantine(qid: str) -> dict:
 
 
 def restore_quarantine(qid: str, srcs=None, override: bool = False) -> dict:
-    """把隔离区里的东西**放回原处**（`srcs` 为空 = 全部）。
+    """把忏悔室里的东西**放回原处**（`srcs` 为空 = 全部）。
 
     目标已存在 → 除非 `override=True`，否则记为 `conflict`（**不静默覆盖**）。
     """
@@ -726,11 +907,16 @@ def restore_quarantine(qid: str, srcs=None, override: bool = False) -> dict:
         raise ValueError("找不到隔离记录：%s" % qid)
     base = _q_dir(qid.replace("/", os.sep))
     want = set(str(s) for s in srcs) if srcs else None
-    restored, conflict, missing, failed = 0, 0, 0, 0
+    restored, conflict, missing, failed, tombstone = 0, 0, 0, 0, 0
     actions = []
     for item in (rec.get("items") or []):
         src = item.get("src") or ""
         if want is not None and src not in want:
+            continue
+        if item.get("tombstone"):
+            actions.append({"src": src, "action": "tombstone",
+                            "reason": "自动隔离时只记了清单（可再生文件没复制内容，无法恢复）"})
+            tombstone += 1
             continue
         stored = os.path.join(base, "files", item.get("stored") or "")
         if not os.path.exists(stored):
@@ -761,7 +947,8 @@ def restore_quarantine(qid: str, srcs=None, override: bool = False) -> dict:
             actions.append({"src": src, "action": "failed", "reason": str(exc)})
             failed += 1
     return {"ok": True, "id": qid, "restored": restored, "conflict": conflict,
-            "missing": missing, "failed": failed, "actions": actions[:500]}
+            "missing": missing, "failed": failed, "tombstone": tombstone,
+            "actions": actions[:500]}
 
 
 def drop_quarantine(qid: str) -> dict:
@@ -777,8 +964,147 @@ def drop_quarantine(qid: str) -> dict:
     return {"ok": True, "id": s, "removed": not os.path.exists(d)}
 
 
+def _plan_entry(it: dict, state: str, hours_left=None) -> dict:
+    return {"id": it.get("id"), "ts": it.get("ts"), "scope": it.get("scope"),
+            "taken_at": it.get("taken_at") or 0, "count": it.get("count") or 0,
+            "bytes": it.get("bytes") or 0, "note": it.get("note") or "",
+            "auto": bool(it.get("auto")), "tombstone": bool(it.get("tombstone")),
+            "expires_at": it.get("expires_at") or 0,
+            "max_star": it.get("max_star") or 0, "state": state,
+            "hours_left": round(float(hours_left), 1) if hours_left is not None else None}
+
+
+def _record_safety(rec: dict, cfg: dict) -> dict:
+    """判断一条隔离记录能不能"安全清掉"（**只有 auto 记录会走到这里**）。
+
+    安全 = 清掉这份备份**不会造成额外损失**：
+      * 原件还在（已恢复 / 没删成）→ 备份多余；
+      * 本来就是 ★≤阈值 的可再生成目标（我们放行时就认了"可以不回滚"）；
+      * 清单墓碑（内容当时就没复制）。
+    风险 = 原件已不在、且它是 **git 跟踪文件** 或 **星级不明**（无法确认可再生成）→ **hold**。
+    """
+    reasons = []
+    stars = {}
+    for x in (rec.get("scores") or []):
+        try:
+            stars[str(x.get("path") or "")] = int(x.get("stars") or 0)
+        except Exception:                              # noqa: BLE001
+            continue
+    max_star = int(cfg.get("maxStar") or 1)
+    qbase = _q_dir(str(rec.get("id") or "").replace("/", os.sep))
+    unknown = []
+    for item in (rec.get("items") or []):
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("src") or "")
+        if not src or item.get("tombstone"):
+            continue
+        if os.path.exists(src):
+            continue                                   # 原件还在 → 备份是多余的
+        stored = str(item.get("stored") or "")
+        if not stored or not os.path.exists(os.path.join(qbase, "files", stored)):
+            reasons.append("原件与副本都不在了：%s" % src)
+            continue
+        st = stars.get(src)
+        if st is not None and st <= max_star:
+            continue                                   # 放行时就认了"可再生成"
+        unknown.append(src)
+
+    tracked = {}
+    if unknown and rec.get("root"):
+        try:
+            import file_rank                            # 延迟导入：snapshots ← file_rank 会成环
+            gs = file_rank.git_state(str(rec.get("root")), unknown)
+            tracked = {p: bool((gs[i] or {}).get("tracked")) for i, p in enumerate(unknown)}
+        except Exception:                              # noqa: BLE001
+            tracked = {}
+    for p in unknown:
+        if tracked.get(p):
+            reasons.append("git 跟踪文件已不在：%s" % p)
+        else:
+            reasons.append("无法确认可再生成：%s" % p)
+    return {"safe": not reasons, "reasons": reasons[:10]}
+
+
+def quarantine_plan(now=None) -> dict:
+    """保留期计划：`keep`（还早）/ `soon`（进入提醒窗口）/ `due`（到期可清）/ `hold`（到期但不能清）。
+
+    ⚠ **手动隔离的记录永远不进 due**（`auto=False`）—— 只有"低风险删除自动隔离"的才定时清。
+    """
+    cfg = quarantine_config()
+    now = float(now or time.time())
+    days = float(cfg.get("days") or 7)
+    remind_h = float(cfg.get("remindHours") if cfg.get("remindHours") is not None else 24)
+    total_s = days * 86400.0
+    soon_from = max(0.0, total_s - max(0.0, remind_h) * 3600.0)
+
+    keep, soon, due, hold = [], [], [], []
+    for it in list_quarantine(limit=10000):
+        if not it.get("auto"):
+            keep.append(_plan_entry(it, "manual"))
+            continue
+        taken = float(it.get("taken_at") or 0)
+        age = max(0.0, now - taken)
+        if age < soon_from:
+            left = (total_s - age) / 3600.0
+            keep.append(_plan_entry(it, "keep", left))
+        elif age < total_s:
+            left = (total_s - age) / 3600.0
+            soon.append(_plan_entry(it, "soon", left))
+        else:
+            rec = load_quarantine(str(it.get("id") or ""))
+            safe = _record_safety(rec, cfg)
+            entry = _plan_entry(it, "due" if safe["safe"] else "hold", 0)
+            if safe["safe"]:
+                due.append(entry)
+            else:
+                entry["hold_reasons"] = safe["reasons"]
+                hold.append(entry)
+    nxt = None
+    for e in keep + soon:
+        if not e.get("auto"):
+            continue
+        t = float(e.get("expires_at") or 0)
+        if t and (nxt is None or t < nxt):
+            nxt = t
+    return {"ok": True, "config": cfg, "now": now,
+            "keep": keep, "soon": soon, "due": due, "hold": hold,
+            "counts": {"keep": len(keep), "soon": len(soon),
+                       "due": len(due), "hold": len(hold)},
+            "next_expire_at": nxt,
+            "bytes_due": sum(int(e.get("bytes") or 0) for e in due)}
+
+
+def cleanup_quarantine(now=None, dry_run=False, ids=None) -> dict:
+    """按保留期清理 `due` 记录（**只清安全项**；`hold` 永远留着）。
+
+    * `dry_run=True` 只算不动；
+    * `ids` 非空 = 只清这几条（后台守护用：到期后先提醒、宽限期过了才清）；
+    * `ids=None` = 清全部 `due`（面板上用户手动点「立即清理」时用）。
+    """
+    plan = quarantine_plan(now)
+    cfg = plan["config"]
+    want = {str(x) for x in ids} if ids else None
+    due = [e for e in plan["due"] if e.get("id") and (want is None or str(e.get("id")) in want)]
+    ids_due = [str(e.get("id")) for e in due]
+    dropped = []
+    if not dry_run and cfg.get("cleanup"):
+        for qid in ids_due:
+            try:
+                drop_quarantine(qid)
+                dropped.append(qid)
+            except Exception:                          # noqa: BLE001
+                continue
+    return {"ok": True, "dry_run": bool(dry_run), "enabled": bool(cfg.get("cleanup")),
+            "ids": ids_due, "dropped": dropped,
+            "freed": sum(int(e.get("bytes") or 0) for e in due if e.get("id") in dropped),
+            "bytes_due": sum(int(e.get("bytes") or 0) for e in due),
+            "held": plan["hold"], "soon": plan["soon"],
+            "counts": plan["counts"]}
+
+
 def stats() -> dict:
-    """隔离区 / 快照仓的总占用（给 UI 显示）。"""
+    """忏悔室 / 快照仓的总占用（给 UI 显示）。"""
     def _size(p):
         t = 0
         for dp, _dn, fns in os.walk(p):
@@ -791,7 +1117,9 @@ def stats() -> dict:
     return {"quarantine": _size(QUARANTINE_DIR), "store": _size(STORE_DIR),
             "snapshots": _size(SNAPSHOT_DIR), "quarantine_dir": QUARANTINE_DIR,
             "snapshot_dir": SNAPSHOT_DIR,
-            "store_limit": MAX_STORE_BYTES, "keep": KEEP_SNAPSHOTS}
+            "store_limit": MAX_STORE_BYTES, "keep": KEEP_SNAPSHOTS,
+            "quarantine_cfg": quarantine_config(),
+            "auto_copy_limit": AUTO_COPY_MAX_BYTES}
 
 
 # ---------------------------------------------------------------- 3. 从命令里猜"要动的东西"
@@ -806,6 +1134,23 @@ _ENV = re.compile(r"%[^%]+%|\$env:[A-Za-z_][A-Za-z0-9_]*|\$\{?[A-Za-z_][A-Za-z0-
 _VERB_DESTRUCTIVE = re.compile(
     r"remove-item|\brm\b|\brd\b|rmdir|\bdel\b|\berase\b|move-item|\bmv\b|\bmove\b|"
     r"clear-content|set-content|out-file|copy-item|\bcp\b|robocopy|xcopy", re.I)
+
+# ★代码内嵌删除（Python / Node / .NET）：命令原文里没有 `rm` / `del`，但确实在删文件。
+#   只认**带引号的字面路径**；变量 / 拼接一律进 `unresolved`（fail-closed，交给上层弹窗）。
+_CODE_DELETE = re.compile(
+    r"""(?ix)
+    (?:
+        shutil\.rmtree | os\.removedirs | os\.remove | os\.unlink
+      | (?:fs|fsp)\.(?:rmSync|rm|unlinkSync|unlink|rmdirSync|rmdir)
+      | \.(?:rmSync|unlinkSync|rmdirSync)
+      | (?:file|directory)\s*\]?\s*::\s*delete
+    )
+    \s*\(\s*(['"])([^'"]+)\1
+    """
+)
+# `Path('a.log').unlink()`：引号在 `.unlink` 前面，单独抓。
+_PATHLIB_UNLINK = re.compile(
+    r"""(?ix) path \s* \( \s* (['"]) ([^'"]+) \1 \s* \) \s* \.unlink \s* \( """)
 
 
 def _tokens(cmd: str) -> list:
@@ -895,6 +1240,17 @@ def guess_targets(cmd: str, root: str) -> dict:
                     _push(p)
             else:
                 unresolved.append(raw[:200])
+
+    # ★代码内嵌删除（Python / Node / .NET）：只认带引号的字面路径，变量 → unresolved
+    for pat in (_CODE_DELETE, _PATHLIB_UNLINK):
+        for m in pat.finditer(cmd or ""):
+            raw = m.group(2)
+            hits = _resolve(raw, root)
+            if hits:
+                for p in hits:
+                    _push(p)
+            else:
+                unresolved.append(raw[:200])
     return {"targets": targets, "unresolved": unresolved}
 
 
@@ -907,15 +1263,19 @@ _TURN_CACHE: dict = {}
 _TURN_LOCK = threading.RLock()
 
 
-def take_turn_snapshot(root: str, scope: str, label: str = "") -> dict:
-    """给「某一轮」落一次**只记路径+哈希**的快照（不带内容，热扫走内存缓存）。
+def take_turn_snapshot(root: str, scope: str, label: str = "",
+                       with_content: bool = False) -> dict:
+    """给「某一轮」落一次快照。
 
-    用途：群聊派活时，在 agent 动手**之前**记一份；之后 `diff_manifests(latest, scan(当前))`
-    就能回答「这个人改了哪些文件」。**不写内容仓** → 不占磁盘。
+    `with_content=False`（默认）= **只记路径+哈希**（不带内容，热扫走内存缓存）：
+    用来回答「这个人改了哪些文件」，不占磁盘、**不能回滚**。
+    `with_content=True` = 连内容一起进内容仓（增量、天然去重）：
+    多花一点磁盘，但之后能 `undo_snapshot` **一键退回**（`ui 0.2.85` 起可选）。
     """
     with _TURN_LOCK:
         cache = _TURN_CACHE.get(str(scope))
-    res = take_snapshot(root, scope, label=label or "turn", cache=cache, with_content=False)
+    res = take_snapshot(root, scope, label=label or "turn", cache=cache,
+                        with_content=bool(with_content))
     man = load_manifest(str(scope), res["ts"]) or {}
     with _TURN_LOCK:
         _TURN_CACHE[str(scope)] = man.get("files") or {}
@@ -923,6 +1283,34 @@ def take_turn_snapshot(root: str, scope: str, label: str = "") -> dict:
             for k in list(_TURN_CACHE.keys())[:50]:
                 _TURN_CACHE.pop(k, None)
     return res
+
+
+def list_scopes(limit: int = 40) -> list:
+    """所有 scope 的「最新一次快照」摘要（审计页「轮快照」列表用）。
+
+    返回 `[{scope, ts, taken_at, root, label, count, with_content}]`，**按时间新→旧**。
+    `with_content=True` 的才能一键退回（否则只有清单）。
+    """
+    out = []
+    try:
+        names = os.listdir(SNAPSHOT_DIR)
+    except OSError:
+        return out
+    for nm in names:
+        if nm.startswith("_"):
+            continue
+        d = os.path.join(SNAPSHOT_DIR, nm)
+        if not os.path.isdir(d):
+            continue
+        lst = list_snapshots(nm)
+        if not lst:
+            continue
+        one = dict(lst[0])
+        one["scope"] = nm
+        one["runs"] = len(lst)
+        out.append(one)
+    out.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
+    return out[:max(1, int(limit or 40))]
 
 
 def changes_since_latest(root: str, scope: str) -> dict:

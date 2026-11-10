@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 
 CREATE_NO_WINDOW = 0x08000000
@@ -96,6 +97,21 @@ def _inject_git_path(env: dict) -> None:
         env[key] = (cur.rstrip(";") + ";" + ";".join(add)) if cur else ";".join(add)
 
 
+def _inject_cu_path(env: dict) -> None:
+    """把 cocraft 的 `cu`（桌面工具）薄壳目录补进 PATH。
+
+    ACP 没有"客户端自定义工具"，所以给 agent 一双"手"的办法就是：
+    命令在 PATH 里 + prompt 里讲一句（见 service.py 的工具卡）。
+    """
+    try:
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        sys.path.insert(0, os.path.join(root, "backend"))
+        from computer.shim import inject_path  # noqa: WPS433
+        inject_path(env)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class AcpProcess:
     """一个 ACP agent 子进程。回调都在后台读线程里触发。"""
 
@@ -130,6 +146,7 @@ class AcpProcess:
         env["PYTHONUTF8"] = "1"
         _inject_git_path(env)          # 自动把本机 Git 的 bin 补进 PATH（bash 要用）
         _inject_pwsh_path(env)         # 自动把 pwsh 补进 PATH（Codex 优先用它，UTF-8 不乱码）
+        _inject_cu_path(env)           # 自动把 `cu`（桌面工具）放进 PATH
         self._proc = subprocess.Popen(
             self.command, cwd=self.cwd, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

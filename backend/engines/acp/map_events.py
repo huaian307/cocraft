@@ -112,9 +112,36 @@ class AssistantTurn:
         self.plan = None            # agent 的计划（todo）；不进 content，走事件
         self.plan_id = ""
         self.context = None         # 上下文窗口占用 {used, size}
+        self.cost = None            # agent 报的费用（`usage_update.cost`）；口径见 _note_cost
+        self.cost_currency = ""
+        self.error = None           # ★本轮失败：面板用它渲染「错误卡」（余额不足 / 限流 / 连不上…）
+        self.compaction_parts = []  # 上下文压缩摘要（单独成一条 compaction 消息）
+        self.compaction_at = None
+        self.compaction_before_text = True
         self._tool_index = {}
         self._text_seq = 0
         self._reason_seq = 0
+
+    # ---- 费用 ----
+    def _note_cost(self, amount, currency=""):
+        """记一次费用。ACP 各家口径不一：**累计**（opencode-acp）或**本轮增量**。
+
+        判定：新值 >= 旧值 → 当累计，直接覆盖；变小 → 当增量，累加。
+        （单调递增的累计值不会触发第二条；真正逐轮报增量的也不会被吃掉。）
+        """
+        try:
+            amt = float(amount)
+        except (TypeError, ValueError):
+            return
+        if currency:
+            self.cost_currency = str(currency)
+        if self.cost is None:
+            self.cost = amt
+        elif amt >= float(self.cost) - 1e-12:
+            self.cost = amt
+        else:
+            self.cost = float(self.cost) + amt
+
 
     # ---- 增量 → 事件 ----
     def _delta(self, kind, text):
@@ -196,9 +223,16 @@ class AssistantTurn:
             ev = self._delta("reasoning", content_text(update.get("content")))
             return [ev] if ev else []
         if kind == "compaction_summary_chunk":
-            # 上下文压缩的摘要：丢进思考里比整段丢掉强
-            ev = self._delta("reasoning", content_text(update.get("content")))
-            return [ev] if ev else []
+            # 上下文压缩的摘要：**单独成一条 compaction 消息**（面板有专门的「会话已压缩」卡片），
+            # 不再塞进思考里 —— 以前混在 thinking 里，用户根本看不出"压缩过了"，长摘要还特别吵。
+            txt = content_text(update.get("content"))
+            if not txt:
+                return []
+            if self.compaction_at is None:
+                self.compaction_at = now_ms()
+                self.compaction_before_text = not any(str(s).strip() for s in self.text_segments)
+            self.compaction_parts.append(txt)
+            return []                       # 不发 reasoning.delta（不是碎碎念）
         if kind == "tool_call":
             self.break_text_segment()          # ★文字 → 工具 = 一段结束
             tcid = update.get("toolCallId") or ("t%d" % len(self.tools))
@@ -266,12 +300,22 @@ class AssistantTurn:
             return [self._ev("session.plan.update", planId=update.get("planId") or self.plan_id,
                              plan=None)]
         if kind == "usage_update":
-            # ⚠ 这是**上下文窗口**占用（used/size），不是账单 token —— 别拿它当费用。
+            # ⚠ `used` 是**上下文窗口**占用，不是账单 token；但同一个 update 里可能带 `cost`
+            #   （opencode-acp 实测会给 `{"amount":…,"currency":"USD"}`）→ 那个才是费用。
             used = int(update.get("used") or 0)
             size = int(update.get("size") or 0)
-            self.context = {"used": used, "size": size}
+            # ★带上「是哪个模型上报的」：切模型后旧的窗口上限不能再当新模型的上限用
+            #   （用户实测：Iceman Free 256K → 1017 1M，面板一直显示 26.2 万）。
+            self.context = {"used": used, "size": size, "model": self.model or ""}
+            cost = update.get("cost")
+            if isinstance(cost, dict):
+                self._note_cost(cost.get("amount"), cost.get("currency") or "")
+            elif isinstance(cost, (int, float)):
+                self._note_cost(cost)
             return [self._ev("session.usage.update", used=used, size=size,
-                             ratio=(round(used / size, 4) if size else None))]
+                             model=self.model or "",
+                             ratio=(round(used / size, 4) if size else None),
+                             cost=(self.cost if self.cost is not None else None))]
         return []
 
     # ---- 权威消息 ----
@@ -299,7 +343,28 @@ class AssistantTurn:
             m["context"] = self.context
         if self.plan:                    # 同上：计划挂在消息上，不进 content
             m["plan"] = self.plan
+        # ★失败：把错误挂到**消息**上（前端 `assistantErrorCard` 才能画「余额不足 / 限流…」卡片，
+        #   而不是一句"这一轮确实没有返回正文"）。以前只发 `session.error` 事件 → 刷新后卡片就没了。
+        if self.error:
+            m["error"] = self.error
+            m["finish"] = "error"
         return m
+
+    def compaction_message(self):
+        """本轮的上下文压缩摘要 → 一条独立的 `compaction` 消息（没有就回 None）。
+
+        形状与 OpenCode 那边一致（`type/status/reason/summary/time`），前端的
+        `renderCompactionMsg()` 直接就能画「会话已压缩 + 可折叠摘要」。
+        """
+        txt = "".join(self.compaction_parts).strip()
+        if not txt:
+            return None
+        out = {"id": "cmp_%s" % self.id, "type": "compaction", "status": "completed",
+               "reason": "auto", "summary": txt,
+               "time": {"created": int(self.compaction_at or self.started)}}
+        if self.model:
+            out["model"] = {"id": self.model}
+        return out
 
 
 # ---------------- elicitation / permission 的字段转换 ----------------

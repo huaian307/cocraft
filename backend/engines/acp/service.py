@@ -19,10 +19,15 @@ import threading
 import time
 
 from .. import STATE_DIR
+from .. import base                     # ★先隔离再放行（单聊）：quarantine_before_allow
 try:
     import audit                                 # ★审计链：面板里对 ACP 权限申请的答复
 except ImportError:                              # 以 `backend.engines.acp.service` 形式加载时（测试）
     from backend import audit  # type: ignore  # noqa: F401,F811
+try:
+    import errkind                               # ★报错分类（余额不足 / 限流 / 网络…）
+except ImportError:                              # 同上（测试里的包形式）
+    from backend import errkind  # type: ignore  # noqa: F401,F811
 
 from .client import AcpClient, AcpClosed
 from .map_events import AssistantTurn, content_text, now_ms, pick_option_id, schema_to_fields
@@ -36,6 +41,96 @@ CLIENT_CAPABILITIES = {"elicitation": {"form": {}},
                        "_meta": {"terminal_output_delta": True}}
 # Codex 在自定义 provider 下会把这段告警当正文/想法输出；弹窗"背景"里没必要带它
 _MODEL_WARN_RE = re.compile(r"^\s*Warning: Model metadata for `[^`]*` not found\.[^\n]*\n+", re.I)
+
+# ---------------------------------------------------------------- 桌面工具卡
+# ACP 协议没有「客户端自定义工具」：agent 的工具是它自己的。所以"像技能一样
+# 让所有 agent 都能用 cu"= **命令在 PATH 里**（process.py 注入 runtime/bin）
+# + **每轮 prompt 讲一句**（首轮完整卡，之后只留一行，省 token）。
+CU_CARD = """【桌面 + 浏览器工具（cocraft 提供，命令已在 PATH 里；输出都是一行 JSON）】
+■ 桌面窗口（原生应用）：**不要截图猜坐标**
+  cu windows [--title QQ]                     列窗口（hwnd / 标题 / 进程 / 矩形 / 是否前台）
+  cu tree --hwnd N --depth 4 --prune          导出 UIA 树（控件名 / 角色 / 矩形 / 可用模式）
+  cu find --hwnd N --name 发送 --role Button  按名字/角色/AutomationId/类名找控件
+  cu click --hwnd N --name 发送               点控件（一次调用完成 find+click）
+  cu type --hwnd N --class-like EDIT --text "…" [--replace]
+  cu keys --hwnd N --keys CTRL+S              cu wait --hwnd N --name 完成 --timeout-ms 8000
+  cu shot --hwnd N                            只截目标窗口，不抢前台
+■ 网页（浏览器）：**用选择器，不要用桌面像素**（Chromium 的 UIA 树拿不到 DOM）
+  cu browser status | cu browser list         浏览器是否在跑 / 列标签
+  cu browser open --url URL [--headless]      开新标签（专用 profile，不碰日常浏览器）
+  cu browser text --selector "#id"            读元素文本（--selector body = 整页）
+  cu browser click --selector "#btn"          真实鼠标点击
+  cu browser type --selector "#q" --text "…" [--clear]
+  cu browser wait --selector "#done" --timeout-ms 8000
+  cu browser shot [--full]                    页面截图
+  cu browser eval --js "…"                    执行 JS（**按动作管**，能提交表单）
+■ 直接调接口（不用开页面）
+  cu http get --url URL [--cookies auto|none] [--header "K: V"]    只读；auto 会带浏览器已登录的 cookie
+  cu http post --url URL --json "{\"k\":1}" [--method PUT]         写请求（按动作管，默认 deny）
+■ 复用：同一类任务**第二次别再重新探索**（不花模型，10 秒级）
+  cu macro list                               看本机有哪些宏（步数 / 参数 / 是否含危险动作）
+  cu macro play 名字 --set 参数=值 --allow-actions   回放（失败即停；--dry-run 先预检控件在不在）
+  cu macro save 名字 --from-run <run_id>      把这一轮做过的动作提取成宏（也可 --from-audit --since 2h）
+规则：① 先树/查找（桌面）或先 text（网页）再动手；界面一变元素 id 就失效，重新 find。
+      ② 「发送 / 支付 / 删除 / 卸载」这类不可撤销动作会被直接拒绝 —— 换对应 API / CLI 做。
+      ③ 同一时刻只有一个 agent 能动鼠标键盘（桌面租约）；返回 busy 就等或换只读工具。
+      ④ 有 API/CLI 的优先用 API/CLI；GUI/浏览器只是没有接口时的最后手段。
+      ⑤ 动手前先 `cu macro list`：有能用的宏就回放，别从零探索（省 10 倍时间）；宏失败再回探索模式。
+      ⑥ **动作类命令（click/type/keys/macro play）要加 `--allow-actions`**：单聊里这样才会执行
+         （面板会弹一次确认 = 整条命令/整条宏；工作流里 trust 成员不用加）。只读命令从不弹窗。"""
+CU_ONE_LINE = ("【桌面/网页】原生窗口用 `cu windows/tree/find/click/type/shot`，网页用 "
+               "`cu browser open/text/click/type/shot`（选择器，别截图猜坐标）；先 `cu macro list` 看有没有现成宏；返回 JSON，先查再动。")
+
+# ------------------------------------------------------- 注入前缀：只在"显示时"剥掉
+# ACP 既没有「客户端自定义工具」也没有「系统消息」：工具卡 / 本地补记 / 技能正文
+# 都只能**拼在用户消息前面**一起发（见 `_start_turn`）。而 opencode-acp 与 OpenCode
+# 桌面端共用同一个 SQLite，`messages()` 又是**直接读库** → 这些前缀会被当成"用户说的
+# 话"显示在面板和客户端里（用户 2026-11-05 发图："这个是啥？我没有输入过这一段"）。
+#
+# 这里只做**展示层**的剥离：注入照旧（agent 能力不变），只是不把它当用户原话显示。
+_CU_CARD_HEAD = "【桌面 + 浏览器工具（cocraft 提供"
+_CU_CARD_TAIL = "只读命令从不弹窗。"
+_CU_LINE_HEAD = "【桌面/网页】"
+_CU_LINE_TAIL = "返回 JSON，先查再动。"
+_RESEED_HEAD = "（本地补记：以下是面板保存的此前对话"
+_RESEED_TAIL = "（以上为历史。）"
+
+
+def _strip_one_prefix(out):
+    """剥掉**开头**一段已知的注入前缀；剥不动就原样返回。"""
+    if out.startswith(_RESEED_HEAD):
+        i = out.find(_RESEED_TAIL)
+        if i >= 0:
+            return out[i + len(_RESEED_TAIL):].lstrip("\r\n")
+    if out.startswith(_CU_CARD_HEAD):
+        i = out.find(_CU_CARD_TAIL)
+        if i >= 0:
+            return out[i + len(_CU_CARD_TAIL):].lstrip("\r\n")
+    if out.startswith(_CU_LINE_HEAD):
+        nl = out.find("\n")
+        first = out if nl < 0 else out[:nl]
+        if _CU_LINE_TAIL in first:
+            return (out[nl + 1:] if nl >= 0 else "").lstrip("\r\n")
+    return out
+
+
+def strip_injected_prefix(text, rounds: int = 3):
+    """把注入前缀从「给人看」的那份消息里剥掉。
+
+    三条安全阀（别省）：
+      · 只剥**开头** —— 用户在正文里引用这些文本时不会被吞（用户就贴过整张卡）；
+      · 每段都要**看到结束标记**才动手 —— 卡片以后改版也不会误删多行正文；
+      · 剥完变空 → 回原文 —— 宁可多显示一段，也不能把消息变成空白气泡。
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    out = text.lstrip("\ufeff \t\r\n")
+    for _ in range(max(1, int(rounds or 1))):
+        nxt = _strip_one_prefix(out)
+        if nxt == out:
+            break
+        out = nxt
+    return out or text
 
 
 def _destructive_cmd(cmd) -> bool:
@@ -314,7 +409,8 @@ def _opencode_history(rid, limit: int = 400) -> list:
         m = {"id": str(mid), "time": d.get("time") or {}}
         if t == "user":
             m["type"] = "user"
-            m["text"] = d.get("text") or ""
+            # ⚠ 库里这条 user 消息是「注入前缀 + 用户原话」拼起来的（见 strip_injected_prefix）
+            m["text"] = strip_injected_prefix(d.get("text") or "")
             if d.get("files"):
                 m["files"] = d["files"]
             if d.get("metadata"):
@@ -322,6 +418,15 @@ def _opencode_history(rid, limit: int = 400) -> list:
         elif t == "assistant":
             m["type"] = "assistant"
             m["content"] = d.get("content") or []     # opencode 的形状 ≈ 面板的形状
+            # ★失败消息：库里是 `finish:"error"` + `error:{...}`（例如余额不足 402）。
+            #   以前这三项没透传 → 前端只看到空正文 → 显示"这一轮确实没有返回正文"。
+            for _k in ("finish", "rawFinish", "error"):
+                if d.get(_k) is not None:
+                    m[_k] = d[_k]
+            # ★正在生成的那一步：库里已经有这一行、但还没有 `completed`。
+            #   前端据此**不要**再画一遍（live 缓冲会画），否则同一步会出现两个「正在思考…」。
+            if not (isinstance(m.get("time"), dict) and m["time"].get("completed")):
+                m["inflight"] = True
             if d.get("agent"):
                 m["agent"] = d["agent"]
             if d.get("model"):
@@ -339,10 +444,55 @@ def _opencode_history(rid, limit: int = 400) -> list:
         elif t in ("model-switched", "agent-switched"):
             m["type"] = "system"                       # 转成系统提示，别让前端糊成原始 JSON
             m["text"] = _opencode_switched_notice(t, d)
+        elif t == "compaction":
+            # ★上下文压缩：以前落到 `else: continue` 被整条丢掉（用户看不到"会话已压缩"）。
+            #   库里的字段已经就是面板要的形状（status/reason/summary/tokens/cost/time）。
+            m["type"] = "compaction"
+            for k in ("status", "reason", "model", "summary", "recent", "cost", "tokens"):
+                if d.get(k) is not None:
+                    m[k] = d[k]
         else:
             continue                                   # idle / 其他内部消息：跳过
         out.append(m)
     return out
+
+
+_OPENCODE_COST_CACHE = {}        # sid -> ((max_seq, count), total_cost)
+
+
+def _opencode_session_cost(rid):
+    """共享库里这条会话的**总费用**（把每条 assistant 消息的 `cost` 加起来）。
+
+    ⚠ 两边口径不同（别混用）：
+      · OpenCode 库里 cost 是**每条消息**一份（实测 0.001~0.003 USD）；
+      · ACP 的 `usage_update.cost` 多为**会话累计**（见 `map_events.AssistantTurn._note_cost`）。
+    这里按"逐条求和"，带 (max seq, count) 签名缓存 —— 消息没变就不重复算。
+    """
+    key = str(rid or "").strip()
+    if not key:
+        return None
+    sig_rows = _opencode_query(
+        "select max(seq), count(*) from session_message where session_id=?", (key,))
+    if not sig_rows:
+        return None
+    sig = tuple(sig_rows[0] or ())
+    hit = _OPENCODE_COST_CACHE.get(key)
+    if hit and hit[0] == sig:
+        return hit[1]
+    rows = _opencode_query(
+        "select data from session_message where session_id=? and type='assistant'", (key,))
+    if not rows:
+        return None
+    total = 0.0
+    for (data,) in rows:
+        try:
+            c = json.loads(data or "{}").get("cost")
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(c, (int, float)):
+            total += float(c)
+    _OPENCODE_COST_CACHE[key] = (sig, total)
+    return total
 
 
 def _opencode_session_dir(rid) -> str:
@@ -430,6 +580,77 @@ def _reseed_text(messages, cap: int = 30, max_chars: int = 12000, per_msg: int =
         return ""
     return ("（本地补记：以下是面板保存的此前对话，仅作为上下文，请据此继续；不要复述这段补记。）\n"
             + "\n\n".join(lines) + "\n（以上为历史。）")
+
+
+def _usage_cost(usage):
+    """从 `usage` 里取 `(amount, currency)`；没有就 `(None, "")`。"""
+    if not isinstance(usage, dict):
+        return None, ""
+    c = usage.get("cost")
+    if isinstance(c, dict):
+        amt, cur = c.get("amount"), str(c.get("currency") or "")
+        if isinstance(amt, (int, float)):
+            return float(amt), cur
+        return None, cur
+    if isinstance(c, (int, float)):
+        return float(c), ""
+    return None, ""
+
+
+def _note_session_cost(s, amount, currency=""):
+    """把一次费用记到会话上（累计 / 增量两种口径都兼容）。
+
+    规则与 `map_events.AssistantTurn._note_cost` 一致：新值 ≥ 旧值 → 当累计直接覆盖；
+    变小 → 当"本轮增量"累加。这样 opencode-acp（累计）和逐轮报数的 agent 都不会算错。
+    """
+    try:
+        amt = float(amount)
+    except (TypeError, ValueError):
+        return
+    if currency:
+        s["costCurrency"] = str(currency)
+    prev = s.get("cost")
+    prev = float(prev) if isinstance(prev, (int, float)) else None
+    if prev is None:
+        s["cost"] = amt
+    elif amt >= prev - 1e-12:
+        s["cost"] = amt
+    else:
+        s["cost"] = prev + amt
+
+
+_PRICE_FILE = os.path.join(STATE_DIR, "_model_prices.json")
+
+
+def _model_prices() -> dict:
+    """可选价格表：`runtime/state/_model_prices.json`（**没有就什么也不显示**，绝不编价格）。
+
+    形状（每百万 token · USD，前端 `models()` 弹窗直接按这个显示）：
+      {
+        "deepseek/deepseek-flash": {"input": 0.28, "output": 0.42,
+                                    "cache": {"read": 0.028, "write": 0}},
+        "deepseek-chat": {"input": 0.28, "output": 0.42}      // 也可以只写模型 id
+      }
+    """
+    try:
+        with open(_PRICE_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _price_row(price):
+    """把价格表里的一行转成前端 `/api/model` 认的 `cost[]`；不认识就 None。"""
+    if isinstance(price, list):
+        return price or None
+    if not isinstance(price, dict):
+        return None
+    cache = price.get("cache") if isinstance(price.get("cache"), dict) else {}
+    if not any(isinstance(price.get(k), (int, float)) for k in ("input", "output")):
+        return None
+    return [{"input": price.get("input"), "output": price.get("output"),
+             "cache": {"read": cache.get("read"), "write": cache.get("write")}}]
 
 
 class BusyError(Exception):
@@ -834,7 +1055,10 @@ class AcpService:
         try:
             keys = ("id", "agent", "agentSessionId", "title", "location", "model", "time",
                     "tokens", "cost", "outcome", "context", "plan", "imported", "attach",
-                    "messages", "pendingSkills")
+                    "messages", "pendingSkills",
+                    # ★ 桌面工具卡发过没发过：不存的话每次重启后**第一条消息又发一整张卡**
+                    #   （本意是每个会话只在首轮发一次，之后一行；2026-11-05 用户反馈消息里出现整张卡）
+                    "cuCardShown")
             with self._lock:
                 mine = [{k: s.get(k) for k in keys}
                         for i in self._order if (s := self._sessions.get(i))]
@@ -1096,9 +1320,16 @@ class AcpService:
         if kind == "usage_update":
             used = int(update.get("used") or 0)
             size = int(update.get("size") or 0)
-            s["context"] = {"used": used, "size": size}
+            # ★记下上报模型：切模型后前端据此忽略「旧模型窗口」（见 ctxCompute）
+            _m = getattr(self, "_model", "") or ""
+            s["context"] = {"used": used, "size": size, "model": _m}
+            try:
+                self._maybe_planner_handoff(s, s["context"])
+            except Exception:
+                pass
             return [{"type": "session.usage.update",
                      "data": {"sessionID": sid, "used": used, "size": size,
+                              "model": _m,
                               "ratio": (round(used / size, 4) if size else None)}}]
         return []
 
@@ -1142,6 +1373,21 @@ class AcpService:
             return self._ask_form(params)
         raise RuntimeError("客户端不支持该请求：%s" % method)
 
+    def _capture_change(self, sid, kind, title, locations, cmd, note=""):
+        """★忏悔室：放行前把「修改前 / 删除前」的旧版复制进隔离库。失败只记日志。"""
+        try:
+            ws = str(((self._sessions.get(sid) or {}).get("location") or {})
+                     .get("directory") or "")
+            qid = base.capture_before_allow(
+                ws, cmd, title or "", locations,
+                scope="panel-%s" % str(sid or "")[:20], note=note or "", kind=kind or "")
+            if qid:
+                self._log("[acp] 忏悔室已留存旧版（%s）→ %s" % (title or kind or "", qid))
+            return qid
+        except Exception as exc:            # noqa: BLE001 - 不挡放行
+            self._log("[acp] 忏悔室留存失败（不影响放行）：%r" % (exc,))
+            return ""
+
     def _ask_permission(self, params):
         sid = self._local_sid(params.get("sessionId"))    # ★ 权限请求也带 agent 侧 id
         tc = params.get("toolCall") or {}
@@ -1154,6 +1400,12 @@ class AcpService:
         reason = str(meta.get("description") or "").strip()
         title = str(meta.get("title") or "").strip() or tc.get("title") or tc.get("name") or "工具调用"
         kind = str(tc.get("kind") or "")
+        raw = tc.get("rawInput") if isinstance(tc.get("rawInput"), dict) else {}
+        cmd = str(raw.get("command") or raw.get("cmd") or raw.get("script") or "").strip()
+        for _k in ("file_path", "filePath", "path", "file"):
+            _v = raw.get(_k)
+            if isinstance(_v, str) and _v.strip() and _v not in locations:
+                locations.append(_v)
 
         # ① 先看「始终允许」的记忆：命中就直接放行，不再弹窗打断用户。
         #    ⚠ 只在**同 agent + 同会话 + 同 kind**（或规则写 "*"）时命中；
@@ -1163,6 +1415,8 @@ class AcpService:
             oid = pick_option_id(options, "always") or pick_option_id(options, "once")
             if oid is not None:
                 self._hit_rule(rule)
+                self._capture_change(sid, kind, title, locations, cmd,
+                                     note="始终允许自动放行前留存")
                 self._log("[acp] 按「始终允许」自动放行：%s（%s）" % (title, rule.get("id")))
                 self._emit({"type": "permission.auto", "data": {
                     "sessionID": sid, "action": title, "rule": dict(rule),
@@ -1174,8 +1428,30 @@ class AcpService:
         #   ★ 2026-10-13：把 `info`（含**命令原文** rawInput/command）也传给钩子 —— 否则桥只能看到
         #     "Run command" 这种标题，等于**盲签**（桌面被清空那次就是盲签 + 自动放行）。
         hook = getattr(self, "auto_permission", None)
-        raw = tc.get("rawInput") if isinstance(tc.get("rawInput"), dict) else {}
-        cmd = str(raw.get("command") or raw.get("cmd") or raw.get("script") or "").strip()
+
+        # ★ `cu`（桌面工具）不要弹窗：
+        #   · 只读（windows/tree/find/shot/wait/clipboard-get…）**永远**自动放行；
+        #   · 动作（click/type/keys…）外层也放行，真正的闸门在 cu 进程里
+        #     （COCRAFT_CU_ACTIONS / 黑名单 / 危险词 / 桌面租约 / 审计）；
+        #   · 但命令里带 `--allow-actions` 的**不**自动放行 —— 那等于 agent 自己给自己授权。
+        #   不加这一条，一个 GUI 任务会弹几十次审批（实测 50 次），工作流根本跑不动。
+        try:
+            from computer import gate as _cu_gate
+            _cu = _cu_gate.parse_cu_command(cmd)
+        except Exception:  # noqa: BLE001
+            _cu = None
+        if _cu is not None:
+            _cu_sub, _cu_readonly = _cu
+            if _cu_readonly or "--allow-actions" not in cmd:
+                _oid = pick_option_id(options, "once")
+                if _oid is not None:
+                    self._emit({"type": "permission.auto", "data": {
+                        "sessionID": sid, "action": title, "verdict": "cu",
+                        "sub": _cu_sub, "readonly": _cu_readonly}})
+                    self._log("[acp] cu 命令自动放行（%s%s）"
+                              % (_cu_sub, " · 只读" if _cu_readonly else " · 动作"))
+                    return {"outcome": {"outcome": "selected", "optionId": _oid}}
+
         if callable(hook):
             info = {"kind": kind, "title": title, "locations": locations, "options": options,
                     "command": cmd, "toolCallId": tc.get("toolCallId"), "rawInput": raw}
@@ -1192,10 +1468,62 @@ class AcpService:
                 if oid2 is None and verdict in ("always", "once"):
                     oid2 = pick_option_id(options, "once")   # 对方没给 always 就退 once
                 if oid2 is not None:
+                    if str(verdict) in ("once", "always"):
+                        self._capture_change(sid, kind, title, locations, cmd,
+                                             note="自动应答前留存")
                     self._emit({"type": "permission.auto", "data": {
                         "sessionID": sid, "action": title, "verdict": str(verdict)}})
                     self._log("[acp] 自动应答权限（%s）：%s" % (verdict, title))
                     return {"outcome": {"outcome": "selected", "optionId": oid2}}
+
+        # ★低风险删除（`ui 0.2.95`）：**先隔离，再自动放行**。
+        #   只认「删除类」命令；目标评分 ≤ 阈值（默认 ★）、范围完全确定、隔离没跳过任何一项
+        #   才放行 —— 任何一条不满足都照旧弹窗（fail-closed）。
+        #   ⚠ 这条不是"放开破坏性操作"：它只覆盖 node_modules / __pycache__ / dist / *.log
+        #     这类**可再生成**的东西，而且必须留下隔离记录（超 64 MB 只留清单墓碑）。
+        try:
+            import file_rank as _fr                      # noqa: PLC0415
+            import snapshots as _snap                    # noqa: PLC0415
+            _cfg = _snap.quarantine_config()
+            if cmd and _cfg.get("enabled"):
+                s0 = self._sessions.get(sid) or {}
+                ws = str(((s0.get("location") or {}).get("directory")) or "")
+                _tr = _fr.triage(ws, cmd, max_star=int(_cfg.get("maxStar") or 1))
+                if _tr.get("ok"):
+                    _rec = _snap.quarantine_paths(
+                        ws, _tr.get("targets") or [], scope="panel-%s" % str(sid)[:20],
+                        note=(title or "低风险删除"), cmd=cmd, auto=True,
+                        scores=_tr.get("items"), kind="delete")
+                    if _rec and not (_rec.get("skipped") or []):
+                        _oid = pick_option_id(options, "once")
+                        if _oid is not None:
+                            self._emit({"type": "permission.auto", "data": {
+                                "sessionID": sid, "action": title, "verdict": "delete-ticket",
+                                "quarantine": _rec.get("id"),
+                                "stars": _tr.get("max_star"),
+                                "count": len(_rec.get("items") or []),
+                                "tombstone": bool(_rec.get("tombstone"))}})
+                            self._log("[acp] 低风险删除自动隔离放行（★≤%s）：%s -> %s"
+                                      % (_cfg.get("maxStar"), title, _rec.get("id")))
+                            try:
+                                audit.append(
+                                    "permission",
+                                    actor={"kind": "system", "name": "file_rank", "engine": "acp"},
+                                    action={"kind": "delete", "title": title or "低风险删除",
+                                            "command": cmd, "targets": _tr.get("targets") or [],
+                                            "destructive": True},
+                                    decision="allow", result="ok",
+                                    ref={"session": sid, "scope": str(_rec.get("id") or "")},
+                                    quarantine=str(_rec.get("id") or ""),
+                                    note="低风险删除自动隔离放行 · ★≤%s · %d 项%s"
+                                         % (_cfg.get("maxStar"), len(_rec.get("items") or []),
+                                            " · 仅清单（超 64MB 未复制）" if _rec.get("tombstone") else ""),
+                                    via="system")
+                            except Exception:            # noqa: BLE001
+                                pass
+                            return {"outcome": {"outcome": "selected", "optionId": _oid}}
+        except Exception as _exc:                          # noqa: BLE001
+            self._log("[acp] 低风险删除检查失败（不影响询问）：%r" % (_exc,))
 
         # ★按「面板权限等级」自动放行（**后端**做，别只靠前端轮询）。
         #   为什么：前端只轮询「当前会话」，切到别的会话 / 页面关掉 / 页面刚好刷新
@@ -1204,12 +1532,15 @@ class AcpService:
         try:
             import cocraft_agents as _ca          # 同一份 _perm_level.json（延迟 import，避免环）
             lv = _ca.perm_level()
-            if lv and lv != "ask" and not (cmd and _ca._is_destructive(cmd)):
+            if lv and lv != "ask" and not (cmd and _ca._is_destructive(cmd)) \
+                    and not (cmd and _ca._is_secret(cmd)):
                 s0 = self._sessions.get(sid) or {}
                 ws = str(((s0.get("location") or {}).get("directory")) or "")
                 if _ca.allowed_by_level(lv, kind, title, reason or title, locations, ws):
                     oid3 = pick_option_id(options, "once")
                     if oid3 is not None:
+                        self._capture_change(sid, kind, title, locations, cmd,
+                                             note="按权限等级自动放行前留存")
                         self._emit({"type": "permission.auto", "data": {
                             "sessionID": sid, "action": title, "level": lv, "verdict": "once"}})
                         self._log("[acp] 按面板等级自动放行（%s）：%s" % (lv, title))
@@ -1259,6 +1590,21 @@ class AcpService:
             self._waiters.pop(pid, None)
             if s is not None:
                 s.get("permissions", {}).pop(pid, None)
+        # ★先隔离再放行（单聊 · ACP · `ui 0.2.85`）：批准后、回报 agent 之前，
+        #   把这条**破坏性**命令要动的目标复制进忏悔室 → 「工具 → 忏悔室」能一键恢复。
+        qid = ""
+        if decision in ("once", "always"):
+            try:
+                ws = str(((self._sessions.get(sid) or {}).get("location") or {})
+                         .get("directory") or "")
+                qid = base.capture_before_allow(
+                    ws, cmd, title or "", locations,
+                    scope="panel-%s" % str(sid or "")[:20], note=reason or "",
+                    kind=kind or "")
+                if qid:
+                    self._log("[acp] 忏悔室留存旧版（%s）→ %s" % (pid, qid))
+            except Exception as exc:            # noqa: BLE001 - 不挡放行
+                self._log("[acp] 先隔离失败（不影响放行）：%r" % (exc,))
         if decision == "always":
             # 记住：以后同类请求（同 agent + 同会话 + 同 kind，路径范围相同）直接放行
             self._remember_always(sid, kind, locations, title)
@@ -1277,7 +1623,9 @@ class AcpService:
                         "denied" if answered else "timeout"),
                 approver=({"kind": "user", "id": "local", "name": "owner"} if answered else None),
                 ref={"session": sid, "perm": pid},
+                quarantine=qid,
                 note=("等待 %.0fs" % (time.time() - t_ask))
+                     + ((" · 已隔离 " + qid) if qid else "")
                      + ("" if answered else " · 无人批准"))
         except Exception:  # noqa: BLE001 - 审计绝不能挡住权限应答
             pass
@@ -1570,20 +1918,41 @@ class AcpService:
             self._log("[acp] 切换模式失败：%s" % exc)
             return False
 
-    def close_agent_session(self, sid) -> bool:
-        """删除本地会话时，best-effort 告诉 agent 侧 close/delete（不支持就忽略）。"""
+    def close_agent_session(self, sid) -> str:
+        """删除本地会话时，best-effort 告诉 agent 侧：**先 delete，删不掉再 close**。
+
+        返回 `"delete"` / `"close"` / `""`：
+          · `delete` = agent 侧真删了（「接续」列表里会消失）；
+          · `close`  = 只是关闭（会话还在 agent 那边，仍会出现在「接续」里）；
+          · `""`     = 连 close 都没成功（agent 没连上 / 不支持）。
+
+        ⚠ 以前是 close 先、成功就 `return` → **永远走不到 delete**，
+          用户看到的就是"删了还在"（2026-11-05 反馈）。现在顺序反过来。
+        """
         client = self._client_or_none()
         if client is None:
-            return False
+            return ""
         asid = self._agent_sid(sid)
-        for method in ("session/close", "session/delete"):
+        for method, tag in (("session/delete", "delete"), ("session/close", "close")):
             try:
                 client.request(method, {"sessionId": asid}, timeout=60)
-                self._log("[acp] 已在 agent 侧 %s 会话 %s" % (method, sid))
-                return True
+                self._log("[acp] 已在 agent 侧 %s 会话 %s" % (tag, sid))
+                return tag
             except Exception:  # noqa: BLE001
                 continue
-        return False
+        return ""
+
+    def delete_remote(self, rid) -> bool:
+        """删掉 **agent 侧**一条会话（「接续」列表里的「删除」），不动面板本地记录。"""
+        client = self._client_or_none()
+        if client is None:
+            raise RuntimeError("agent 没连上（先打开任意一个会话，让它启动后再试）")
+        try:
+            client.request("session/delete", {"sessionId": str(rid)}, timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("这个 agent 不支持删除 agent 侧会话（%s）" % exc)
+        self._log("[acp] 已删除 agent 侧会话 %s" % rid)
+        return True
 
     # ---------------- agent 侧已有会话（session/list → 导入）----------------
 
@@ -1868,15 +2237,28 @@ class AcpService:
     def models(self) -> list:
         """把 ACP 的 model configOption 转成前端要的模型清单形状。"""
         out = []
+        caps = {}
+        try:
+            caps = self._prompt_caps()          # agent 自己宣告的能力（图片 / 内嵌上下文）
+        except Exception:  # noqa: BLE001
+            caps = {}
+        prices = _model_prices()
         for o in ((self._config.get("model") or {}).get("options") or []):
             if not isinstance(o, dict) or not o.get("value"):
                 continue
-            out.append({"id": o["value"], "modelID": o["value"], "providerID": self.provider_id,
-                        "family": self.provider_id, "name": o.get("name") or o["value"],
+            mid = o["value"]
+            # 价格：可选表里配了才显示；没配 = None（面板显示「费用未知」，不谎报免费）
+            cost = _price_row(prices.get("%s/%s" % (self.provider_id, mid))
+                              or prices.get(mid))
+            out.append({"id": mid, "modelID": mid, "providerID": self.provider_id,
+                        "family": self.provider_id, "name": o.get("name") or mid,
                         "variants": self._effort_variants(),
-                        # ACP 不给官方价格；null = 前端显示「费用未知」，不要谎报免费
-                        "cost": None,
-                        "capabilities": {"tools": True}})
+                        "cost": cost,
+                        "capabilities": {
+                            "tools": True,
+                            "image": caps.get("image") is not False,
+                            "embeddedContext": caps.get("embeddedContext") is not False,
+                        }})
         return out
 
     def commands(self) -> list:
@@ -2024,6 +2406,7 @@ class AcpService:
             s = self._sessions.get(sid)
             if not s:
                 return False
+            before_id = str((s.get("model") or {}).get("id") or "")
         try:
             client = self.ensure_started()
             self._ensure_bound(sid, allow_new=False)   # 接回旧会话（失败也不在改模型时建新会话）
@@ -2059,9 +2442,14 @@ class AcpService:
             self._log("[acp] 切换模型失败：%s" % exc)
             return False
         with self._lock:
-            s["model"] = {"id": self._model or "",
+            new_id = self._model or ""
+            s["model"] = {"id": new_id,
                           "providerID": (ref or {}).get("providerID") or self.provider_id,
                           "variant": self._effort or "default"}
+            # ★换模型 → 上一轮的窗口上限作废：不清的话面板会拿旧模型的 size 配新模型的
+            #   名字（用户实测 1017 显示成 26.2 万），直到下一次 usage_update 才自己改。
+            if before_id and new_id and before_id != new_id:
+                s["context"] = None
             s["time"]["updated"] = now_ms()
         self._save()
         return True
@@ -2111,6 +2499,16 @@ class AcpService:
             return None
         if not hist:
             return None
+        # ★费用：库里每条 assistant 都带 cost（逐条）→ 求和写回会话（会话详情「花费」不再空着）
+        try:
+            total = _opencode_session_cost(self._agent_sid(sid))
+            if total is not None:
+                with self._lock:
+                    s0 = self._sessions.get(sid)
+                    if s0 is not None:
+                        s0["cost"] = total
+        except Exception:  # noqa: BLE001
+            pass
         if extra and not cursor:
             # 排队 / 未送达 / 刚投递的用户消息可能只在本地面板 → 合并进来（按时间排好）
             ids = {str(m.get("id")) for m in hist}
@@ -2189,6 +2587,11 @@ class AcpService:
         with self._lock:
             s = self._sessions.get(sid)
             return bool(s and s.get("turn") is not None)
+
+    def any_busy(self) -> bool:
+        """有没有**任何**会话正在跑一轮（自动更新只在空闲时做）。"""
+        with self._lock:
+            return any(s.get("turn") is not None for s in self._sessions.values())
 
     def prompt(self, sid, text, files=None) -> dict:
         """发一条用户消息。
@@ -2290,6 +2693,15 @@ class AcpService:
         if skill_note:
             blocks = [{"type": "text", "text": skill_note}] + blocks
             self._log("[acp] 本轮带上了 %d 个已装填的技能" % len(pending))
+        # ★ 桌面工具卡：ACP 没有"客户端自定义工具"，所以"像技能那样人人可用" =
+        #   命令在 PATH 里（process.py 注入 runtime/bin）+ 每轮 prompt 里讲一句。
+        cu_note = ""
+        try:
+            cu_note = self._cu_prompt_note(s)
+        except Exception:  # noqa: BLE001
+            cu_note = ""
+        if cu_note:
+            blocks = [{"type": "text", "text": cu_note}] + blocks
         if reseed:
             note = _reseed_text(prior)
             if note:
@@ -2324,9 +2736,24 @@ class AcpService:
                         m.pop("queued", None)
                         m["undelivered"] = True
             self._save()
-            self._emit({"type": "session.error", "data": {
-                "sessionID": sid,
-                "error": "排队消息没能发出去：%s（请重新发送）" % exc}})
+            _qerr = "排队消息没能发出去：%s（请重新发送）" % exc
+            self._emit({"type": "session.error",
+                        "data": errkind.payload(_qerr, {"sessionID": sid, "error": _qerr})})
+
+    def _cu_prompt_note(self, s):
+        """给 agent 一张「桌面工具卡」（首轮完整版，之后一行提醒）。
+
+        这就是"像 skill 一样"的那一半：不需要 agent 支持 MCP、也不用改它的配置，
+        只要它能跑 shell（ACP 的 execute 工具人人都有）就能用。
+        """
+        try:
+            if str(os.environ.get("COCRAFT_CU_PROMPT", "1")).strip() == "0":
+                return ""
+        except Exception:  # noqa: BLE001
+            pass
+        first = not s.get("cuCardShown")
+        s["cuCardShown"] = True
+        return CU_CARD if first else CU_ONE_LINE
 
     def inject_skill(self, sid, skill: dict, resume: bool = False) -> dict:
         """把技能注入会话。
@@ -2334,7 +2761,9 @@ class AcpService:
         - `resume=False`（默认）：**只装填** —— 在本地历史留一条 `skill` 消息（面板显示成
           「已注入技能 X」），并把正文暂存到 `pendingSkills`；用户**下次发言**时随那条消息
           一起发给 agent（什么时候跑交给用户）。对应 OpenCode `/skill` 的 `resume:false`。
-        - `resume=True`：立刻把正文作为一条消息发出去、跑一轮。
+        - `resume=True`：**先装填、再发一条短指令**跑一轮 —— 技能正文走 `pendingSkills`
+          前置注入，用户消息里只留「（已激活技能：X…）」，不会把整段正文当你的话显示。
+          （以前是直接把正文当消息发出去，界面上看就是把技能全文当用户在说话。）
 
         ACP 协议没有"往会话上下文里塞东西但不跑"的接口，所以"只装填"只能靠暂存实现。
         """
@@ -2350,16 +2779,105 @@ class AcpService:
                   "time": {"created": now, "completed": now}}
             s["messages"].append(sm)
             s["time"]["updated"] = now_ms()
-            if not resume:
-                pend = s.setdefault("pendingSkills", [])
+            # ★两种模式都先暂存：resume=True 时由 _start_turn 前置注入正文
+            pend = s.setdefault("pendingSkills", [])
+            if not any(str(p.get("id")) == str(skill.get("id")) for p in pend):
                 pend.append({"id": skill.get("id"), "name": name, "text": text})
         self._save()
         if resume:
             try:
-                self.prompt(sid, text)
+                self.prompt(sid, "（已激活技能：%s，请按技能说明开始）" % name)
             except BusyError as exc:
                 raise RuntimeError("上一轮还在生成，稍后再试：%s" % exc)
         return {"ok": True, "injected": skill.get("id"), "resumed": bool(resume)}
+
+    def _maybe_planner_handoff(self, s, ctx):
+        """P0.5：若该聊天会话绑定了策划会话，且上下文达到阈值，自动写 HANDOFF（幂等）。
+        fail-open：任何异常都不影响聊天。首次触发时尝试自动新建接棒会话并注入上下文。"""
+        try:
+            if not isinstance(ctx, dict):
+                return
+            used = ctx.get("used") or 0
+            size = ctx.get("size") or 0
+            if not size:
+                return
+            psid = str((s or {}).get("plannerSessionId") or "").strip()
+            try:
+                import planner as _planner  # backend module
+            except Exception:
+                return
+            if not psid:
+                try:
+                    found = _planner.find_by_chat_session(str((s or {}).get("id") or ""))
+                    if found:
+                        psid = str(found.get("id") or "")
+                        if psid:
+                            s["plannerSessionId"] = psid
+                except Exception:
+                    pass
+            if not psid:
+                return
+            res = _planner.maybe_auto_handoff(psid, used, size)
+            if res.get("needed"):
+                s["plannerHandoffReady"] = True
+                s["plannerHandoff"] = {"sessionId": psid, "path": (res.get("handoff") or {}).get("path"),
+                                       "ratio": res.get("ratio"), "written": res.get("written"),
+                                       "action": res.get("action")}
+                self._emit({"type": "planner.handoff.ready", "data": {
+                    "sessionID": s.get("id"), "plannerSessionId": psid,
+                    "ratio": res.get("ratio"), "written": res.get("written"),
+                    "action": res.get("action")}})
+                # 首次写入交接：后台自动开新会话注入（不阻塞当前聊天）
+                if res.get("written") and not s.get("plannerResumeStarted"):
+                    s["plannerResumeStarted"] = True
+                    ctx_text = (res.get("context") or {}).get("text") or ""
+                    t = threading.Thread(target=self._resume_planner_handoff_async,
+                                         args=(psid, ctx_text, str((s or {}).get("id") or "")),
+                                         daemon=True, name="planner-handoff-%s" % psid[:16])
+                    t.start()
+        except Exception:
+            return
+
+    def _resume_planner_handoff_async(self, planner_session_id, context_text, old_chat_id=""):
+        """后台：为策划会话创建接棒聊天会话并注入 HANDOFF 上下文。"""
+        try:
+            import planner as _planner
+        except Exception:
+            return
+        try:
+            ps = _planner.get_session(planner_session_id)
+            if not ps:
+                return
+            if not context_text:
+                context_text = (_planner.handoff_context(planner_session_id) or {}).get("text") or ""
+            if not context_text:
+                return
+            cwd = str(ps.get("cwd") or self._cwd or "")
+            title = "策划接棒 · " + (str(ps.get("title") or "策划会话"))[:40]
+            new_s = self.create_session(title=title, cwd=cwd)
+            nid = str((new_s or {}).get("id") or "")
+            if not nid:
+                return
+            # 绑定新聊天会话（覆盖旧绑定）
+            try:
+                _planner.bind_chat_session(planner_session_id, nid, engine="acp")
+            except Exception:
+                pass
+            intro = (
+                "【系统：策划会话接棒】上下文已满或已切换，以下是交接包。"
+                "请先阅读并确认你理解目标/计划/约束；不要重新设计整份计划（除非校验失败或用户明确要求）。"
+                "plan.json 是唯一可执行真相。\n\n" + context_text
+            )
+            self.prompt(nid, intro)
+            self._emit({"type": "planner.handoff.resumed", "data": {
+                "plannerSessionId": planner_session_id, "oldSessionID": old_chat_id,
+                "sessionID": nid, "agentId": self.agent_id}})
+            self._log("[planner] 已为 %s 创建接棒会话 %s 并注入交接上下文" % (planner_session_id, nid))
+        except Exception as exc:
+            try:
+                self._log("[planner] 自动接棒失败：%s" % exc)
+            except Exception:
+                pass
 
     def _record_usage(self, s, usage, stop):
         """把一轮的 token 用量累加到会话上，并把 stopReason 记成「结果」。
@@ -2392,13 +2910,12 @@ class AcpService:
                 cache["read"] = int(cache.get("read") or 0) + num("cachedReadTokens")
                 cache["write"] = int(cache.get("write") or 0) + num("cachedWriteTokens")
                 tok["cache"] = cache
-                cost = usage.get("cost")
-                if isinstance(cost, dict) and isinstance(cost.get("amount"), (int, float)):
-                    s["cost"] = float(cost["amount"])
-                elif isinstance(cost, (int, float)):
-                    s["cost"] = float(cost)
+                # 费用不在这里算：`_run_turn` 统一用 `_note_session_cost()`（口径见那里）
                 # ★上下文兜底：只在本轮没有真实 usage_update（size>0）时才估
                 est = context_from_usage(usage)
+                if est:
+                    # ★带上模型：切模型后旧模型估出来的 used 也不能当新模型的（见前端 ctxCompute）
+                    est["model"] = (s.get("model") or {}).get("id") or getattr(self, "_model", "") or ""
                 cur = s.get("context")
                 if est and not (isinstance(cur, dict) and cur.get("size")):
                     s["context"] = est
@@ -2410,14 +2927,18 @@ class AcpService:
         return est_out
 
     def _recover_model(self, sid, detail) -> str:
-        """本轮因「模型不可用」失败 → 自动切到一个已知可用的模型；回可读提示（空 = 没处理）。
+        """本轮因「模型不可用 / 模型服务端 503」失败 → 自动切到一个已知可用的模型；回可读提示（空 = 没处理）。
 
         候选顺序：① 本 agent 最近一次跑通的模型 → ② 模型清单里其它模型。
         ⚠ 用会话上的 `_badModels` 记账：反复重发会**逐个**试下去，不会死磕同一个坏模型。
         """
         low = str(detail or "").lower()
-        if ("model unavailable" not in low and "model_not_found" not in low
-                and "modelnotfound" not in low):
+        model_missing = ("model unavailable" in low or "model_not_found" in low
+                         or "modelnotfound" in low)
+        provider_down = any(x in low for x in (
+            "endpoint is unavailable", "provider.internal", "upstream request failed",
+            "status 503", "503 service"))
+        if not model_missing and not provider_down:
             return ""
         m = re.search(r"model unavailable[:\s]+([^\s\)'\"`]+)", str(detail), re.I)
         with self._lock:
@@ -2437,17 +2958,19 @@ class AcpService:
         for cand in cands[:8]:
             try:
                 if self.set_model(sid, {"id": cand, "providerID": self.provider_id}):
-                    self._log("[acp] 模型 %s 不可用 → 已自动切到 %s" % (failing or "?", cand))
+                    self._log("[acp] 模型 %s 不可用/服务端 503 → 已自动切到 %s" % (failing or "?", cand))
                     with self._lock:
                         cur = (self._sessions.get(sid) or {}).get("model")
                     self._emit({"type": "session.model.update",
                                 "data": {"sessionID": sid, "model": cur}})
-                    return ("模型 %s 在 agent 侧不可用，已自动切到 %s —— 请把刚才那条再发一次。"
-                            % (failing or "?", cand))
+                    why = "服务端不可用" if provider_down and not model_missing else "不可用"
+                    return ("模型 %s %s，已自动切到 %s —— 请把刚才那条再发一次。"
+                            % (failing or "?", why, cand))
             except Exception:  # noqa: BLE001
                 continue
-        return ("模型 %s 在 agent 侧不可用，且没找到可用的替代 —— 请在「模型」里手动换一个。"
-                % (failing or "?"))
+        why = "服务端不可用" if provider_down and not model_missing else "不可用"
+        return ("模型 %s %s，且没找到可用的替代 —— 请在「模型」里手动换一个，"
+                "或把这一步换成 codex-node / dsh。" % (failing or "?", why))
 
     def _run_turn(self, sid, turn, blocks):
         outcome = "completed"
@@ -2481,11 +3004,19 @@ class AcpService:
             model_note = self._recover_model(sid, detail)
             if model_note:
                 detail = model_note
-            if not (turn.text_parts or turn.reason_parts or turn.tools):
-                turn.text_parts.append("（本轮未产生输出：%s）" % detail)
-            self._emit({"type": "session.error", "data": {
+            # ★把错误挂到**消息**上：前端 `assistantErrorCard` 才能画「余额不足 / 限流 / 连不上…」卡片。
+            #   以前只发 `session.error` 事件 + 塞一句正文 → 刷新后只剩"这一轮确实没有返回正文"。
+            try:
+                _k = errkind.classify(detail)
+                _st = re.search(r"(?:status|http)\s*(\d{3})", detail, re.I)
+                turn.error = {"type": str(_k.get("kind") or "error"),
+                              "message": detail,
+                              "status": int(_st.group(1)) if _st else None}
+            except Exception:  # noqa: BLE001
+                turn.error = {"type": "error", "message": detail}
+            self._emit({"type": "session.error", "data": errkind.payload(detail, {
                 "sessionID": sid, "assistantMessageID": turn.id, "error": detail,
-                "modelUnavailable": bool(model_note)}})
+                "modelUnavailable": bool(model_note)})})
         turn.completed = now_ms()
         self._log("[acp] turn done outcome=%s text_parts=%d reason_parts=%d tools=%d usage=%s"
                   % (outcome, len(turn.text_parts), len(turn.reason_parts), len(turn.tools),
@@ -2493,7 +3024,19 @@ class AcpService:
         with self._lock:
             s = self._sessions.get(sid)
             if s is not None:
-                s["messages"].append(turn.message())
+                # ★上下文压缩：单独一条 `compaction` 消息（有专门的卡片），
+                #   压缩通常发生在正文之前 → 插在助手消息**前面**，和客户端的顺序一致。
+                try:
+                    cmp_msg = turn.compaction_message()
+                except Exception:  # noqa: BLE001
+                    cmp_msg = None
+                msg = turn.message()
+                if cmp_msg and getattr(turn, "compaction_before_text", True):
+                    s["messages"].extend([cmp_msg, msg])
+                elif cmp_msg:
+                    s["messages"].extend([msg, cmp_msg])
+                else:
+                    s["messages"].append(msg)
                 if s.get("turn") is turn:
                     s["turn"] = None
                 s["time"]["updated"] = now_ms()
@@ -2502,16 +3045,28 @@ class AcpService:
                     s["plan"] = turn.plan
                 if turn.context:
                     s["context"] = turn.context
+                    try:
+                        self._maybe_planner_handoff(s, turn.context)
+                    except Exception:
+                        pass
         est_ctx = None
         if s is not None:
             est_ctx = self._record_usage(s, usage, stop)
+            # ★费用：优先 prompt 结果里的 usage.cost；没有才用本轮 usage_update 里看到的
+            cost_amt, cost_cur = _usage_cost(usage)
+            if cost_amt is None and turn.cost is not None:
+                cost_amt, cost_cur = turn.cost, turn.cost_currency
+            if cost_amt is not None:
+                with self._lock:
+                    _note_session_cost(s, cost_amt, cost_cur)
         self._save()
         # ★dsh 等「只给 prompt usage、不发 usage_update」的 agent：把估算值推给前端，
         #   否则要等重新打开会话才能看到（`state.current.context` 不会自己更新）。
         if est_ctx:
             self._emit({"type": "session.usage.update", "data": {
                 "sessionID": sid, "used": est_ctx.get("used") or 0,
-                "size": 0, "estimated": True}})
+                "size": 0, "estimated": True,
+                "model": est_ctx.get("model") or ""}})
         # 终态事件 → 前端会去重取一次权威消息
         self._emit({"type": "session.text.ended",
                     "data": {"sessionID": sid, "assistantMessageID": turn.id}})

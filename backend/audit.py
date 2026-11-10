@@ -809,7 +809,7 @@ _DECISION_ZH = {"once": "允许一次", "always": "始终允许", "reject": "拒
                 "drop": "删除恢复点", "undo": "撤销这一轮", "archive": "归档"}
 _RESULT_ZH = {"ok": "成功", "denied": "被拒", "timeout": "超时", "failed": "失败",
               "skipped": "跳过"}
-_SOURCE_ZH = {"collab": "本地协作", "ccagent": "群聊 AI 成员", "snapshot": "隔离区/撤销",
+_SOURCE_ZH = {"collab": "本地协作", "ccagent": "群聊 AI 成员", "snapshot": "忏悔室/撤销",
               "panel": "面板会话", "manual": "手动/系统"}
 
 
@@ -909,3 +909,327 @@ def report(since: float = 0.0, until: float = 0.0, limit: int = 0, **filters) ->
     lines += ["", "> 只含「决定 / 命令 / 目标路径」，**不含成员正文**；",
               "> 链校验用 `tools\\cocraft_audit_verify.py <导出文件>` 可独立复核。", ""]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 人话简报（L2：给人读）
+# 口径：**确定性生成** —— 同一批记录永远给出同一份正文（只有"生成时间"那行会变）。
+# 不调用任何模型：报告要能当证据，就必须可复现、可复核。
+#
+# 三层输出（互不替代）：
+#   L1 取证：原始 .jsonl / 34 列 CSV（带 prev/hash，交给 cocraft_audit_verify.py）
+#   L2 简报：brief() → render_brief()（一页纸，给老板/合规看；末尾仍带 seq 范围 + 链尾）
+#   L2 人话 CSV：human_csv()（9 列，给人用 Excel 看；保留 seq 以便回查）
+
+_ACTION_ZH = {
+    "execute": "运行命令", "edit": "修改文件", "write": "写入文件", "read": "读取",
+    "net": "联网", "undo": "撤销这一轮", "restore": "恢复文件", "drop": "删除恢复点",
+    "files": "文件改动", "archive": "归档", "cu": "桌面操作", "quarantine": "隔离",
+    "snapshot": "快照", "config": "改设置",
+}
+
+
+def _zh_action(kind) -> str:
+    k = str(kind or "")
+    return _ACTION_ZH.get(k, k or "操作")
+
+
+def _short(text, n=80) -> str:
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _who(r) -> str:
+    a = r.get("actor") or {}
+    return str(a.get("name") or a.get("id") or a.get("kind") or "-")
+
+
+def _approver_name(r) -> str:
+    ap = r.get("approver") or {}
+    if str(ap.get("kind") or "") == "user":
+        return str(ap.get("name") or ap.get("id") or "有人")
+    return ""
+
+
+def _what(r, n=110) -> str:
+    """一条记录"干了什么"的人话摘要（命令优先，其次目标，最后动作名）。"""
+    act = r.get("action") or {}
+    kind = _zh_action(act.get("kind"))
+    cmd = _short(act.get("command") or act.get("title") or "", n)
+    tg = [str(x) for x in (act.get("targets") or [])[:3]]
+    # 命令里已经带了目标就不再重复（`rm -rf D:/x → D:/x` 读着很蠢）
+    tg = [x for x in tg if x and x not in (act.get("command") or "")]
+    base = cmd or kind
+    if tg:
+        base += " → " + "、".join(_short(x, 40) for x in tg)
+    return base
+
+
+def brief(items=None, since=0.0, until=0.0, limit=0, subset=None, **filters) -> dict:
+    """把审计记录算成 facts（纯函数：同一批记录 → 同一份 facts，可断言、可复现）。"""
+    if items is None:
+        items = records(limit=limit, since=since, until=until, **filters)
+    rows = sorted([r for r in (items or []) if isinstance(r, dict)],
+                  key=lambda r: int(r.get("seq") or 0))
+    if subset is None:
+        subset = bool(since or until or limit or any(x for x in filters.values()))
+    v = verify(rows, subset=bool(subset))
+
+    destructive, unacked = [], []
+    q_ids, q_rows = set(), []
+    restored_ids, dropped_ids = set(), set()
+    secret_blocked, rejected, failed, acked = [], [], [], 0
+    people, days = {}, {}
+    file_turns, files = 0, set()
+
+    for r in rows:
+        act = r.get("action") or {}
+        dec = str(r.get("decision") or "")
+        res = str(r.get("result") or "")
+        who = _who(r)
+        apn = _approver_name(r)
+        p = people.setdefault(who, {"name": who, "total": 0, "approved": 0, "rejected": 0})
+        p["total"] += 1
+        if apn:
+            acked += 1
+            p["approved"] += 1
+        if dec == "reject":
+            rejected.append(r)
+            p["rejected"] += 1
+        if res in ("failed", "timeout"):
+            failed.append(r)
+        day = str(r.get("ts") or "")[:10]
+        if day:
+            d = days.setdefault(day, {"date": day, "count": 0, "destructive": 0})
+            d["count"] += 1
+            if act.get("destructive"):
+                d["destructive"] += 1
+        if act.get("destructive"):
+            destructive.append(r)
+            if not apn:
+                unacked.append(r)
+        qid = str(r.get("quarantine") or "")
+        if qid and dec not in ("restore", "drop"):
+            q_ids.add(qid)
+            q_rows.append(r)
+        if dec == "restore" and res == "ok":
+            rid = str((r.get("ref") or {}).get("scope") or qid or "")
+            if rid:
+                restored_ids.add(rid)
+        if dec == "drop":
+            rid = str((r.get("ref") or {}).get("scope") or qid or "")
+            if rid:
+                dropped_ids.add(rid)
+        if dec == "reject" and str(act.get("kind") or "") == "read":
+            secret_blocked.append(r)
+        if str(act.get("kind") or "") == "files":
+            file_turns += 1
+            for t in (act.get("targets") or []):
+                files.add(str(t))
+
+    pending_ids = sorted(q_ids - restored_ids - dropped_ids)
+
+    # —— 需要你知道的事：按严重度挑最多 3 条（同一条记录的多条说明合并成一行） ——
+    agg = {}
+
+    def _add(sev, r, note, warn=False):
+        sq = int(r.get("seq") or 0)
+        it = agg.get(sq)
+        if it is None:
+            it = agg[sq] = {"sev": sev, "r": r, "notes": [], "warn": False}
+        if note not in it["notes"]:
+            it["notes"].append(note)
+        it["warn"] = it["warn"] or bool(warn)
+        it["sev"] = min(it["sev"], sev)
+
+    for r in unacked:
+        _add(0, r, "不可撤销操作，**没有人工确认**", True)
+    for r in destructive:
+        if _approver_name(r):
+            _add(1, r, "不可撤销操作，经 %s 确认" % _approver_name(r))
+    for r in q_rows:
+        qid = str(r.get("quarantine") or "")
+        if qid in pending_ids:
+            _add(2, r, "已隔离，**还没有恢复**（原件在忏悔室）", True)
+        elif qid in restored_ids:
+            _add(3, r, "已从忏悔室**恢复**")
+    for r in secret_blocked[-3:]:
+        _add(4, r, "试图读取敏感内容，被拦下")
+    for r in rejected[-3:]:
+        _add(5, r, "请求被拒绝")
+    for r in failed[-3:]:
+        _add(6, r, "执行失败")
+    order = sorted(agg.values(),
+                   key=lambda x: (x["sev"], -float(x["r"].get("tsu") or 0)))
+    highlight = []
+    for it in order[:3]:
+        r = it["r"]
+        highlight.append({
+            "level": it["sev"], "warn": bool(it["warn"]),
+            "ts": str(r.get("ts") or "")[:19].replace("T", " "),
+            "who": _who(r), "approver": _approver_name(r) or "—",
+            "what": _what(r), "note": "；".join(it["notes"]),
+            "seq": int(r.get("seq") or 0),
+        })
+
+    f = {
+        "ok": bool(v.get("ok")),
+        "broken": int(v.get("brokenCount") or 0),
+        "gaps": int(v.get("gaps") or 0),
+        "count": len(rows),
+        "first": int(v.get("first") or 0),
+        "last": int(v.get("last") or 0),
+        "tail": str(v.get("tail") or ""),
+        "subset": subset,
+        "since": float(since or 0),
+        "until": float(until or 0),
+        "machines": sorted({str(r.get("machine") or "") for r in rows if r.get("machine")}),
+        "destructive": {"total": len(destructive), "unacked": len(unacked)},
+        "acked": acked,
+        "quarantine": {"total": len(q_ids), "restored": len(restored_ids & q_ids),
+                       "pending": len(pending_ids)},
+        "rejected": len(rejected),
+        "secret_blocked": len(secret_blocked),
+        "failed": len(failed),
+        "files": {"turns": file_turns, "count": len(files)},
+        "people": sorted(people.values(), key=lambda x: (-x["total"], x["name"])),
+        "days": sorted(days.values(), key=lambda x: x["date"]),
+        "highlight": highlight,
+    }
+    f["headline"] = _headline(f)
+    return f
+
+
+def _headline(f) -> str:
+    """一句话结论：由规则拼出来（不是写死的，也不调模型）。"""
+    if not f.get("ok"):
+        return ("⚠ **审计链校验未通过**（断 %d 处 / 空洞 %d）—— 下面的数字只能当线索，"
+                "不能当证据；请用原始导出单独复核。" % (f.get("broken") or 0, f.get("gaps") or 0))
+    n = int(f.get("count") or 0)
+    if n <= 0:
+        return "本期没有任何记录（没有 agent 动作、也没有人操作）。"
+    bits = ["共 **%d** 条记录" % n]
+    ppl = len(f.get("people") or [])
+    mach = len(f.get("machines") or [])
+    if ppl:
+        bits.append("%d 个操作者" % ppl)
+    if mach > 1:
+        bits.append("%d 台机器" % mach)
+    d = f.get("destructive") or {}
+    if d.get("total"):
+        if d.get("unacked"):
+            bits.append("⚠ **%d 次不可撤销操作没有人工确认**" % d["unacked"])
+        elif d["total"] == 1:
+            bits.append("1 次不可撤销操作已经你确认")
+        else:
+            bits.append("%d 次不可撤销操作全部经人工确认" % d["total"])
+    q = f.get("quarantine") or {}
+    if q.get("restored"):
+        bits.append("%d 次误删已从忏悔室恢复" % q["restored"])
+    if q.get("pending"):
+        bits.append("⚠ **%d 次破坏性操作还没有恢复**" % q["pending"])
+    if f.get("secret_blocked"):
+        bits.append("拦下 %d 次敏感读取" % f["secret_blocked"])
+    if f.get("rejected"):
+        bits.append("拒绝 %d 次请求" % f["rejected"])
+    if f.get("failed"):
+        bits.append("%d 次执行失败" % f["failed"])
+    if not (d.get("total") or f.get("rejected") or f.get("failed") or f.get("secret_blocked")):
+        bits.append("没有破坏性操作、没有越权、没有失败")
+    return "，".join(bits) + "。"
+
+
+def _range_text(f) -> str:
+    if f.get("since") or f.get("until"):
+        a = _iso(f["since"]) if f.get("since") else "最早"
+        b = _iso(f["until"]) if f.get("until") else "现在"
+        return "%s ~ %s" % (a, b)
+    return "全部记录"
+
+
+def render_brief(f, generated_at=None) -> str:
+    """facts → 一页 Markdown（固定骨架：结论 → 3 件事 → 按人 → 按天 → 附录）。"""
+    when = _iso(float(generated_at if generated_at is not None else time.time()))
+    lines = ["# AI 操作简报（cocraft）", ""]
+    lines.append("> %s ｜ 记录 %d 条（seq %d..%d）｜ 链校验：%s ｜ 生成于 %s" % (
+        _range_text(f), int(f.get("count") or 0), int(f.get("first") or 0),
+        int(f.get("last") or 0),
+        "完整" if f.get("ok") else "⚠ 断裂 %d 处" % int(f.get("broken") or 0), when))
+    if f.get("subset"):
+        lines.append(">")
+        lines.append("> ⚠ 这是**区间导出**（subset）：首条的 `prev` 指向范围外，"
+                     "只能在完整链上复核它的衔接。")
+    lines += ["", "## 一句话", "", f.get("headline") or "（无）", ""]
+
+    hl = f.get("highlight") or []
+    lines += ["## 需要你知道的 %d 件事" % len(hl), ""]
+    if not hl:
+        lines.append("- 没有需要注意的事（没有破坏性操作 / 拒绝 / 失败）。")
+    for i, h in enumerate(hl, 1):
+        who = h.get("who") or "-"
+        ap = h.get("approver") or "—"
+        lines.append("- %s%s｜%s：`%s`｜谁批的：%s｜%s" % (
+            "⚠ " if h.get("warn") else "", h.get("ts") or "", who,
+            _short(h.get("what") or "", 90), ap, h.get("note") or ""))
+    lines += [""]
+
+    if f.get("people"):
+        lines += ["## 按人", "", "| 谁 | 次数 | 经人批准 | 被拒 |", "| --- | --- | --- | --- |"]
+        for p in f["people"][:20]:
+            lines.append("| %s | %d | %d | %d |" % (
+                p.get("name") or "-", p.get("total") or 0,
+                p.get("approved") or 0, p.get("rejected") or 0))
+        lines += [""]
+
+    if f.get("days"):
+        lines += ["## 按天", "", "| 日期 | 记录 | 其中不可撤销 |", "| --- | --- | --- |"]
+        for d in f["days"][-31:]:
+            lines.append("| %s | %d | %d |" % (
+                d.get("date") or "-", d.get("count") or 0, d.get("destructive") or 0))
+        lines += [""]
+
+    fl = f.get("files") or {}
+    lines += ["## 附录（可复核）", "",
+              "- 记录条数：%d（seq %d..%d）" % (int(f.get("count") or 0),
+                                                int(f.get("first") or 0), int(f.get("last") or 0)),
+              "- 机器：%s" % ("、".join(f.get("machines") or []) or "-"),
+              "- 文件改动：%d 轮 / 涉及 %d 个文件" % (fl.get("turns") or 0, fl.get("count") or 0),
+              "- 链尾：`%s`" % (f.get("tail") or "-"),
+              "- 独立复核：`python tools\\cocraft_audit_verify.py <导出文件>`",
+              "",
+              "> 本简报由规则从审计记录**确定性生成**（同一份导出 → 同一份正文），不含成员正文，",
+              "> 也不含可修改的判断；数字有疑问请回原始导出复核。", ""]
+    return "\n".join(lines)
+
+
+HUMAN_CSV_FIELDS = ["时间", "操作人", "动作", "对象", "结论", "批准人", "不可撤销", "恢复点", "序号"]
+
+
+def human_csv(items) -> str:
+    """人话版 CSV（9 列，给 Excel 看）。**不含哈希/prev**，但保留 `序号` 以便回查链。"""
+    rows = sorted([r for r in (items or []) if isinstance(r, dict)],
+                  key=lambda r: int(r.get("seq") or 0))
+    out = ["\ufeff" + ",".join(HUMAN_CSV_FIELDS)]
+    for r in rows:
+        act = r.get("action") or {}
+        qid = str(r.get("quarantine") or "")
+        ref_ts = str((r.get("ref") or {}).get("ts") or "")
+        dec = str(r.get("decision") or "")
+        restore = ""
+        if dec not in ("restore", "drop"):
+            restore = "忏悔室" if qid else ("快照" if ref_ts else "")
+        cells = [
+            str(r.get("ts") or "")[:19].replace("T", " "),
+            _who(r),
+            _zh_action(act.get("kind")),
+            _short(act.get("command") or "、".join(str(x) for x in (act.get("targets") or [])[:3])
+                   or act.get("title") or "", 120),
+            "%s/%s" % (_DECISION_ZH.get(str(r.get("decision") or ""), r.get("decision") or ""),
+                       _RESULT_ZH.get(str(r.get("result") or ""), r.get("result") or "")),
+            _approver_name(r) or "",
+            "是" if act.get("destructive") else "",
+            restore,
+            str(int(r.get("seq") or 0)),
+        ]
+        out.append(",".join('"%s"' % str(c).replace('"', '""') for c in cells))
+    return "\n".join(out) + "\n"
+
