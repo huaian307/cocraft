@@ -253,14 +253,8 @@ html.glass .empty .credit {
   text-shadow: 0 0 4px var(--paper), 0 0 9px var(--paper);
 }
 
-/* ---------- 面板毛玻璃（「液态玻璃」关掉时的纸面兜底）---------- */
-[data-theme="hiru"] #sidebar,
-[data-theme="hiru"] #topbar,
-[data-theme="hiru"] #composer {
-  background: rgba(250, 247, 242, .72);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-}
+/* ---------- 面板毛玻璃（「液态玻璃」关掉时的纸面兜底）----------
+   `ui 0.2.123` 起只有暗色定盘；纸面兜底直接吃 `--paper`（暖黑），不再有浅色那套。 */
 
 /* ---------- 动态壁纸（Wallpaper Engine 原片）----------
    收起侧栏 → **缓慢启动**：转速由静止慢慢加上去；
@@ -284,13 +278,16 @@ html[data-sidebar="open"] #static-bg .sb {
   background-position: center 16%; background-size: cover; background-repeat: no-repeat;
   filter: brightness(var(--bg-dim, 1));
 }
-html[data-theme="hiru"] #live-bg { background-image: url("/assets/hiru-bg.jpg"); }
+#live-bg { background-image: url("/assets/hiru-bg.jpg"); }
 html:not(.has-live) #live-bg { display: none; }
 html[data-sidebar="open"] #live-bg {
   filter: brightness(var(--bg-dim, 1));
 }
-/* 动态层一旦上屏，静态那张就让位（否则它画在更上层，会把视频盖住） */
-html.has-live #static-bg { display: none; }
+/* ⚠ 2026-10-27：**动态层上屏后静态那张也要留着**（以前这里 `display:none`）。
+   `#static-bg` 在 DOM 里排在 `#live-bg` 之前、z-index 相同 → 天然在下面，留着不会盖住视频；
+   它只多花一张已经解码过的图，却能顶住「视频/场景被系统丢掉那一帧」
+   （窗口失焦 / 被遮挡 / 显卡驱动回收视频表面时，`<video>` 会一个像素都不画）。
+   以前一旦视频不画，聊天区（本来就透明压在壁纸上）就直接露出桌面 / 后面的窗口。 */
 /* 模糊会把图层边缘和"透明"混出一圈淡边：开模糊时把图层撑出视口一点。
    收起/展开都撑 —— 两层几何一致，切换时不会有一点点位移。 */
 
@@ -322,7 +319,7 @@ html.has-scene .lb-video { display: none !important; }
   background: linear-gradient(180deg,
     rgba(250,247,242,.34) 0%, rgba(250,247,242,.44) 55%, rgba(250,247,242,.58) 100%);
 }
-html[data-theme="hiru"].has-live #live-bg .lb-wash { display: none; }
+/* 收起侧栏 / 展开会话时的歌词浮层已随音乐一起移除（`ui 0.2.123`）。 */
 
 /* 系统要求减少动态效果：不播，直接用静态壁纸 */
 @media (prefers-reduced-motion: reduce) {
@@ -709,6 +706,38 @@ button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 1
   color: var(--err); border-radius: var(--radius); white-space: pre-wrap;
   font-size: 13px;
 }
+
+/* ★「这一轮失败」的人话错误卡（`ui 0.2.92`）：以前这里只有"没有返回正文"，
+   余额不足这类上游错误完全看不出来。红色左边条 + 标题（分类）/ 原始报错 / 建议三行。 */
+.msg.assistant.failed .bubble { border-color: color-mix(in srgb, var(--err) 42%, transparent); }
+.err-card {
+  padding: 10px 12px; border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
+  border-left: 3px solid var(--err);
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+  display: flex; flex-direction: column; gap: 5px;
+}
+.err-card.account {
+  border-color: color-mix(in srgb, var(--gold) 45%, transparent);
+  border-left-color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 10%, transparent);
+}
+.err-head { font-size: 13px; font-weight: 600; color: var(--err); letter-spacing: .02em; }
+.err-card.account .err-head { color: var(--gold); }
+.err-msg {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  color: var(--ink-dim); word-break: break-word;
+  user-select: text; -webkit-user-select: text;
+}
+.err-hint { font-size: 11.5px; line-height: 1.6; color: var(--ink-faint); }
+.err-raw { margin-top: 2px; }
+.err-raw > summary { cursor: pointer; font-size: 11px; color: var(--ink-faint); }
+.err-raw .body {
+  margin-top: 4px; padding: 6px 8px; border-radius: 6px; max-height: 180px; overflow: auto;
+  background: rgba(0,0,0,.28); font-family: var(--mono); font-size: 10.5px;
+  color: var(--ink-dim); white-space: pre-wrap; user-select: text;
+}
+.tag.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
 
 /* ---------- 空状态：烛光首屏（主图 / 贴纸 / 三行文案都可在「壁纸与外观」里换） ---------- */
 

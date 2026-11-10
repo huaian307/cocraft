@@ -3,7 +3,7 @@
  * 依赖：前面所有文件的全局函数 / 状态 / 常量（加载顺序见 index.html）。
  *
  * 本文件曾是一个 15k 行的单文件巨石；P1 已按模块拆到 js/（00-util / 01-chat / 02-shell /
- * 21-cocraft / 40-music / 12-asks / 11-engine / 41-visual / 30-code / 20-collab）。
+ * 21-cocraft / 40-music / 12-asks / 11-engine / 41-visual / 30-code / 20-collab / 13-restore）。
  */
 
 /* OpenCode UI —— 前端逻辑（零依赖，无构建）
@@ -76,8 +76,13 @@ function initCollab() {
   }
   const runsAll = $("collab-runs-all");
   if (runsAll) runsAll.addEventListener("click", () => {
+    if (typeof collabToggleRuns === "function") collabToggleRuns(true);   // 「全部」= 先展开
     COLLAB.runWfFilter = "";
     collabRenderRuns();
+  });
+  const runsToggle = $("collab-runs-toggle");
+  if (runsToggle) runsToggle.addEventListener("click", () => {
+    if (typeof collabToggleRuns === "function") collabToggleRuns();
   });
 
   // ★左栏：工作流（点选中；▶ 用默认任务一键跑；「已归档」可折叠）
@@ -118,7 +123,7 @@ function initCollab() {
   if (wfLayout) wfLayout.addEventListener("click", () => {
     const wf = collabWf();
     if (!wf) return;
-    wf.layout = { zoom: COLLAB.canvas.zoom, nodes: {} };
+    collabDropActiveNodes(wf);
     COLLAB.canvas.sel = "";
     collabRenderCanvas();
     collabRenderInspector();
@@ -133,6 +138,42 @@ function initCollab() {
   if (wfDel) wfDel.addEventListener("click", collabDeleteWf);
   const quickRun = $("collab-quick-run");
   if (quickRun) quickRun.addEventListener("click", () => collabQuickRun());
+  const wfContinue = $("collab-wf-continue");
+  if (wfContinue) wfContinue.addEventListener("click", collabContinueWf);
+  const wfSessions = $("collab-wf-sessions");
+  if (wfSessions) wfSessions.addEventListener("click", () => {
+    const wf = collabWf();
+    if (wf) sessMgrOpen("workflow", wf.id);
+    else setBanner("先选一个工作流");
+  });
+  // ★工作流主控（策划）会话：同项目只有一个；按 cwd 找，没有就问一次要不要建
+  const wfPlanner = $("collab-wf-planner");
+  if (wfPlanner) wfPlanner.addEventListener("click", () => {
+    if (typeof collabOpenPlanner === "function") collabOpenPlanner();
+    else setBanner("策划会话前端未加载：请刷新面板后重试");
+  });
+  // ★左栏「主控会话」记录（同一条工作流的主控；没有就创建）
+  const plOpen = $("collab-planner-open");
+  if (plOpen) plOpen.addEventListener("click", () => {
+    if (typeof collabOpenPlanner === "function") collabOpenPlanner();
+    else setBanner("策划会话前端未加载：请刷新面板后重试");
+  });
+  const cppClose = $("cpp-close");
+  if (cppClose) cppClose.addEventListener("click", () => {
+    if (typeof collabPlannerHide === "function") collabPlannerHide();
+  });
+  const cppHelp = $("cpp-help");
+  if (cppHelp) cppHelp.addEventListener("click", () => {
+    const h = $("cpp-help-body");
+    if (h) h.hidden = !h.hidden;
+  });
+  const ccSessions = $("cc-sessions");
+  if (ccSessions) ccSessions.addEventListener("click", () => {
+    if (typeof CC === "undefined" || !CC.chatID) { setBanner("先打开一个群聊"); return; }
+    sessMgrOpen("group", CC.chatID);
+  });
+  const quickLast = $("collab-quick-last");
+  if (quickLast) quickLast.addEventListener("click", () => collabCopyLastTask());
   const quickInput = $("collab-quick-task");
   if (quickInput) quickInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
@@ -155,6 +196,8 @@ function initCollab() {
     insp.addEventListener("click", (e) => {
       const openRun = e.target.closest("[data-insp-open-run]");
       if (openRun) collabOpenMemberResult(openRun.dataset.inspOpenRun);
+      // ★工作流的「＋ 新建项目」：建到 cocraft 的 workflow-projects（见 20-collab.js）
+      if (typeof collabInspectorClick === "function") collabInspectorClick(e);
     });
   }
 
@@ -197,6 +240,8 @@ function initCollab() {
       if (dir) { collabClose(); codeOpenAt(dir, ""); }
       return;
     }
+    const copyTask = e.target.closest("[data-collab-copy-task]");
+    if (copyTask) { collabCopyRunTask(); return; }
     const backWf = e.target.closest("[data-collab-back-wf]");
     if (backWf) { collabSelectWf(backWf.dataset.collabBackWf); return; }
     const saveWf = e.target.closest("[data-collab-save-wf]");
@@ -205,6 +250,12 @@ function initCollab() {
     if (cancel) { collabCancel(cancel.dataset.collabCancel || ""); return; }
     const perm = e.target.closest("[data-perm-go]");
     if (perm) { collabPerm(perm.dataset.permGo, perm.dataset.decision); return; }
+    const wfOpt = e.target.closest("[data-wf-opt]");
+    if (wfOpt) { collabFormPick(wfOpt); return; }
+    const wfSubmit = e.target.closest("[data-wf-submit]");
+    if (wfSubmit) { collabFormSubmit(wfSubmit.dataset.wfForm || ""); return; }
+    const wfDecline = e.target.closest("[data-wf-decline]");
+    if (wfDecline) { collabFormDecline(wfDecline.dataset.wfForm || ""); return; }
     if (e.target.closest("[data-collab-perm-open]")) { collabPermToggle(true); return; }
     if (e.target.closest("[data-collab-perm-close]")) { collabPermToggle(false); return; }
     const memChip = e.target.closest("[data-collab-mem]");
@@ -221,6 +272,9 @@ function initCollab() {
     }
     const diff = e.target.closest("[data-collab-diff]");
     if (diff) { collabToggleDiff(); return; }
+    const isoApply = e.target.closest("[data-collab-apply]");
+    if (isoApply) { collabApplyMember(isoApply.dataset.collabApply); return; }
+    if (e.target.closest("[data-collab-iso-clean]")) { collabCleanupIsolation(); return; }
     const arb = e.target.closest("[data-collab-arb]");
     if (arb) { collabArbitrate(); return; }
     const pick = e.target.closest("[data-collab-pick]");
@@ -231,12 +285,18 @@ function initCollab() {
     if (expRun) { collabExportRun(); return; }
     const rerun = e.target.closest("[data-collab-rerun]");
     if (rerun) { collabRerun(); return; }
+    const contRun = e.target.closest("[data-collab-continue]");
+    if (contRun) { collabContinueFromRun(COLLAB.run); return; }
   });
   if (root) root.addEventListener("change", (e) => {
     const sel = e.target.closest("#collab-arb-engine");
     if (sel) COLLAB.arbEngine = String(sel.value || "");
     const lv = e.target.closest("[data-perm-level]");
     if (lv) collabSetMemberPerm(lv.dataset.permLevel, lv.value);
+  });
+  if (root) root.addEventListener("input", (e) => {
+    const ci = e.target.closest("[data-wf-custom]");
+    if (ci) collabFormCustom(ci);
   });
 
 
@@ -281,7 +341,10 @@ function initCollab() {
 
   initTheme();
   initToolsMenu();
-  initHubMenu();
+  initRestore();                         // ★忏悔室：分类 → 项目 → 文件版本时间线
+  initSessMgr();                         // ★会话管理：工作流成员 / 群聊成员（不混进单聊）
+  try { if (typeof initPlanner === "function") initPlanner(); } catch (e) { console.warn("planner init", e); }
+  initCuPanel();
   initTerm();
   initCode();
   initUpdate();
@@ -314,6 +377,7 @@ function initCollab() {
   initAttachments();
   initCopy();
   initMsgNav();                          // 回到底部 / 问题导航（跳到某次提问）
+  initFocusRefresh();                    // ★回到前台补一次对账（失焦期间定时器被节流）
   initPartToggle();                      // 折叠块展开状态记忆
   initSelCopy();                         // 选中片段 → 浮出「复制选中」
   initTrace();                           // 顶栏「轨迹」：思考 / 工具调用
@@ -327,6 +391,8 @@ function initCollab() {
   restoreMusicState();                   // 刷新后面板内歌曲信息 / 队列 / 进度恢复
   initSettings();
   initTrust();                           // 顶栏「信任」：权限等级 / 待批准 / 始终允许
+  initQuarantine();                      // ★隔离区策略（低风险删除）+ 到期提醒（不阻塞首屏）
+  initAgentUpdates();                    // ★后台检查 agent / Node 更新（只读缓存，20s 后再联网）
   initCollab();                          // 顶栏「协作」：本地多 agent 工作台（不登录）
   // 自定义素材（头像 / 空会话主图与贴纸）：拉回来后再画一次首屏（接口没有就安静跳过）
   loadAppearance().then(() => refreshAppearanceArt());

@@ -3,7 +3,6 @@
 /* ---- 顶栏「设置」改成齿轮图标 ---- */
 #topbar .actions #btn-cfg { display: inline-flex; align-items: center; justify-content: center; }
 .ico-gear { width: 17px; height: 17px; display: block; }
-.ico-hub { width: 17px; height: 17px; display: block; }
 
 /* ---- 播放条：可折叠（像会话列表那样收起 / 展开）---- */
 #p-fold { padding: 0 7px; font-size: 11px; line-height: 1; transition: transform .18s ease; }
@@ -19,74 +18,22 @@
    从**底部上滑**的抽屉（类似群聊的右侧抽屉）：fixed 贴底，`.open` 才滑入；
    打开时给 #app 让出底部（padding-bottom）→ 输入框被顶到抽屉之上，抽屉正好在**文本框下面**。
    配色全部走主题变量（纸色 / 黄铜边 / 圣徽 / 烛焰金光标）。 */
-#topbar .actions #btn-tools,
-#topbar .actions #btn-hub { display: inline-flex; align-items: center; justify-content: center; }
+#topbar .actions #btn-tools { display: inline-flex; align-items: center; justify-content: center; }
 .ico-wrench { width: 17px; height: 17px; display: block; }
-#topbar .actions #btn-tools.on,
-#topbar .actions #btn-hub.on {
+#topbar .actions #btn-tools.on {
   color: var(--gold);
   border-color: color-mix(in srgb, var(--gold) 45%, transparent);
 }
-/* 顶栏「工具」触发件：平时只一个**淡淡的方阵小图标**（≈隐藏），
-   悬停 / 展开时高亮，并把「工具」两字**伸展**出来（就是旧群聊条那种伸展手感） */
-#topbar .actions #btn-hub {
-  width: auto; min-width: 0; padding: 0 8px; gap: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  color: var(--ink-faint); opacity: .55;
-  transition: opacity .16s ease, color .16s ease, padding .16s ease,
-              background .16s ease, border-color .16s ease;
-}
-#topbar .actions #btn-hub .hs-label {
-  max-width: 0; overflow: hidden; white-space: nowrap; opacity: 0;
-  font-family: var(--serif); font-size: 11.5px; letter-spacing: .1em;
-  transition: max-width .18s ease, opacity .18s ease, margin-left .18s ease;
-}
-#topbar .actions #btn-hub:hover, #topbar .actions #btn-hub.on {
-  opacity: 1; color: var(--hi);
-  background: color-mix(in srgb, var(--hi) 10%, transparent);
-}
-#topbar .actions #btn-hub:hover .hs-label,
-#topbar .actions #btn-hub.on .hs-label { max-width: 80px; opacity: 1; margin-left: 7px; }
-/* ★未读徽章（A1/A2）：群聊有未读时挂在按钮左上角（图标上方；避免展开时压住「工具」两字） */
-#topbar .actions #btn-hub { position: relative; }
-#topbar .actions #btn-hub.has-unread { opacity: 1; color: var(--hi); }
-#topbar .actions #btn-hub.has-unread::after {
-  content: attr(data-unread);
-  position: absolute; top: 1px; left: 2px;
-  min-width: 15px; height: 15px; padding: 0 4px;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--hi); color: #fff;
-  font-size: 9.5px; font-weight: 700; line-height: 1; border-radius: 8px;
-  pointer-events: none;
-}
-/* ★C1：有 AI 成员在干活 → 按钮**右下角**一个「工作中」绿点（未读徽章在左上角，互不打架） */
-#topbar .actions #btn-hub.cc-busy::before {
-  content: "";
-  position: absolute; right: 2px; bottom: 2px;
-  width: 8px; height: 8px; border-radius: 50%;
-  background: #3fb950; box-shadow: 0 0 5px rgba(63, 185, 80, .8);
-  animation: cc-busy-pulse 1.4s ease-in-out infinite;
-  pointer-events: none;
-}
+/* ★ 顶栏原来那个「工具」方阵按钮（#btn-hub / #hub-menu）已删：
+   在线协作 / 音乐 收进扳手菜单（#tools-menu 的 #tm-chat / #tm-music）。
+   徽章样式放在文件末尾（要晚于 `.open-menu button.on::after`，否则「 · 开」会盖掉未读数）。 */
 @keyframes cc-busy-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%      { opacity: .45; transform: scale(.75); }
 }
 
-/* 展开后的「工具」方阵抽屉：图标按**方阵**排列，点图标启动对应工具 */
-.hub-grid { min-width: 0; padding: 10px; }
-.hub-tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.open-menu .hub-tool {
-  width: 60px; height: 60px; min-width: 0; padding: 6px 4px; margin: 0;
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
-  text-align: center; font-size: 10.5px; letter-spacing: .02em; border-radius: 8px;
-}
-.open-menu .hub-tool svg { width: 20px; height: 20px; display: block; }
-.open-menu .hub-tool.on {
-  color: var(--gold); border-color: color-mix(in srgb, var(--gold) 55%, transparent);
-  background: color-mix(in srgb, var(--gold) 12%, transparent);
-}
-.open-menu .hub-tool.on::after { content: none; }   /* 方阵里不要「 · 开」后缀 */
+/* 扳手菜单里的分隔线：上面是「在线协作 / 音乐」，下面是编辑器类工具 */
+.open-menu .om-sep { height: 1px; background: var(--line); margin: 4px 2px; }
 .open-menu button.on {
   color: var(--gold);
   border-color: color-mix(in srgb, var(--gold) 45%, transparent);
@@ -98,7 +45,7 @@
 
 /* ANSI 16 色按主题取色（light 用深色系、dark 用经典亮色系）。渲染层写 var(--tN) 即可随主题切换。 */
 /* ANSI 16 色 —— 面板是深色玻璃，用**浅色**那套才看得清（原"夜间"调色板） */
-:root, [data-theme="hiru"] {
+:root {
   --t0: #000000; --t1: #cd3131; --t2: #0dbc79; --t3: #e5e510;
   --t4: #2472c8; --t5: #bc3fbc; --t6: #11a8cd; --t7: #e5e5e5;
   --t8: #8a8a8a; --t9: #f14c4c; --t10: #23d18b; --t11: #f5f543;
@@ -292,6 +239,77 @@ html.code-resizing #app { transition: none; }
   direction: rtl; text-align: left; unicode-bidi: plaintext;
 }
 .code-edit-wrap { position: relative; flex: 1; min-height: 0; }
+/* ★预览层（`ui 0.2.86`）：图片 / PDF / 音视频 —— 和编辑器二选一显示 */
+.code-preview {
+  flex: 1; min-height: 0; overflow: auto;
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  gap: 8px; padding: 10px 12px; background: var(--paper-2);
+}
+.code-preview img,
+.code-preview video {
+  max-width: 100%; max-height: 100%; object-fit: contain;
+  border-radius: 6px; box-shadow: 0 6px 24px rgba(0,0,0,.35);
+}
+.code-preview embed,
+.code-preview iframe {
+  width: 100%; flex: 1; min-height: 420px; border: 0; border-radius: 6px; background: #fff;
+}
+.code-preview audio { width: 100%; }
+.code-preview .cp-note { font-size: 11px; color: var(--ink-faint); text-align: center; line-height: 1.6; }
+.code-preview .cp-acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.code-preview .cp-acts button { padding: 5px 10px; font-size: 11.5px; }
+/* Markdown 预览的工具栏吸顶（内容长时也够得着「源码」） */
+.code-preview .cp-acts.cp-acts-top {
+  position: sticky; top: 0; z-index: 2; align-self: stretch;
+  padding: 5px 2px; margin-bottom: 2px;
+  background: color-mix(in srgb, var(--paper-2) 90%, transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--line-soft);
+}
+.code-preview .cp-icon { font-size: 34px; opacity: .5; margin: 24px 0 2px; }
+/* ★Markdown 渲染（`ui 0.2.91`）：读文档用，不做代码风格 */
+.code-preview .cp-html {
+  width: 100%; flex: 1; min-height: 60vh; border: 0; border-radius: 6px;
+  background: #fff; align-self: stretch;
+}
+.code-preview .cp-md {
+  width: 100%; max-width: 900px; align-self: center;
+  color: var(--ink); font-size: 13.5px; line-height: 1.72;
+  padding: 4px 6px 18px;
+}
+.code-preview .cp-md h1,
+.code-preview .cp-md h2,
+.code-preview .cp-md h3,
+.code-preview .cp-md h4 { font-family: var(--serif); margin: 1em 0 .4em; line-height: 1.35; }
+.code-preview .cp-md h1 { font-size: 1.5em; }
+.code-preview .cp-md h2 { font-size: 1.28em; border-bottom: 1px solid var(--line-soft); padding-bottom: 4px; }
+.code-preview .cp-md h3 { font-size: 1.12em; }
+.code-preview .cp-md .md-p { margin: .55em 0; white-space: pre-wrap; word-break: break-word; }
+.code-preview .cp-md ul, .code-preview .cp-md ol { margin: .5em 0; padding-left: 1.7em; }
+.code-preview .cp-md li { margin: .18em 0; }
+.code-preview .cp-md blockquote {
+  margin: .6em 0; padding: .3em .9em; border-left: 3px solid var(--gold);
+  background: color-mix(in srgb, var(--gold) 6%, transparent); color: var(--ink-dim);
+}
+.code-preview .cp-md table { border-collapse: collapse; margin: .7em 0; font-size: 12.5px; }
+.code-preview .cp-md th, .code-preview .cp-md td { border: 1px solid var(--line-soft); padding: 4px 8px; }
+.code-preview .cp-md th { background: color-mix(in srgb, var(--gold) 10%, transparent); }
+.code-preview .cp-md code {
+  font-family: var(--mono); font-size: 11.5px; padding: 0 4px; border-radius: 4px;
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+}
+.code-preview .cp-md pre { overflow-x: auto; padding: 8px 10px; border-radius: 6px;
+  background: rgba(0,0,0,.28); font-family: var(--mono); font-size: 11.5px; line-height: 1.5; }
+.code-preview .cp-md pre code { background: transparent; padding: 0; }
+.code-preview .cp-md hr { border: 0; border-top: 1px solid var(--line-soft); margin: 1em 0; }
+/* Markdown「源码」模式：允许折行，别再把长行切掉 */
+.code-edit-wrap.md-src .code-editor,
+.code-edit-wrap.md-src .code-highlight {
+  white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+}
+/* 「自动打开」是个状态开关：亮着 = 开 */
+#code-auto { font-size: 11px; padding: 4px 8px; }
+#code-auto.on { border-color: var(--gold); color: var(--gold); }
 .code-highlight,
 .code-editor {
   position: absolute; inset: 0; margin: 0;
@@ -308,7 +326,7 @@ html.code-resizing #app { transition: none; }
 .code-edit-wrap.disabled .code-highlight { opacity: .6; }
 
 /* VS Code 风格 token 配色 —— 面板已改成**深色玻璃**，所以用**浅色**配色（Dark+）才看得清 */
-:root, [data-theme="hiru"] {
+:root {
   --c-comment: #6a9955; --c-string: #ce9178; --c-number: #b5cea8;
   --c-keyword: #569cd6; --c-control: #c586c0; --c-func: #dcdcaa;
   --c-type: #4ec9b0; --c-var: #9cdcfe; --c-const: #4fc1ff;
@@ -332,3 +350,29 @@ html.code-resizing #app { transition: none; }
   html.code-open #app { padding-right: 0; }          /* 窄屏：抽屉占满，退回覆盖式 */
   .code-tree { width: 160px; }
 }
+
+/* ================= 扳手菜单里的「在线协作 / 音乐」 =================
+   ★ 顶栏那个方阵按钮（#btn-hub）已删，两项收进 #tools-menu。
+   ⚠ 这几条必须放在文件末尾：`.open-menu button.on::after { content: " · 开" }`
+     在上面，同特异度下它会盖掉未读数字。 */
+#tools-menu #tm-chat { position: relative; }
+#tools-menu #tm-chat.has-unread { color: var(--hi); }
+#tools-menu #tm-chat.has-unread::after {
+  content: attr(data-unread);
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  min-width: 16px; height: 16px; padding: 0 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--hi); color: #fff;
+  font-size: 9.5px; font-weight: 700; line-height: 1; border-radius: 8px;
+  pointer-events: none;
+}
+#tools-menu #tm-chat.cc-busy { padding-left: 22px; }
+#tools-menu #tm-chat.cc-busy::before {
+  content: "";
+  position: absolute; left: 9px; top: 50%; margin-top: -4px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #3fb950; box-shadow: 0 0 5px rgba(63, 185, 80, .8);
+  animation: cc-busy-pulse 1.4s ease-in-out infinite;
+  pointer-events: none;
+}
+

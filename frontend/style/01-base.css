@@ -1,13 +1,13 @@
 /* 01-base.css —— 基础 / 主题变量 / 布局 / 消息区（P4 从 style.css 按物理顺序拆出的第 1 段；拼接后与原文件一致） */
 
 /* ============================================================================
-   OpenCode UI —— 两套内置主题：默认「圣烛教堂」(chapel) ／「和纸白昼」(hiru)
+   OpenCode UI —— **唯一内置主题「圣烛教堂」(chapel)**（`ui 0.2.123` 起删除「和纸白昼」）
    设计依据：
-     · 教堂意象：暖黑石墙 + 米白（白袍）+ 绣线金 + 烛焰橙            → chapel（默认，暗色）
-     · 巫女服 = 白衣 + 绯袴，红白两色，衣襟袖口编红色丝绳            → hiru（和纸白 + 绯红）
-     · 暗红色长发、深玫瑰红眼瞳                                    → 金色点缀
-     · 器物都贴一句自己的落款（「祈祷书」「壁画」…）                → 会话项 / 弹窗题字命名风格
-   切换入口：设置 → 壁纸与外观 → 主题（两张卡）。
+     · 教堂意象：暖黑石墙 + 米白（白袍）+ 绣线金 + 烛焰橙
+     · 器物都贴一句自己的落款（「祈祷书」「壁画」…）→ 会话项 / 弹窗题字命名风格
+   入口：设置 → 壁纸与外观 → 主题（只剩内置 + 主题工坊）。
+   ⚠ `:root` 与 `[data-theme="chapel"]` 是**同一套**变量：`<html data-theme>` 由 JS 写在
+     `applyTheme()` 里，而 `:root` 兜住「JS 还没跑」的首屏（否则会闪一下浅色）。
    ============================================================================ */
 
 /* 反斜杠全局修正：日文字体（Yu Mincho / Yu Gothic UI 等）按 Shift-JIS 习惯把 U+005C(\) 画成「￥」。
@@ -21,25 +21,25 @@
 
 :root {
   --ui-z: 1;   /* ★界面缩放倍率（设置里的滑块写）：把视口相对单位除回去 —— CSS zoom 会把它们一起放大 */
-  /* —— 昼：白衣绯袴 —— */
-  --paper:      #faf7f2;   /* 和纸白（白衣） */
-  --paper-2:    #f2ece1;   /* 第二层纸 */
-  --paper-3:    #e9e1d3;
-  --ink:        #241f1d;   /* 墨 */
-  --ink-dim:    #6d635b;
-  --ink-faint:  #a2988e;
-  --hi:         #c8102e;   /* 绯（绯袴） */
-  --hi-deep:    #96071f;
-  --hi-wash:    #fbeaea;   /* 绯的淡染 */
-  --gold:       #a8842c;   /* 金边 */
-  --gold-soft:  #d9c07a;
-  --sakura:     #f2c6cf;   /* 樱 */
-  --line:       rgba(36, 31, 29, .14);
-  --line-soft:  rgba(36, 31, 29, .07);
-  --shadow:     0 1px 2px rgba(36,31,29,.05), 0 6px 18px rgba(36,31,29,.06);
-  --ok:         #3f7d58;
-  --run:        #a8842c;
-  --err:        #b3261e;
+  /* —— 圣烛教堂：暖黑石墙 + 米白 + 绣线金 + 烛焰橙（唯一定盘，不再有浅色版） —— */
+  --paper:      #17120f;
+  --paper-2:    #201a15;
+  --paper-3:    #2a221b;
+  --ink:        #f6efe3;
+  --ink-dim:    #cdbfa9;
+  --ink-faint:  #9c8d79;
+  --hi:         #e0a24a;
+  --hi-deep:    #a86c22;
+  --hi-wash:    rgba(224, 162, 74, .16);
+  --gold:       #d9bd83;
+  --gold-soft:  #f0dcae;
+  --sakura:     #c56a55;
+  --line:       rgba(246, 239, 227, .16);
+  --line-soft:  rgba(246, 239, 227, .08);
+  --shadow:     0 14px 38px rgba(0, 0, 0, .42);
+  --ok:         #63a97f;
+  --run:        #d9bd83;
+  --err:        #e0645c;
 
   /* Cambria Math 放在最后一位：前面的字体缺数学符号时由它补，避免 ∑ ∫ √ 这类显示成方框 */
   --serif: "cocraft-bslash", "Yu Mincho", "MS Mincho", "Noto Serif SC", "Source Han Serif SC",
@@ -47,41 +47,13 @@
   --sans:  "cocraft-bslash", "Yu Gothic UI", "Microsoft YaHei UI", "Segoe UI", "Cambria Math", system-ui, sans-serif;
   --mono:  ui-monospace, "Cascadia Mono", Consolas, "Courier New", "Cambria Math", monospace;
 
-  --radius: 3px;          /* 和风：小圆角，接近直角更利落 */
+  --radius: 6px;          /* 教堂：6px 圆角（`0.2.48` 定下的） */
   --sidebar: 288px;
   --col-side: var(--sidebar);   /* 两栏网格用；收起侧栏时置 0 */
   /* 背景亮度（1 = 原样，<1 变暗）：设置面板里可调（写内联变量覆盖）。 */
   --bg-dim: 1;
   /* ★统一的「模糊程度」—— 会话界面 / 消息气泡 / 群聊界面**共用**这一个值（设置面板里调）。0 = 全透明不模糊。 */
   --g-blur: 28px;
-}
-
-/* ============================================================================
-   ★ 官方主题「圣烛教堂」(chapel) · 底盘变量（2026-10-25）
-   取色直接来自官方壁纸：白袍兜帽（米白）+ 金线刺绣（绣金）+ 手持蜡烛（烛焰橙金）+ 彩窗（暖红）。
-   ⚠ 仍是「暗色专属」：不做浅色变体；浅色请切回 hiru（和纸白昼）。
-   ⚠ 只给**变量**，组件细节在 `08-visual.css` 的「圣烛教堂 · 细节」一节。
-   ============================================================================ */
-[data-theme="chapel"] {
-  --paper:      #17120f;   /* 暖黑石墙（不是纯黑，烛光下才有温度） */
-  --paper-2:    #201a15;
-  --paper-3:    #2a221b;
-  --ink:        #f6efe3;   /* 白袍米白 */
-  --ink-dim:    #cdbfa9;
-  --ink-faint:  #9c8d79;
-  --hi:         #e0a24a;   /* 烛焰橙金（主强调：主按钮 / 选中 / 焦点） */
-  --hi-deep:    #a86c22;
-  --hi-wash:    rgba(224, 162, 74, .16);
-  --gold:       #d9bd83;   /* 绣线金（描边 / 标签 / 徽章） */
-  --gold-soft:  #f0dcae;
-  --sakura:     #c56a55;   /* 彩窗暖红（只做小面积点缀） */
-  --line:       rgba(246, 239, 227, .16);
-  --line-soft:  rgba(246, 239, 227, .08);
-  --shadow:     0 14px 38px rgba(0, 0, 0, .42);
-  --ok:         #63a97f;
-  --run:        #d9bd83;
-  --err:        #e0645c;
-  --radius:     6px;
 }
 
 * { box-sizing: border-box; }
@@ -195,15 +167,23 @@ body::before {
   color: var(--ink-faint); font-size: 11px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-/* 所属项目：右下角的小标签（只显示目录名；完整路径仍在「详细信息」里） */
+/* 所属项目 → **工作区路径**（`ui 0.2.89`：以前只显示目录名，两个同名项目分不出来）。
+ *  路径按"右侧省略"排（`direction: rtl`）：窄的时候留住**最后一段**（项目名），而不是 `D:\Us…`。 */
 .session .proj {
-  flex: none; max-width: 46%;
+  flex: 0 1 auto; max-width: 68%;
   border: 1px solid var(--line-soft); border-radius: 999px;
-  padding: 0 6px; line-height: 15px;
+  padding: 0 7px; line-height: 15px;
   background: color-mix(in srgb, var(--paper) 55%, transparent);
   color: var(--ink-faint); font-size: 10.5px; letter-spacing: .02em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.session .proj.ws {
+  font-family: var(--mono); font-size: 10.5px;
+  direction: rtl; text-align: left; unicode-bidi: plaintext;
+  cursor: pointer;
+}
+.session .proj.ws:hover { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 45%, transparent); }
+.session .proj.ws.none { font-family: inherit; border-style: dashed; }
 .session.active .proj { color: var(--ink-dim); border-color: var(--line); }
 
 /* 删除按钮：平时淡着（看得见、但不抢眼），悬停到这一项时才变红 —— 兼顾"找得到"和"别误点" */
@@ -580,6 +560,18 @@ h1#session-title {
 /* Markdown 块级元素（表格 / 列表 / 标题 / 引用 / 分割线 / 段落） */
 .msg .bubble .md-p { margin: .4em 0; white-space: pre-wrap; word-break: break-word; }
 .msg .bubble .md-p:first-child { margin-top: 0; }
+/* ★数学（`ui 0.2.87`）：LaTeX 已翻成可读文本 —— 行内用等宽/微底，块级居中并允许横向滚动 */
+.math {
+  font-family: var(--mono); font-size: .95em; padding: 0 .18em; border-radius: 4px;
+  background: color-mix(in srgb, var(--ink) 8%, transparent); white-space: nowrap;
+}
+.md-math {
+  font-family: var(--mono); font-size: .95em; text-align: center;
+  margin: .55em 0; padding: .45em .7em; border-radius: 8px;
+  border: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  overflow-x: auto; white-space: pre;
+}
 .msg .bubble h1, .msg .bubble h2, .msg .bubble h3,
 .msg .bubble h4, .msg .bubble h5, .msg .bubble h6 {
   font-family: var(--serif); margin: .6em 0 .35em; line-height: 1.35;

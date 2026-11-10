@@ -13,6 +13,8 @@ const state = {
   attachments: [],      // 待发送附件
   named: {},            // 已经自动命名过的会话 { id: true } —— 每个会话最多命名一次
   detailOpen: {},       // 侧栏会话详情展开状态 { id: true }
+  // ★自动打开「文件查看」的闸门：只有**用户在提问里明确要求动文件**时才为 true（`ui 0.2.91`）
+  wantFiles: { at: 0, on: false },
   // ★会话列表里的「项目文件树」（按会话展开；数据按**根目录**缓存 → 同项目共用，不重复请求）
   treeOpen: {},         // { [sessionID]: true }  哪些会话的树展开了
   treeData: {},         // { [root]: { [path]: items } }  /fs/list 的结果
@@ -30,10 +32,51 @@ const state = {
 
 /* ---------------- 侧栏：会话列表 ---------------- */
 
+// ★工作流成员 / 群聊 AI 成员不混进单聊列表（15s 缓存，别每条轮询都问）
+const MANAGED_SESSIONS = { ts: 0, ids: new Set() };
+
+async function managedSessionIds() {
+  if (Date.now() - MANAGED_SESSIONS.ts < 15000) return MANAGED_SESSIONS.ids;
+  try {
+    const r = await api("/session/managed");
+    const ids = (r && r.ids) || [];
+    MANAGED_SESSIONS.ids = new Set(ids.map(String));
+    MANAGED_SESSIONS.ts = Date.now();
+  } catch {
+    // 老后端没有这个接口 → 不过滤，保持可用
+  }
+  return MANAGED_SESSIONS.ids;
+}
+
+async function loadPlannerSessionsMerged() {
+  try {
+    const r = await api("/planner/sessions?limit=40");
+    const list = (r && (r.sessions || (r.data && r.data.sessions))) || [];
+    return (Array.isArray(list) ? list : []).map((p) => {
+      const sid = String(p.id || "");
+      const ts = Number(p.updatedAt || p.createdAt || 0) * 1000;
+      return {
+        id: "planner:" + sid,
+        title: "📋 " + (p.title || "策划会话"),
+        _kind: "planner",
+        _planner: p,
+        time: { updated: ts || Date.now(), created: Number(p.createdAt || 0) * 1000 || ts },
+        location: { directory: p.cwd || "" },
+        outcome: p.status || "",
+      };
+    });
+  } catch { return []; }
+}
+
 async function loadSessions() {
   try {
     const body = await api("/api/session?limit=50&order=desc");
-    state.sessions = unwrap(body) || [];
+    const list = unwrap(body) || [];
+    const hidden = await managedSessionIds();
+    let sessions = hidden.size ? list.filter((s) => !hidden.has(String(s.id))) : list;
+    // ★主控（策划）会话**不混进聊天列表**：它属于工作流面板（左栏「主控会话」）。
+    //   `openSession("planner:…")` 仍支持，由工作流面板点进来。
+    state.sessions = sessions.filter((s) => !String(s.id || "").startsWith("planner:"));
     renderSessions();
   } catch (err) {
     $("session-list").innerHTML = `<div class="error-box">加载会话失败：${esc(err.message)}</div>`;
@@ -108,13 +151,35 @@ function ctxLimitOf(ref) {
   return n > 0 ? n : 0;
 }
 
-/** 从最近一条 assistant 消息推上下文占用（优先 agent 上报的 context，其次 OpenCode 的 tokens）。 */
+/** 模型引用的「短名」：`deepseek/deepseek-flash` → `deepseek-flash`。
+ *  用来判断一条 context 是不是**当前模型**上报的（ACP 的 id 可能带/不带 provider 前缀）。 */
+function ctxModelKey(ref) {
+  const id = typeof ref === "string" ? ref
+    : String((ref && (ref.id || ref.modelID)) || "");
+  const parts = id.split("/").filter(Boolean);
+  return (parts[parts.length - 1] || "").toLowerCase();
+}
+
+/** 这条 context 能不能给「当前模型」用：认得出是**别的**模型 → false；不知道（老数据）→ true。 */
+function ctxModelMatches(ctxModel, ref) {
+  const a = ctxModelKey(ctxModel), b = ctxModelKey(ref);
+  if (!a || !b) return true;
+  return a === b;
+}
+
+/** 从最近一条 assistant 消息推上下文占用（优先 agent 上报的 context，其次 OpenCode 的 tokens）。
+ *  ⚠ 切过模型的会话：旧模型的消息（context / tokens）不能拿来算当前模型的窗口 —— 跳过。 */
 function ctxFromMessages() {
+  const cur = (state.current && state.current.model) || {};
+  const curId = String(cur.id || "");
   const msgs = state.messages || [];
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (!m || m.type !== "assistant") continue;
+    const msgModel = (m.model && (m.model.id || m.model.modelID)) || "";
+    if (msgModel && curId && !ctxModelMatches(msgModel, cur)) continue;
     if (m.context && Number(m.context.size) > 0) {
+      if (!ctxModelMatches(m.context.model || msgModel, cur)) continue;
       return { used: Number(m.context.used) || 0, size: Number(m.context.size) || 0,
                src: "agent", model: String((m.model && m.model.id) || "") };
     }
@@ -132,16 +197,49 @@ function ctxFromMessages() {
   return null;
 }
 
+/** 这个会话里有没有「别的模型」的助手消息（用来判断没有 model 字段的老 context 可不可信）。 */
+function ctxSessionMixedModels(curRef) {
+  const msgs = state.messages || [];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m && m.type === "assistant" && m.model && m.model.id
+        && !ctxModelMatches(m.model.id, curRef)) return true;
+  }
+  return false;
+}
+
+/** 会话里有没有「已切换模型」的系统提示（老 context 没记模型时，用它判断旧窗口作废）。 */
+function ctxHadModelSwitch() {
+  const msgs = state.messages || [];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m && m.type === "system" && /已切换模型/.test(String(m.text || ""))) return true;
+  }
+  return false;
+}
+
 function ctxCompute() {
   if (!state.current) return { used: 0, size: 0, src: "", model: "" };
   const mid = String((state.current.model && state.current.model.id) || "");
+  const curRef = state.current.model || { id: mid };
   const sc = state.current.context;
   // ★size=0 也认：dsh 这类 agent 只在 prompt 结果里给 tokens，后端估一个 used（estimated=true）
   if (sc && (Number(sc.used) > 0 || Number(sc.size) > 0)) {
+    // ★切模型后的旧窗口：认得出是别的模型 → 丢给消息里的数据（通常也没有 → 显示「—」，
+    //   等下一次 usage_update 上报真实窗口）。
+    const scModel = String(sc.model || "");
+    if (scModel && !ctxModelMatches(scModel, curRef)) {
+      return ctxFromMessages() || { used: 0, size: 0, src: "stale", model: mid };
+    }
+    // ★老数据（context 还没有 model 字段）：会话里出现过别的模型 / 有「已切换模型」提示
+    //   就**不能确定**这条窗口是谁的，宁可不显示，也不拿旧模型的 256K 冒充新模型的 1M。
+    if (!scModel && (ctxSessionMixedModels(curRef) || ctxHadModelSwitch())) {
+      return ctxFromMessages() || { used: 0, size: 0, src: "stale", model: mid };
+    }
     let size = Number(sc.size) || 0;
     // ★两个引擎同一口径：agent 没给窗口上限时，用**当前引擎**模型清单里的 limit.context 补一次
     //   （只补真实清单里有的模型；补不到就还是「~N」，绝不编一个数）
-    if (!size && Number(sc.used) > 0) size = ctxLimitOf(state.current.model || { id: mid });
+    if (!size && Number(sc.used) > 0) size = ctxLimitOf(curRef);
     return { used: Number(sc.used) || 0, size: size,
              src: sc.estimated ? "estimate" : "agent", model: mid };
   }
@@ -149,6 +247,10 @@ function ctxCompute() {
 }
 
 function ctxTitle() {
+  if (CTX.src === "stale") {
+    return "上下文：上一个模型上报的窗口已作废（刚切过模型）\n"
+      + "等这一轮结束 / 下一次 usage_update 上报后，会显示新模型真实的窗口大小";
+  }
   if (!CTX.used && !CTX.size) {
     return "上下文用量：这个 agent 还没上报\n"
       + "（ACP 里 codex / opencode-acp 会发 usage_update；dsh 等不发，OpenCode 走模型清单 + 上一条回答的 tokens）";
@@ -192,6 +294,10 @@ function ctxSync() {
 
 function ctxShowInfo() {
   if (!state.current) return;
+  if (CTX.src === "stale") {
+    setBanner("刚切过模型：上一个模型上报的窗口已作废，等这一轮结束会显示新模型的窗口", { ms: 9000 });
+    return;
+  }
   if (!CTX.used && !CTX.size) {
     setBanner("这个 agent 还没上报上下文用量（不支持 usage_update）", { ms: 6000 });
     return;
@@ -322,7 +428,9 @@ function renderSessions() {
     const proj = projectNameOf(dir);
     const tip = open ? "收起详细信息" : "展开详细信息";
     const tOpen = !!state.treeOpen[s.id];                 // ★项目文件树是否展开
-    return `<div class="session${active}" data-id="${esc(s.id)}" title="${esc(s.title || "(无标题)")}">
+    const isPlanner = s._kind === "planner" || String(s.id||"").startsWith("planner:");
+    const kindCls = isPlanner ? " kind-planner" : "";
+    return `<div class="session${active}${kindCls}" data-id="${esc(s.id)}" data-kind="${isPlanner?"planner":""}" title="${esc(s.title || "(无标题)")}">
       <button type="button" class="info" data-info="${esc(s.id)}"
               title="${tip}" aria-label="${tip}">${open ? "▾" : "▸"}</button>
       <button type="button" class="del" data-del="${esc(s.id)}"
@@ -333,7 +441,20 @@ function renderSessions() {
       <span class="t">${esc(s.title || "(无标题)")}</span>
       <span class="s-row">
         <span class="s">${esc(when)}${s.outcome ? " · " + esc(s.outcome) : ""}</span>
-        ${proj ? `<span class="proj" title="项目：${esc(proj)}">${esc(proj)}</span>` : ""}
+        ${dir
+          ? (tOpen || open
+            // ★展开文件树 / 详情时 → 显示**完整工作区路径**（点一下复制）
+            ? `<button type="button" class="proj ws" data-ws="${esc(dir)}"
+                       title="工作区：${esc(dir)}
+（点一下复制完整路径；文件查看 / 快照 / 撤销 都以这个目录为准）"
+                       >${esc(dir)}</button>`
+            // 默认（收起）→ 只显示**项目名**，别让每行都挂一条长路径
+            : `<span class="proj" title="项目：${esc(proj)}（展开左侧文件夹按钮或 ▸ 看完整工作区路径）"
+                     >${esc(proj)}</span>`)
+          : (open
+            ? `<span class="proj ws none" title="这个会话没有工作目录 —— 新建会话时选一个项目；没有目录时「文件查看 / 忏悔室」都用不了"
+                     >未指定工作区</span>`
+            : "")}
       </span>
       <div class="det"${open ? "" : " hidden"}>${sessionDetailHtml(s)}</div>
       ${tOpen && dir ? `<div class="session-tree" data-root="${esc(dir)}">${sessionTreeHtml(dir)}</div>` : ""}
@@ -345,17 +466,31 @@ function renderSessions() {
  *  删掉的如果是当前会话，就把界面清回"未选择"再自动选剩下最新的一条。 */
 async function deleteSession(id, title) {
   const label = (title || "").trim() || "(无标题)";
+  const isPlanner = String(id||"").startsWith("planner:");
   let n = 0;
   try { n = (state.messages || []).length; } catch { /* ignore */ }
-  const extra = (state.current && state.current.id === id && n)
-    ? `\n（含当前这 ${n} 条消息，无法撤销）` : "（无法撤销）";
-  if (!confirm(`删除会话「${label}」？${extra}`)) return;
+  const extra = isPlanner ? "（删除策划会话记录与其 plan/handoff 文件）" : ((state.current && state.current.id === id && n)
+    ? `\n（含当前这 ${n} 条消息，无法撤销）` : "（无法撤销）");
+  if (!confirm(`删除${isPlanner?"策划":""}会话「${label}」？${extra}`)) return;
+  let delRes = null;
   try {
-    await api(`/api/session/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (isPlanner) {
+      const sid = String(id).replace(/^planner:/,"");
+      delRes = await api(`/planner/session?id=${encodeURIComponent(sid)}`, { method: "DELETE" });
+    } else {
+      delRes = await api(`/api/session/${encodeURIComponent(id)}`, { method: "DELETE" });
+    }
     delete state.detailOpen[id];
   } catch (err) {
     alert(`删除失败：${err.message}`);
     return;
+  }
+  // ★ACP：告诉用户「agent 那边到底删没删」——只 close 的话它还会出现在「接续」里
+  const side = (delRes && delRes.agentSide) || "";
+  if (side === "close") {
+    setBanner("本地已删除；agent 侧只是「关闭」——它还会出现在「接续」里，可在那里点 × 彻底删掉", { ms: 10000 });
+  } else if (side === "none") {
+    setBanner("本地已删除；agent 侧没删（可能没连上 / 不支持）。可在「接续」里再删一次", { ms: 10000 });
   }
   if (state.current && state.current.id === id) {
     state.current = null;
@@ -591,9 +726,55 @@ function renderShellMsg(m) {
     </span><span class="line"></span></div>${outHtml}`;
 }
 
+/** ★把「这一轮失败」渲染成一张**人话错误卡**（`ui 0.2.92`）。
+ *
+ *  opencode 引擎的失败消息长这样（实测取自 OpenCode 自己的 SQLite）：
+ *      { type:"assistant", content: [], finish:"error",
+ *        error:{ type:"provider.quota", message:"Insufficient Balance (request_id: …)",
+ *                status:402, response:{ body:"{\"error\":{\"type\":\"insufficient_balance_error\",…}}" } } }
+ *  以前只读 `content` → 空数组 → 显示"这一轮确实没有返回正文"，用户永远看不出是余额不足。
+ *  这里统一交给 `errKindOf()`（和后端 `backend/errkind.py` 同一套口径）翻成人话。 */
+function assistantErrorCard(m) {
+  const err = (m && m.error && typeof m.error === "object") ? m.error : null;
+  if (!err && !(m && m.finish === "error")) return "";
+  const body = (err && err.response && typeof err.response === "object") ? err.response.body : "";
+  const raw = [err && err.type, err && err.message,
+               (typeof body === "string" ? body : "")].filter(Boolean).join(" · ");
+  const k = errKindOf(raw || "未知错误");
+  const status = (err && err.status) ? `（HTTP ${err.status}）` : "";
+  const msg = oneLine((err && err.message) || raw || "未知错误", 240);
+  const detail = raw && raw !== msg
+    ? `<details class="err-raw"><summary>原始报错</summary>
+       <div class="body">${esc(raw.slice(0, 4000))}</div></details>` : "";
+  const agent = String((m && m.agent) || "");
+  const model = (m && m.model && (m.model.id || m.model.modelID)) || "";
+  return `<div class="msg assistant failed" data-mid="${esc((m && m.id) || "")}">
+    <div class="who">
+      <img class="avatar" src="${appearanceUrl("avatar", "/assets/icon-256.png")}" alt="">
+      <strong>助手</strong>
+      ${agent ? `<span class="badge">${esc(agent)}</span>` : ""}
+      ${model ? `<span class="badge">${esc(model)}</span>` : ""}
+      ${m && m.time && m.time.created ? `<span class="muted">${fmtTime(m.time.created)}</span>` : ""}
+      <span class="tag err">失败</span>
+    </div>
+    <div class="bubble"><div class="err-card${k.account ? " account" : ""}">
+      <div class="err-head">⚠ ${esc(k.label)}${esc(status)}</div>
+      <div class="err-msg">${esc(msg)}</div>
+      <div class="err-hint">${esc(k.hint)}</div>
+      ${detail}
+    </div></div>
+  </div>`;
+}
+
 function renderMessage(m) {
   const type = m.type || "assistant";
   if (type === "idle") return "";
+
+  // ★ACP（opencode-acp）：正在生成的那一步会先往共享库落一行**未完成**的助手消息
+  //   （`time.completed` 还没有 → 后端标 `inflight`），而它的 id（`msg_…`）与 live 缓冲
+  //   （`a_…`）**不是同一个** → 两处都画就会出现**两个「正在思考…」**（用户 2026-11-05 发图）。
+  //   有 live 缓冲时让 live 画那一步；刷新后没有 live 再退回这条（免得整段消失）。
+  if (type === "assistant" && m.inflight && Object.keys(state.live || {}).length) return "";
 
   // ★系统注入通知（AGENTS.md 指令变更 / 日期 / 运行环境…）**不进主界面** —— 整条归「轨迹」页。
   //   一个回合里它会出现十几次（每一轮工具调用后都可能来一条），把消息区刷满。
@@ -692,6 +873,11 @@ function renderMessage(m) {
         return `<div class="msg assistant"><div class="who"><strong>助手</strong></div>
           <div class="bubble"><div class="text muted">正在思考…</div></div></div>`;
       }
+      // ★「这一轮失败了」：opencode 引擎把错误放在**消息对象**上（`content: []` + `finish:"error"`
+      //   + `error:{type,message,status}`）—— 以前只读 content，于是余额不足也被说成
+      //   "这一轮确实没有返回正文"（用户实测报过两次）。
+      const errCard = assistantErrorCard(m);
+      if (errCard) return errCard;
       // ★已结束、但没有最终输出（只有思考 / 工具 / 旁白）→ **主界面不显示**（细节看「轨迹」）。
       if (!trulyEmpty) return "";
       // 整条 content 真的为空（不是被藏起来的）：给个诊断，别静默
@@ -1059,7 +1245,11 @@ function liveToMessage(id, e, revealed) {
   }
   return {
     id, type: "assistant", agent: e.agent, model: { id: e.model },
-    time: { created: e.started || Date.now() },
+    // ★已收尾（`step.ended` 到了）就带上 completed —— 否则 renderMessage 会把"只有思考/工具"的
+    //   已结束步骤当成**还在生成**、画成「正在思考…」占位（一步一个，多步一轮就一大串）。
+    time: e.done
+      ? { created: e.started || Date.now(), completed: e.endedAt || Date.now() }
+      : { created: e.started || Date.now() },
     content,
   };
 }
@@ -1067,6 +1257,31 @@ function liveToMessage(id, e, revealed) {
 function pendingLiveIds() {
   const known = new Set(state.messages.map((m) => m.id));
   return Object.keys(state.live).filter((id) => !known.has(id));
+}
+
+/** 这条「生成中」缓冲里有没有**主界面看得见**的正文（思考 / 工具只在轨迹页显示） */
+function liveHasText(e) {
+  return !!(e && joinBucket(e.text || {}).trim());
+}
+
+/** ★主界面到底画哪几条「生成中」缓冲（`ui 0.2.83`）。
+ *  背景：多步一轮里**每一步都是一个新的 `assistantMessageID`** → `state.live` 会依次攒下很多条；
+ *  而思考 / 工具在主界面**不渲染** → 每一条都只剩一个「正在思考…」占位。
+ *  以前只靠 `refreshMessages()` 把"已落库的 id"删掉，可**失焦 / 窗口被遮挡时浏览器会节流定时器**
+ *  （Chromium 后台可到 1 次/分钟）→ 那段时间里能攒出好几个「正在思考…」（用户实测一次看到 4 个）。
+ *  现在：① 有正文的照画；② 已收尾（`done`）的**只画有正文的**（没正文就该收起来）；
+ *       ③ **只有正在跑的那一步**才给「正在思考…」占位。
+ *  ⚠ 轨迹页（`traceItems`）与本轮进展行（`turnCards`）仍用 `pendingLiveIds()` —— 那边要看到**每一步**。 */
+function liveMainIds() {
+  const ids = pendingLiveIds();
+  const newest = ids.length ? ids[ids.length - 1] : null;
+  return ids.filter((id) => {
+    const e = state.live[id];
+    if (!e) return false;
+    if (liveHasText(e)) return true;
+    if (e.done) return false;
+    return id === newest;
+  });
 }
 
 /** 取「模型刚才在想什么」的节选：优先生成中的实时缓冲，其次最后一条助手消息。
@@ -1696,6 +1911,11 @@ function initTraceResize() {
 }
 
 function renderMessages() {
+  if (state.current && state.current._kind === "planner") {
+    // planner rich view manages messages-static itself
+    renderHistoryHint && renderHistoryHint();
+    return;
+  }
   const pending = pendingLiveIds();
 
   TURNMAP = buildTurnMap();        // ★「思考 Ns」按整轮算时长（必须在拼 HTML 之前算好）
@@ -1764,14 +1984,16 @@ function renderMessages() {
 function paintLiveSlot() {
   const box = $("messages");
   const slot = $("live-slot");
-  const ids = pendingLiveIds();
+  // ★只画「当前这一步」+ 有正文的那几条 —— 已收尾又没正文的（只有思考/工具）收起来，
+  //   否则失焦期间定时器被节流、刷新没跑，就会攒出一串「正在思考…」。
+  const ids = liveMainIds();
 
   // ★ 正在选中「生成中」那段文字时先别重绘：否则每帧重建会把选区冲掉（就没法选中复制片段了）
   if (selectionInLiveSlot()) return;
 
   const shellSig = state.pending.map((p) => `u:${p.id}`).join(",") + "||" + ids.map((id) => {
     const e = state.live[id];
-    return `${id}|${e.tools.length}|${e.agent}|${e.model}`;
+    return `${id}|${e.tools.length}|${e.agent}|${e.model}|${e.done ? 1 : 0}`;
   }).join(";");
 
   if (shellSig !== liveShellSig) {
@@ -1844,7 +2066,53 @@ function scheduleLiveRender() {
 
 /* ---------------- 会话操作 ---------------- */
 
+async function openPlannerNativeSession(id) {
+  const sid = String(id || "").replace(/^planner:/, "");
+  finishEditQuestion();
+  const base = state.sessions.find((s) => String(s.id) === String(id)) || { id, _kind: "planner" };
+  // ★主控会话不在聊天列表里了 → 标题/目录按需向 /planner/session 要一次（否则头只显示"策划会话"）
+  let meta = base._planner || null;
+  if (!meta || !meta.title) {
+    try {
+      const r = await api("/planner/session?id=" + encodeURIComponent(sid));
+      meta = (r && r.session) || meta;
+    } catch { /* 老后端没有也不影响打开 */ }
+  }
+  const title = (base.title || (meta && meta.title) || "策划会话").replace(/^📋\s*/, "");
+  state.current = {
+    ...base, id: String(id), _kind: "planner", _plannerSid: sid, title: title,
+    location: (base.location && base.location.directory)
+      ? base.location : { directory: (meta && meta.cwd) || "" },
+  };
+  staticSig = "planner:" + sid;
+  liveShellSig = null;
+  state.live = {}; state.reveal = {}; state.pending = []; state.attachments = []; state.follow = false;
+  state.messages = [];                 // 策划视图不走消息流（避免「上下文」拿上一条聊天会话的 tokens）
+  const liveBox = $("live-slot"); if (liveBox) liveBox.innerHTML = "";
+  const moreBox = $("msg-more"); if (moreBox) moreBox.hidden = true;
+  resetMsgPaging();
+  renderAttachRow();
+  $("session-title").textContent = "📋 " + (state.current.title || "策划会话");
+  $("session-meta").textContent = "策划会话 · " + sid;
+  // ★主控会话也要能说话：输入框不锁；这一句会发到「绑定的聊天会话」（没有就自动建）
+  $("input").disabled = false; $("btn-send").disabled = false; $("btn-stop").disabled = true;
+  $("input").placeholder = "告诉主控你的需求…（会发到绑定聊天会话；计划面板用上面的按钮）";
+  state.current.context = null;          // 策划会话不显示上一个聊天会话的上下文占用
+  ctxSync();
+  renderSessions();
+  if (typeof window.renderPlannerRichView === "function") {
+    try { await window.renderPlannerRichView(sid); } catch (e) {
+      const host = $("msg-static"); if (host) host.innerHTML = `<div class="error-box">加载策划会话失败：${esc((e&&e.message)||e)}</div>`;
+    }
+  } else {
+    // fallback: open panel
+    try { if (typeof initPlanner === "function") initPlanner(); } catch {}
+    const host = $("msg-static"); if (host) host.innerHTML = `<div class="muted" style="padding:18px">策划会话 <b>${esc(sid)}</b><br><button type="button" class="primary" onclick="(function(){try{document.getElementById('tm-planner').click()}catch(e){}})()">打开策划面板</button></div>`;
+  }
+}
+
 async function openSession(id) {
+  if (String(id || "").startsWith("planner:")) return openPlannerNativeSession(id);
   finishEditQuestion();          // 换会话时收掉「重新编辑」状态，别把上一条会话的草稿带过来
   try {
     state.current = unwrap(await api(`/api/session/${encodeURIComponent(id)}`));
@@ -1859,6 +2127,8 @@ async function openSession(id) {
   state.attachments = [];
   state.follow = true;
   resetMsgPaging();               // 换会话：分页状态一并复位（否则会把上一个会话的游标带过来）
+  // ★文件查看：换会话后第一次扫描只记账不弹（不然一进会话就把上一条生成的文件顶出来）
+  try { if (typeof codePrimeAuto === "function") codePrimeAuto(); } catch { /* ignore */ }
   renderAttachRow();
   $("session-title").textContent = state.current.title || "(无标题)";
   // 会话名下面不再显示 session id / 本地路径（详情请用侧栏会话项的 ▸ 展开）
@@ -1870,6 +2140,8 @@ async function openSession(id) {
   $("input").disabled = false;
   $("btn-send").disabled = false;
   $("btn-stop").disabled = false;
+  // ★从「主控会话」切回普通聊天时，把输入框提示语也恢复（主控那里改过）
+  $("input").placeholder = "写在这里…… Enter 送出，Shift+Enter 换行（可粘贴/拖入图片）";
   renderSessions();
   await refreshMessages();
   repairStaleModel(state.current);   // 会话绑的模型下架了 → 提示 + 自动切默认（否则"发了没反应"）
@@ -2048,6 +2320,38 @@ function maybeLoadHistory() {
   loadHistoryMore();
 }
 
+/** ★文件查看（`ui 0.2.86`）：权威消息里「这一轮写了哪些文件」→ 右侧抽屉自动打开最后一个。
+ *  实时事件那条（`session.tool.success`）快，但 ACP 的事件不带完整 `input/metadata` ——
+ *  这里按**已落库的消息**兜底，两个引擎都成立。key 用消息 id → 同一条消息只开一次。 */
+function autoOpenFromMessages() {
+  if (typeof codeAutoOpen !== "function" || typeof codeFilesOfTool !== "function") return;
+  const prime = !!CODE.priming;                 // 第一次扫描（刚打开会话 / 刚重载）只记账
+  const msgs = state.messages || [];
+  for (let i = msgs.length - 1, n = 0; i >= 0 && n < 12; i--, n++) {
+    const m = msgs[i];
+    if (!m || m.type !== "assistant" || !Array.isArray(m.content)) continue;
+    for (let j = m.content.length - 1; j >= 0; j--) {
+      const p = m.content[j];
+      if (!p || p.type !== "tool") continue;
+      const st = (p.state && typeof p.state === "object") ? p.state : {};
+      if (st.status !== "completed") continue;
+      const files = codeFilesOfTool(p.name, st.input, st.metadata);
+      if (files.length) {
+        CODE.priming = false;
+        codeAutoOpen(files, "msg:" + m.id, prime).catch(() => {});
+        return;
+      }
+    }
+  }
+  CODE.priming = false;
+}
+
+/** 服务端会**拼在用户消息前面**的注入前缀（只用于"对账本地回显"，不影响渲染）。
+ *  ACP 没有「客户端自定义工具 / 系统消息」，工具卡与本地补记只能塞进 prompt →
+ *  opencode-acp 把它连原话一起存进共享库。服务端已在展示时剥掉（`strip_injected_prefix`），
+ *  这里列出来是给前端对账兜底：只要前缀出现在"多出来的那截"里，就认成同一条。 */
+const INJECTED_HEADS = ["【桌面 + 浏览器工具", "【桌面/网页】", "（本地补记："];
+
 async function refreshMessages() {
   if (!state.current) return;
   if (state.refreshing) { state.pendingRefresh = true; return; }
@@ -2087,13 +2391,30 @@ async function refreshMessages() {
         left.set(t, (left.get(t) || 0) + 1);
       }
       state.pending = state.pending.filter((p) => {
-        const n = left.get(p.text.trim()) || 0;
-        if (n > 0) { left.set(p.text.trim(), n - 1); return false; }
+        const want = (p.text || "").trim();
+        // ① 原样命中（绝大多数字符串）
+        const n = left.get(want) || 0;
+        if (n > 0) { left.set(want, n - 1); return false; }
+        if (!want) return true;
+        // ② 服务端在前面加了**注入前缀**（ACP 的工具卡 / 本地补记）→ 末尾命中也算同一条。
+        //    ⚠ 不补这一条：底部的本地回显永远撤不掉 → 你的问题会在**回答下面**再挂一遍，
+        //      看着像"回复错位 / ACP 的回复有问题"（用户 2026-11-05 报的就是这个）。
+        //      服务端已在 display 时剥前缀（`strip_injected_prefix`），这里再兜一层，
+        //      防别的 agent / 老数据也带前缀。
+        //    ⚠ 只认**已知前缀**，不做"任意末尾匹配"—— 否则短消息（比如只发一个「好」）
+        //      会被"很好"这类别的消息误吃掉，回显提前消失。
+        for (const [k, cnt] of left) {
+          if (cnt <= 0 || !k || !k.endsWith(want)) continue;
+          const head = k.slice(0, k.length - want.length);
+          if (INJECTED_HEADS.some((m) => head.indexOf(m) >= 0)) { left.set(k, cnt - 1); return false; }
+        }
         return true;
       });
       liveShellSig = null;
     }
     renderMessages();
+    // ★文件查看（`ui 0.2.86`）：这一轮生成 / 改了哪些文件 → 右侧自动打开（ACP 的兜底路径）
+    try { autoOpenFromMessages(); } catch { /* 自动打开失败不影响刷新 */ }
     // ★工具密集的会话：刷新后自动补页（保持"看得见"的历史，别一上来就掉进「加载更早」）。
     //   只在你正跟着底部时补 —— 在往上读历史时不打扰。
     if (!state.msgOlder && state.follow) {
@@ -2155,11 +2476,40 @@ async function autoNameSession(text) {
   if (s) { s.title = title; renderSessions(); }
 }
 
+/** ★这段提问是不是**明确要求动某个文件**（改 / 填 / 生成 / 导出…）。
+ *
+ *  为什么需要：`ui 0.2.86` 的自动打开是"只要工具写了文件就弹" —— 用户实测很烦：
+ *  改个界面样式、顺手更新文档，右边就自己弹出来。用户的原话是
+ *  「预览打开的条件应该是**我的输入里有明确的修改/填写/生成某个文件**」。
+ *
+ *  判据（两个都要命中，宁可不开）：
+ *    ① 动作词：改 / 写 / 生成 / 创建 / 导出 / 保存 / 填 / 替换 / 转 / 删…
+ *    ② 文件线索：带扩展名的名字（`README.md` / `src/app.js` / `报告.pdf`），
+ *       或「这个文件 / 当前文件 / 该文件 / 上面的文件」。
+ *  ⚠ 只是"改一下界面"（没有文件线索）→ **不算**，不自动开。 */
+const FILE_ACT_RE = /(改|写|生成|创建|新建|更新|重写|替换|导出|保存|输出|填|补|画|转|转换|删|加上|插入)/;
+const FILE_HINT_RE = new RegExp(
+  "(?:[\\w\\u4e00-\\u9fa5.\\-\\\\/]{1,80}\\.(?:md|markdown|txt|json|jsonl|csv|py|js|ts|tsx|jsx|"
+  + "html|css|scss|yml|yaml|toml|ini|xml|sql|sh|ps1|bat|cmd|pdf|png|jpe?g|gif|svg|webp|mp4|mp3|"
+  + "zip|log|docx?|xlsx?|pptx?))"
+  + "|(?:这个文件|当前文件|该文件|上面的文件|这个文档|当前文档)", "i");
+
+function needsFileTouch(text) {
+  const s = String(text || "");
+  return FILE_ACT_RE.test(s) && FILE_HINT_RE.test(s);
+}
+
 async function send() {
   const input = $("input");
   // ★工作台打开时：底部这一行是「任务输入条」（Enter / 送出 / ▶ 都走工作流，不发聊天）
   if (collabIsOpen()) {
     await collabQuickRun();
+    return;
+  }
+  // ★主控（策划）会话不是聊天实体：这一句要发到「绑定的聊天会话」里（没有就自动建一个）
+  if (state.current && state.current._kind === "planner") {
+    if (typeof plannerSendFromComposer === "function") return plannerSendFromComposer();
+    setBanner("策划会话前端未加载：请刷新面板后重试", { ms: 6000 });
     return;
   }
   const typed = input.value.trim();
@@ -2179,6 +2529,8 @@ async function send() {
   input.style.height = "auto";
   state.attachments = [];
   renderAttachRow();
+  // ★自动打开（文件查看）的闸门：**只有这句提问明确要动文件**才允许自动开
+  state.wantFiles = { at: Date.now(), on: needsFileTouch(text) };
 
   // 先本地回显 —— 让「我的问题」（含附件缩略图）立刻出现，服务端确认后对账撤掉
   const localId = "local_" + Date.now().toString(36);
@@ -2323,21 +2675,20 @@ function renderNewSessionProjects() {
   });
 }
 
-/** 「新建项目」的默认位置 = **对应 agent 的目录**：
- *   ACP → 当前 agent 的生效工作目录（后端 `/projectroot`；agent 没设就用共享基线 shared）；
- *   其它引擎（opencode）→ 当前会话的目录（= agent 正在工作的目录）；
- *   都没有再退回「上次用的位置」。 */
-async function defaultProjectRoot() {
+/** 「新建项目」的默认位置（后端 `/projectroot?scope=session`）：
+ *   agent 有**自己的客户端/桌面端目录** → 建在它下面（`<home>/projects`）；
+ *   没有（随包 node / 面板内装的 agent）→ 建在 **cocraft** 里，按 agent 分类；
+ *   工作流（scope=workflow）→ cocraft 的 `runtime/workflow-projects`（所有成员共用）。
+ *   拿不到就退回「当前会话目录」。回 `{root,label,source}`。 */
+async function defaultProjectRoot(scope) {
   const cur = (state.current && state.current.location && state.current.location.directory)
     || (state.sessions[0] && state.sessions[0].location && state.sessions[0].location.directory)
     || "";
-  if (ENGINE.active === "acp") {
-    try {
-      const r = await api("/projectroot");
-      if (r && r.root) return r.root;
-    } catch { /* 拿不到就退回当前目录 */ }
-  }
-  return cur;
+  try {
+    const r = await api("/projectroot?scope=" + encodeURIComponent(scope || "session"));
+    if (r && r.root) return r;
+  } catch { /* 老后端没有 scope 参数 → 退回当前会话目录 */ }
+  return { root: cur, label: "", source: "" };
 }
 
 /** 点「＋ 新会话」→ 弹窗：选当前 agent 用过的项目，或新建一个长期项目 */
@@ -2355,14 +2706,16 @@ async function openNewSession() {
   box.hidden = false;
   OVERLAY.push("newsess", closeNewSession);
   setTimeout(() => { try { $("ns-title").focus(); } catch { /* ignore */ } }, 0);
-  // 默认「项目位置」要等后端回答（ACP 要问 /projectroot），先填上次的、拿到后再覆盖
+  // 默认「项目位置」要等后端回答（agent 自己的目录 / cocraft 按 agent 分类），先填上次的、拿到后再覆盖
   $("ns-newbase").value = lastNewSessionBase() || "";
-  let root = "";
-  try { root = await defaultProjectRoot(); } catch { root = ""; }
-  const base = root || lastNewSessionBase() || "";
+  let info = { root: "", label: "", source: "" };
+  try { info = await defaultProjectRoot("session"); } catch { /* ignore */ }
+  const base = (info && info.root) || lastNewSessionBase() || "";
   $("ns-newbase").value = base;
-  if (root) $("ns-note").textContent = "新项目默认建在 agent 目录：" + root + "（可改）";
-  else if (base) $("ns-note").textContent = "已沿用上次的项目位置：" + base + "（可改）";
+  if (info && info.root) {
+    $("ns-note").textContent = "新项目默认建在" + (info.label ? "（" + info.label + "）" : "")
+      + "：" + base + "（可改）";
+  } else if (base) $("ns-note").textContent = "已沿用上次的项目位置：" + base + "（可改）";
   else if (dir) $("ns-note").textContent = "已沿用上次的目录（可改；清空 = 引擎默认）";
   else $("ns-note").textContent = "";
 }
@@ -2534,8 +2887,10 @@ function handleEvent(p) {
   //   ⚠ 这是**上下文**，不是账单 token（账单累计在 session.tokens 里）。
   if (t === "session.usage.update") {
     if (mine && state.current) {
+      // ★老后端的事件不带 model → 按「当前会话当前的模型」记（这条事件就是这一轮上报的）
+      const cur = String((state.current.model && state.current.model.id) || "");
       state.current.context = { used: Number(d.used) || 0, size: Number(d.size) || 0,
-                                estimated: !!d.estimated };
+                                estimated: !!d.estimated, model: d.model || cur };
       ctxSync();
     }
     return;
@@ -2557,10 +2912,16 @@ function handleEvent(p) {
   if (t === "session.error") {
     const msg = (d && d.error) || "未知错误";
     if (mine) {
-      setBanner((d && d.modelUnavailable ? "模型问题：" : "本轮出错：") + msg
-        + "（详见 runtime/logs/acp.log）");
+      // ★报错分类（`ui 0.2.87`）：后端给 kind/label/hint；老后端 / opencode 引擎则前端自己认。
+      //   用户实测：余额不足以前只显示一串英文，根本看不出来要充值。
+      const k = (d && d.label)
+        ? { label: d.label, hint: d.hint || "", account: !!d.account }
+        : errKindOf(msg);
+      const head = k.account ? ("⚠ " + k.label + "（账户/凭据问题）") : ("⚠ " + k.label);
+      setBanner(head + "：" + oneLine(msg, 180) + (k.hint ? (" · " + k.hint) : ""),
+                { ms: 30000 });
       scheduleRefresh();
-      if (d && d.modelUnavailable) refreshCurrentModel();   // 后端可能已自动换模型 → 同步按钮
+      if (d && (d.modelUnavailable || k.kind === "model")) refreshCurrentModel();   // 后端可能已自动换模型
     }
     return;
   }
@@ -2599,6 +2960,13 @@ function handleEvent(p) {
     } else if (t === "session.tool.success" || t === "session.tool.error") {
       const last = e.tools[e.tools.length - 1];
       if (last) last.status = t === "session.tool.success" ? "completed" : "error";
+      // ★文件查看（`ui 0.2.86`）：这一步是写文件 → 在右侧抽屉里自动打开它
+      if (t === "session.tool.success" && last && typeof codeAutoOpen === "function") {
+        try {
+          codeAutoOpen(codeFilesOfTool(last.name, last.input, null),
+                       "tool:" + (d.id || d.toolCallId || e.tools.length));
+        } catch { /* 自动打开失败不影响主流程 */ }
+      }
     }
     scheduleLiveRender();
     return;
@@ -2615,9 +2983,21 @@ function handleEvent(p) {
   // ④ 终态：取权威数据对账
   if (TERMINAL.test(t)) {
     if (mine) {
-      // 这一轮的「生成中」标记为已结束 —— 刷新后若权威数据里没有同 id（opencode-acp 读库后 id 变了），就丢掉，别重复
+      // ★这一轮的「生成中」标记为已结束 —— 刷新后若权威数据里没有同 id（opencode-acp 读库后 id 变了），就丢掉，别重复
       if (d && d.assistantMessageID && state.live[d.assistantMessageID]) {
-        state.live[d.assistantMessageID].done = true;
+        const le = state.live[d.assistantMessageID];
+        le.done = true;
+        le.endedAt = le.endedAt || Date.now();     // 给「已收尾」一个时间，别再标成"生成中"
+        liveShellSig = null;                       // 壳签名要跟着变（占位 → 收起 / 思考小条换时长）
+      }
+      // ★本轮失败：**当场**给一句人话（余额不足 / 限流 / 连不上…），别等刷新才看见
+      if (t === "session.step.failed" || t === "session.execution.failed") {
+        const etext = (d && (d.error || d.message)) || "";
+        if (etext) {
+          const k = errKindOf(String(etext));
+          setBanner(`⚠ ${k.label}：${oneLine(String(etext), 160)}${k.hint ? " · " + k.hint : ""}`,
+                    { ms: 30000 });
+        }
       }
       scheduleRefresh();
     }
@@ -2653,6 +3033,15 @@ function connectEvents() {
     try { p = JSON.parse(ev.data); } catch { return; }
     try { handleEvent(p); } catch (err) { console.warn("事件处理异常", err, p); }
   };
+}
+
+/** ★回到前台主动对账一次（`ui 0.2.83`）：失焦 / 窗口被遮挡时浏览器会**节流定时器**
+ *  （Chromium 后台可到 1 次/分钟），而 agent 还在跑 → 消息区停在很久以前。
+ *  回到前台立刻补一次（`scheduleRefresh` 自带 300ms 防抖，不会连发）。 */
+function initFocusRefresh() {
+  const again = () => { if (!document.hidden && state.current) scheduleRefresh(); };
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) again(); });
+  window.addEventListener("focus", again);
 }
 
 function setConn(cls, text) {

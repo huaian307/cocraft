@@ -4,19 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cocraft</title>
-<link rel="icon" href="/assets/icon.svg?v=0.2.63" type="image/svg+xml">
-<link rel="icon" href="/assets/cocraft.ico?v=0.2.63" type="image/x-icon">
-<link rel="stylesheet" href="/style/01-base.css?v=0.2.63">
-<link rel="stylesheet" href="/style/02-chat.css?v=0.2.63">
-<link rel="stylesheet" href="/style/03-music.css?v=0.2.63">
-<link rel="stylesheet" href="/style/04-collab.css?v=0.2.63">
-<link rel="stylesheet" href="/style/05-settings.css?v=0.2.63">
-<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.63">
-<link rel="stylesheet" href="/style/07-code.css?v=0.2.63">
-<link rel="stylesheet" href="/style/08-visual.css?v=0.2.63">
+<link rel="icon" href="/assets/icon.svg?v=0.2.123" type="image/svg+xml">
+<link rel="icon" href="/assets/cocraft.ico?v=0.2.123" type="image/x-icon">
+<link rel="stylesheet" href="/style/01-base.css?v=0.2.123">
+<link rel="stylesheet" href="/style/02-chat.css?v=0.2.123">
+<link rel="stylesheet" href="/style/03-music.css?v=0.2.123">
+<link rel="stylesheet" href="/style/04-collab.css?v=0.2.123">
+<link rel="stylesheet" href="/style/05-settings.css?v=0.2.123">
+<link rel="stylesheet" href="/style/06-cocraft.css?v=0.2.123">
+<link rel="stylesheet" href="/style/07-code.css?v=0.2.123">
+<link rel="stylesheet" href="/style/08-visual.css?v=0.2.123">
+<link rel="stylesheet" href="/style/09-cu.css?v=0.2.123">
+  <link rel="stylesheet" href="/style/10-planner.css?v=0.2.123">
 </head>
 <body>
-<!-- 世界树标记（hiru「和纸白昼」用）：左半枯枝、右半生叶 —— 纯内联 SVG，单色描边 -->
+<!-- 圣徽：尖拱窗 + 烛焰（唯一内置主题「圣烛教堂」用）。世界树标记已随「和纸白昼」移除 -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
   <symbol id="mk-tree" viewBox="0 0 24 24">
     <circle cx="12" cy="12" r="10.4" fill="none" stroke="currentColor" stroke-width=".9" opacity=".5"/>
@@ -74,15 +76,6 @@
       <input id="search" type="search" placeholder="搜索会话…" autocomplete="off">
     </div>
 
-    <!-- ★老用户提示：新增了「圣烛教堂」主题（默认）→ 点一下就能换；不换就关掉（只提示一次） -->
-    <div id="theme-hint" class="theme-hint" hidden>
-      <div class="th-line"><b>✦ 新主题「圣烛教堂」</b><span>暖黑石墙 · 米白 · 烛焰金</span></div>
-      <div class="th-acts">
-        <button type="button" data-theme-hint-go="1">换成圣烛教堂</button>
-        <button type="button" class="th-x" data-theme-hint-x="1" title="不再提示">×</button>
-      </div>
-    </div>
-
     <nav id="session-list" aria-label="会话列表"></nav>
 
     <div class="side-foot">
@@ -101,11 +94,7 @@
         <div id="session-meta" class="muted"></div>
       </div>
       <div class="actions">
-        <button id="btn-hub" title="工具（在线协作 / 音乐 …）" aria-label="工具">
-          <svg class="ico-hub" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>
-          <span class="hs-label">工具</span>
-        </button>
-        <button id="btn-tools" title="工具：面板终端 / 编码模式（VS Code 风格）" aria-label="工具">
+        <button id="btn-tools" title="工具：在线协作 / 音乐 / 面板终端 / 文件查看" aria-label="工具">
           <svg class="ico-wrench" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/></svg>
         </button>
         <button id="btn-collab" title="本地协作工作台：一条任务派给本机多个 agent（不登录、不上云）" aria-label="本地协作">协作</button>
@@ -118,21 +107,16 @@
       </div>
       <div id="tools-menu" class="open-menu" hidden>
         <div id="tm-dir" class="om-dir">—</div>
+        <button type="button" data-tool="chat" id="tm-chat" title="在线群聊（需要 cocraft 账号；本机多 agent 请用顶栏「协作」）">在线协作</button>
+        <button type="button" data-tool="music" id="tm-music" title="音乐（播放条 / 音乐主页）">音乐</button>
+        <button type="button" data-tool="cu" id="tm-cu" title="通用工具：桌面窗口 / 网页（cu 命令）…">通用工具（cu）…</button>
+        <div class="om-sep"></div>
         <button type="button" data-tool="term" id="tm-term">面板终端</button>
-        <button type="button" data-tool="code" id="tm-code">编码模式</button>
-        <button type="button" data-tool="quar" id="tm-quar">隔离区（可恢复）</button>
-        <button type="button" data-tool="undo" id="tm-undo">撤销这一轮</button>
-      </div>
-      <div id="hub-menu" class="open-menu hub-grid" hidden>
-        <div class="om-dir">工具（点图标启动）</div>
-        <div class="hub-tools">
-          <button type="button" class="hub-tool" data-tool="chat" id="hm-chat" title="在线群聊（需要 cocraft 账号；本机多 agent 请用顶栏「协作」）">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z"/></svg><span>在线协作</span>
-          </button>
-          <button type="button" class="hub-tool" data-tool="music" id="hm-music" title="音乐">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg><span>音乐</span>
-          </button>
-        </div>
+        <button type="button" data-tool="code" id="tm-code">文件查看</button>
+        <button type="button" data-tool="quar" id="tm-quar" hidden title="忏悔室的全部原始记录与保留期策略">忏悔室 · 全部记录…</button>
+        <button type="button" data-tool="planner" id="tm-planner" title="策划会话：用一个会话管理工作流（计划→派活→汇报）">策划会话（工作流）</button>
+        <button type="button" data-tool="restore" id="tm-restore" title="忏悔室：删除 / 修改前的旧版都在这里，可按「群聊 / 工作流 / 单聊 → 项目 → 文件 → 版本」回滚">忏悔室（按文件版本）…</button>
+        <button type="button" data-tool="audit" id="tm-audit" title="审计与活动：哈希链 / 导出与校验 / AI 成员改了什么 / 审批时间线">审计与活动…</button>
       </div>
     </header>
 
@@ -220,13 +204,21 @@
             </div>
             <div id="collab-wf-list" class="collab-wf-list"></div>
 
+            <!-- ★工作流主控（策划）会话：记录放在工作流面板里，别只在左侧单聊列表里 -->
+            <div id="collab-planner-card" class="collab-planner-card" hidden>
+              <div class="collab-planner-hd"><b>主控会话</b><span id="collab-planner-status" class="muted"></span></div>
+              <button type="button" id="collab-planner-open" class="collab-planner-row" title="打开/创建这条工作流的策划（主控）会话">—</button>
+            </div>
+
             <div class="collab-side-h">
+              <button type="button" id="collab-runs-toggle" class="collab-side-btn collab-runs-toggle"
+                      aria-expanded="false" title="展开/收起运行历史">▸</button>
               <b>运行历史</b><span id="collab-count" class="muted"></span>
               <button type="button" id="collab-runs-all" class="collab-side-btn" title="显示全部运行（不按工作流筛）">全部</button>
             </div>
             <!-- ★按项目筛选：同一项目可能有多组 agent 工作流；只有一个项目时不显示 -->
-            <div id="collab-proj-filter" class="collab-proj-filter"></div>
-            <div id="collab-runs" class="collab-runs"></div>
+            <div id="collab-proj-filter" class="collab-proj-filter" hidden></div>
+            <div id="collab-runs" class="collab-runs" hidden></div>
           </aside>
           <div class="collab-main">
             <div id="collab-empty" class="collab-empty">
@@ -246,22 +238,34 @@
             <!-- ★工作流视图：头 + 快速任务 + 画布 + 检查器 -->
             <div id="collab-wf" class="collab-wf" hidden>
               <div class="collab-wf-head">
-                <b id="collab-wf-name" title="点一下改名">—</b>
-                <span id="collab-wf-meta" class="muted"></span>
-                <span class="collab-sp"></span>
-                <button type="button" id="collab-wf-cwd" title="换这个工作流的项目目录">目录</button>
-                <button type="button" id="collab-wf-add" title="加一个成员">＋ 成员</button>
-                <button type="button" id="collab-wf-add-stage" title="加一个阶段（阶段之间串行、阶段内并行）">＋ 阶段</button>
-                <button type="button" id="collab-wf-split" title="按角色拆成阶段：实现/测试 → 审查（审查者不再和实现者并行）">分阶段</button>
-                <button type="button" id="collab-wf-layout" title="重新自动排布节点">排布</button>
-                <button type="button" id="collab-wf-dup" title="复制这个工作流">复制</button>
-                <button type="button" id="collab-wf-archive" title="归档：收进左栏「已归档」，不删除">归档</button>
-                <button type="button" id="collab-wf-del" class="danger" title="删除工作流（历史运行保留）">删除</button>
+                <div class="collab-wf-title">
+                  <b id="collab-wf-name" title="点一下改名">—</b>
+                  <span id="collab-wf-meta" class="muted"></span>
+                </div>
+                <div class="collab-wf-tools">
+                  <button type="button" id="collab-wf-continue" hidden title="复用上一轮每个成员的会话继续探索（同一张项目画布）">↻ 继续上次</button>
+                  <button type="button" id="collab-wf-sessions" title="工作流成员会话（只在这里管理，不混进单聊）">成员会话</button>
+                  <button type="button" id="collab-wf-planner" title="打开/创建这条工作流的策划（主控）会话：计划 → 派活 → 汇报">主控会话</button>
+                  <button type="button" id="collab-wf-cwd" title="换这个工作流的项目目录">目录</button>
+                  <button type="button" id="collab-wf-add" title="加一个成员">＋ 成员</button>
+                  <button type="button" id="collab-wf-add-stage" title="加一个阶段（阶段之间串行、阶段内并行）">＋ 阶段</button>
+                  <button type="button" id="collab-wf-layout" title="重新自动排布节点">排布</button>
+                  <details class="collab-wf-more">
+                    <summary>更多 ▾</summary>
+                    <div class="collab-wf-more-menu">
+                      <button type="button" id="collab-wf-split" title="按角色拆成阶段：实现/测试 → 审查（审查者不再和实现者并行）">分阶段</button>
+                      <button type="button" id="collab-wf-dup" title="复制这个工作流">复制</button>
+                      <button type="button" id="collab-wf-archive" title="归档：收进左栏「已归档」，不删除">归档</button>
+                      <button type="button" id="collab-wf-del" class="danger" title="删除工作流（历史运行保留）">删除</button>
+                    </div>
+                  </details>
+                </div>
               </div>
               <div id="collab-quick" class="collab-quick">
                 <input id="collab-quick-task" type="text" autocomplete="off"
                        placeholder="这次要做什么？（Enter 直接开跑；留空用默认任务）">
-                <button type="button" id="collab-quick-run" class="primary">▶ 运行</button>
+                <button type="button" id="collab-quick-run" class="primary" title="用干净上下文新开一轮探索">▶ 新探索</button>
+                <button type="button" id="collab-quick-last" hidden title="复制上一次运行的任务描述">复制上次任务</button>
                 <span id="collab-quick-note" class="muted"></span>
               </div>
               <div id="collab-canvas" class="collab-canvas">
@@ -289,6 +293,8 @@
                   <span id="collab-pick"></span>
                 </div>
                 <div id="collab-task-meta" class="collab-task-meta"></div>
+    <div id="collab-task-line" class="collab-task-line" hidden></div>
+    <div id="collab-fail" class="collab-fail" hidden></div>
                 <div id="collab-task-actions" class="collab-task-actions"></div>
               </div>
               <div id="collab-pend-bar" class="collab-pend-bar" hidden></div>
@@ -297,9 +303,31 @@
               <div id="collab-diff" class="collab-diff" hidden></div>
             </div>
           </div>
-        </div>
-
-        <!-- ★待批权限：右侧抽屉（位置宽，命令原文不用挤） -->
+          <!-- ★主控会话：右侧面板，和工作流画布**同时可见**（不是弹层、不跳会话） -->
+          <aside id="collab-planner-panel" class="collab-planner-panel" hidden aria-label="主控会话">
+            <div class="cpp-head">
+              <b id="cpp-title">主控会话</b>
+              <span id="cpp-status" class="muted"></span>
+              <span class="collab-sp"></span>
+              <button type="button" id="cpp-help" class="cpp-icon" title="说明">?</button>
+              <button type="button" id="cpp-close" class="cpp-icon" title="收起主控面板">×</button>
+            </div>
+            <div id="cpp-help-body" class="cpp-help" hidden>
+              <p><b>主控会话</b>：一个项目一个主控。它写计划（阶段 / 成员 / 权限）、把工作流跑起来、汇总报告。</p>
+              <p>你只需在下面的对话里说需求；计划由主控 agent 维护，<b>不需要手改 JSON</b>。</p>
+              <p>破坏性操作仍要你确认；主控 CLI 不能批准权限。</p>
+            </div>
+            <div id="cpp-summary" class="cpp-summary"></div>
+            <div id="cpp-actions" class="cpp-actions"></div>
+            <div id="cpp-report" class="cpp-report" hidden></div>
+            <div id="cpp-chat" class="cpp-chat">
+              <div id="cpp-chat-list" class="cpp-chat-list"></div>
+              <div class="cpp-chat-send">
+                <textarea id="cpp-chat-input" placeholder="告诉主控你的需求…（Enter 发送，Shift+Enter 换行）"></textarea>
+                <button type="button" id="cpp-chat-send" class="primary">发送</button>
+              </div>
+            </div>
+          </aside>
         <aside id="collab-pending" class="collab-perm-drawer" hidden aria-label="待批权限"></aside>
       </section>
 
@@ -483,6 +511,7 @@
         </div>
         <div class="cc-menu-row">
           <span>AI 成员<i>（绑定 ACP agent；被 @ 时自动回）</i></span>
+          <button type="button" id="cc-sessions" class="cc-ai-b" title="群聊 AI 成员会话（只在这里管理，不混进单聊）">AI 会话</button>
           <div id="cc-ai-list" class="cc-ai-list"></div>
           <!-- ★新建成员：**两行**放（名字＋建 / 大脑＋角色＋建组），别再把五个控件挤成一行 -->
           <div class="cc-ai-add">
@@ -545,20 +574,22 @@
   </div>
 </aside>
 
-<!-- 编码模式（仿 VS Code 的简便版）：**从右侧滑出的抽屉**（跟群聊一样分屏：给 #app 让出右侧），
-     左边缘可拖动改宽度（--code-w）；左边文件树，右边看/改代码并保存。
+<!-- 文件查看（`ui 0.2.94`，原名「编码模式」）：**从右侧滑出的抽屉**（跟群聊一样分屏：给 #app 让出右侧），
+     左边缘可拖动改宽度（--code-w）；左边文件树，右边看/改文本，或者**直接预览**图片 / PDF / 音视频
+     （agent 生成文件后会自动在这里打开 —— 见「自动打开」开关）。
      根目录 = 当前会话的工作目录；后端 /fs/* 会做越界校验。 -->
-<aside id="code" class="code" aria-label="编码模式" aria-hidden="true">
+<aside id="code" class="code" aria-label="文件查看" aria-hidden="true">
   <div id="code-resize" class="code-resize" title="拖动调整宽度"></div>
   <div class="code-head">
     <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
-    <span class="wp-kind">编码</span><b>编码模式</b><i class="mk-cap">project</i>
+    <span class="wp-kind">查看</span><b>文件查看</b><i class="mk-cap">files</i>
     <span id="code-root" class="code-root" title="当前会话的工作目录"></span>
     <span id="code-status" class="code-status"></span>
+    <button type="button" id="code-auto" class="code-auto" title="agent 生成 / 修改文件后，自动在这里打开（当前文件有未保存改动时不会切）">自动打开：开</button>
     <button type="button" id="code-exec" title="运行当前文件（Ctrl+Enter）：按扩展名自动挑解释器（Python / Node / PowerShell…），先自动保存再送进下方终端">▶ 运行</button>
     <button type="button" id="code-menu" title="更多：打开文件夹 / 新建终端 / 在 VS Code 打开">菜单 ▾</button>
     <button type="button" id="code-refresh" title="刷新文件树">↻</button>
-    <button type="button" id="code-close" class="code-x" title="关闭编码模式">×</button>
+    <button type="button" id="code-close" class="code-x" title="关闭文件查看">×</button>
     <div id="code-menu-list" class="open-menu code-menu" hidden>
       <button type="button" id="cm-folder">打开文件夹</button>
       <button type="button" id="cm-term">新建终端</button>
@@ -569,6 +600,8 @@
     <div id="code-tree" class="code-tree" aria-label="文件树"></div>
     <div class="code-main">
       <div id="code-path" class="code-path">未打开文件</div>
+      <!-- ★预览层：图片 / PDF / 音视频（文本仍走下面的编辑器），二选一显示 -->
+      <div id="code-preview" class="code-preview" hidden></div>
       <div class="code-edit-wrap">
         <pre id="code-highlight" class="code-highlight" aria-hidden="true"></pre>
         <textarea id="code-editor" class="code-editor" spellcheck="false" wrap="off" disabled
@@ -642,8 +675,15 @@
         <button id="cfg-wallpaper">壁纸设置…</button>
       </div>
       <div class="cfg-row">
-        <label>每轮工作区快照<i>每发一条消息前给会话工作目录留一次底，之后可「撤销这一轮」。默认关 —— 只保留破坏性操作的隔离区（那一条不受此开关影响）</i></label>
+        <label>每轮工作区快照<i>每发一条消息前给会话工作目录留一次底，供忏悔室显示文件版本。默认关 —— 只保留删除/修改审批前的自动留存（那一条不受此开关影响）</i></label>
         <button id="cfg-turnsnap" class="cfg-toggle">关</button>
+      </div>
+      <div class="cfg-row wide">
+        <label>低风险删除<i>★ 级目标（构建产物 / 缓存 / 日志 / 临时文件）在**可完整隔离**时自动放行，不再逐条弹窗；源码 / 配置 / git 跟踪文件、以及关机·杀进程·格式化一律照旧问你。到期前 24 小时提醒，到期只清安全项</i></label>
+        <div class="cfg-ctl">
+          <button id="cfg-auto-delete" class="cfg-toggle">开</button>
+          <button id="cfg-quar-open" type="button">忏悔室与策略…</button>
+        </div>
       </div>
       <div class="cfg-row">
         <label>任务栏自动隐藏<i>面板打开且未最小化时隐藏；最小化或关掉开关就恢复显示</i></label>
@@ -813,10 +853,9 @@
       </div>
       <div class="wpc-sec">主题</div>
 <div class="cfg-row wide">
-        <label>内置主题<i>「圣烛教堂」是默认（暗色：暖黑石墙 + 米白 + 绣线金 + 烛焰）；「和纸白昼」是原来的浅色</i></label>
+        <label>内置主题<i>「圣烛教堂」：暖黑石墙 + 米白 + 绣线金 + 烛焰（唯一定盘；浅色版已移除）</i></label>
         <div class="cfg-ctl" id="cfg-theme-builtin">
           <button type="button" data-theme-pick="chapel">圣烛教堂</button>
-          <button type="button" data-theme-pick="hiru">和纸白昼</button>
         </div>
       </div>
 <div class="cfg-row">
@@ -981,15 +1020,35 @@
       <button id="imp-close" class="wp-x" title="关闭">×</button>
     </div>
     <div class="wp-cur muted" id="imp-cur">读取中…</div>
-    <!-- ★项目会话 / 内部会话（群聊 AI 成员 + 本地协作）分开放，默认只看项目 -->
-    <div id="imp-tabs" class="imp-tabs">
-      <button type="button" class="imp-tab on" data-imp-tab="project">项目会话 <span id="imp-n-project">0</span></button>
-      <button type="button" class="imp-tab" data-imp-tab="internal">内部会话 <span id="imp-n-internal">0</span></button>
-    </div>
     <div class="wp-list" id="imp-list"></div>
     <div class="wp-foot">
-      <span class="muted" id="imp-note">默认只显示**项目会话**；群聊 AI 成员 / 本地协作的内部会话收在「内部会话」标签里（它们由面板自己创建，通常不需要接续）。「接续」= 在面板里建一条**指向**它的记录，不是复制历史：OpenCode 的会话（与桌面端共用一个库）会**把历史读进来**；其它 agent 没有读历史的接口，历史留在对面。</span>
+      <span class="muted" id="imp-note">这里只列**单聊/项目会话**。群聊 AI 成员在群聊抽屉「AI 会话」里管理，工作流成员在工作流「成员会话」里管理；两边都不混进这个列表。</span>
       <button id="imp-reload">重新读取</button>
+    </div>
+  </div>
+</div>
+
+<div id="cu" class="wp" hidden>
+  <div class="wp-box cu-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">通用工具</span><b>桌面 / 网页</b><i class="mk-cap">computer use</i>
+      <button id="cu-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div id="cu-note" class="wp-cur muted">agent 本来就能用这套工具（命令在 PATH 里 + 每轮 prompt 会告诉它）；这里只是把「有哪些、怎么用」列出来。点示例可直接复制。<br>单聊里<b>动作类命令</b>（click / type / keys / 宏回放）要加 <code>--allow-actions</code>，面板会弹一次确认；<b>只读命令从不弹窗</b>。</div>
+    <div class="cu-acts">
+      <button id="cu-actions" class="cu-switch" type="button" aria-pressed="false"
+              title="开了它，单聊里的动作类工具（click / type / keys / 宏回放）才能动；工作流按成员自己的权限走，不受这里影响">
+        <span class="cu-sw">允许桌面操作</span><b class="cu-st">需信任</b>
+      </button>
+      <span class="cu-acthint muted">单聊：开了才能动鼠标键盘（每条动作命令仍会弹一次确认）；<b>工作流不受影响</b>（按成员的权限等级）。</span>
+    </div>
+    <div id="cu-chips" class="cu-chips"></div>
+    <div id="cu-list" class="wp-list cu-list"></div>
+    <div class="wp-foot">
+      <span class="muted" id="cu-foot">—</span>
+      <button id="cu-copy-all">复制全部示例</button>
+      <button id="cu-reload">刷新</button>
     </div>
   </div>
 </div>
@@ -998,14 +1057,29 @@
   <div class="wp-box">
     <div class="wp-head">
       <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
-      <span class="wp-kind">可逆执行</span><b>隔离区</b><i class="mk-cap">quarantine</i>
+      <span class="wp-kind">可逆执行</span><b>忏悔室 · 全部记录与策略</b><i class="mk-cap">confessional records</i>
       <button id="quar-close" class="wp-x" title="关闭">×</button>
     </div>
-    <div class="wp-cur muted" id="quar-note">破坏性操作<b>放行前</b>会自动把要动的文件<b>复制</b>一份到这里 —— <b>不信 OS 回收站</b>（2026-10-13 那次事故，回收站里没有任何内容实体，21 项真没了）。点「恢复」把文件放回<b>原路径</b>。</div>
+    <div class="wp-cur muted" id="quar-note">删除或修改文件<b>放行前</b>，系统会自动把<b>删除的文件 / 被修改的旧版</b>复制到这里 —— <b>不信 OS 回收站</b>（2026-10-13 那次事故，回收站里没有任何内容实体，21 项真没了）。主页面「忏悔室」按文件时间线回滚；这里保留全部原始记录与保留期策略。</div>
+    <div class="wp-cur q-policy" id="quar-policy">
+      <div class="q-policy-line">
+        <button type="button" id="quar-auto" class="toggle">低风险删除：开</button>
+        <span class="muted" id="quar-auto-note">★ 级（构建产物 / 缓存 / 日志 / 临时文件）先隔离再自动放行；源码、配置、git 跟踪文件照旧问你。</span>
+      </div>
+      <div class="q-policy-line">
+        <label>保留 <input type="number" id="quar-days" min="1" max="90" value="7" class="q-days"> 天</label>
+        <span class="muted" id="quar-plan-note">到期前 24 小时提醒；到期只清安全项，风险项永久保留。</span>
+        <button type="button" id="quar-cleanup">立即清理到期项</button>
+      </div>
+    </div>
+    <div class="wp-cur" id="quar-snap-row">
+      <button type="button" id="quar-snap-toggle" class="toggle">轮快照带内容（可一键退回）</button>
+      <span class="muted" id="quar-snap-note">群聊 / 工作流的轮快照默认只记<b>文件名</b>（不占磁盘、只能看）；打开后连内容一起进仓 —— 才能「退回这一轮」。代价是磁盘占用。</span>
+    </div>
     <div class="wp-list" id="quar-list"></div>
     <div class="wp-foot">
       <span class="muted" id="quar-foot"></span>
-      <button id="quar-open">打开隔离区目录</button>
+      <button id="quar-open">打开忏悔室目录</button>
       <button id="quar-reload">刷新</button>
     </div>
   </div>
@@ -1047,20 +1121,44 @@
       <div class="trust-sec"><b>待你批准</b><span class="muted" id="trust-pend-note"></span></div>
       <div id="trust-pend" class="trust-list"></div>
 
+      <div class="trust-sec"><b>最近「始终允许」</b><span class="muted">只对 ACP 引擎 · 逐条可撤销</span></div>
+      <div id="trust-always" class="trust-list"></div>
+    </div>
+    <div class="wp-foot">
+      <span class="muted" id="trust-foot">收紧随时可以；放宽请想清楚（破坏性操作永远会问）。</span>
+      <button id="trust-tighten" title="立刻切到「全部询问」——一键收紧">立即收紧</button>
+      <span class="muted" id="trust-audit-brief" title="审计链状态（点右边按钮看明细）">—</span>
+      <button id="trust-open-audit" class="audit-jump"
+        title="单独的审计页：链状态与校验 / 五种导出 / AI 成员改了什么 / 审批时间线 / 仲裁结论 / 可撤销入口">审计与活动 ▸</button>
+      <button id="trust-reload">刷新</button>
+    </div>
+  </div>
+</div>
+
+<!-- ★审计页（`ui 0.2.94`）：从信任面板拆出来的「看得见 / 导得出 / 退得回」 ——
+     信任面板只管**权限**（等级 / 待批 / 始终允许），审计这摊子单独一页，别再把两层意思塞一块。 -->
+<div id="audit" class="wp" hidden>
+  <div class="wp-box audit-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">审计</span><b>谁做了什么 · 能不能退</b><i class="mk-cap">audit</i>
+      <button id="audit-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="audit-body">
       <div class="trust-sec"><b>审计链</b><span class="muted" id="trust-audit-note">谁批准了什么 · 哈希链可校验</span></div>
       <div id="trust-audit" class="trust-list"></div>
 
       <div class="trust-sec"><b>AI 成员改了什么</b><span class="muted" id="trust-files-note">文件级 · 落盘可追溯</span></div>
       <div id="trust-files" class="trust-list"></div>
 
-      <div class="trust-sec"><b>最近「始终允许」</b><span class="muted">只对 ACP 引擎 · 逐条可撤销</span></div>
-      <div id="trust-always" class="trust-list"></div>
-
       <div class="trust-sec"><b>群聊审批时间线</b><span class="muted" id="trust-permlog-note">谁批准/拒绝了哪条 · 落盘不丢</span></div>
       <div id="trust-permlog" class="trust-list"></div>
 
-      <div class="trust-sec"><b>可撤销</b><span class="muted" id="trust-undo-note">隔离区 / 本轮快照 · 点开沿用现有入口</span></div>
+      <div class="trust-sec"><b>忏悔室</b><span class="muted" id="trust-undo-note">删除 / 修改前的旧版 · 点「打开」查看原始记录与策略</span></div>
       <div id="trust-undo" class="trust-list"></div>
+
+      <div class="trust-sec"><b>轮快照（可退回）</b><span class="muted" id="aud-snaps-note">群聊 / 工作流 / 单聊每一轮 · 只有「带内容」的才能退回</span></div>
+      <div id="aud-snaps" class="trust-list"></div>
 
       <div class="trust-sec"><b>agent 活动</b><span class="muted" id="trust-act-note">群聊 AI 成员最近在做什么</span></div>
       <div id="trust-act" class="trust-list"></div>
@@ -1072,26 +1170,8 @@
       <div id="trust-orch" class="trust-list"></div>
     </div>
     <div class="wp-foot">
-      <span class="muted" id="trust-foot">收紧随时可以；放宽请想清楚（破坏性操作永远会问）。</span>
-      <button id="trust-tighten" title="立刻切到「全部询问」——一键收紧">立即收紧</button>
-      <button id="trust-reload">刷新</button>
-    </div>
-  </div>
-</div>
-
-<div id="undo" class="wp" hidden>
-  <div class="wp-box">
-    <div class="wp-head">
-      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
-      <span class="wp-kind">可逆执行</span><b>撤销这一轮</b><i class="mk-cap">undo</i>
-      <button id="undo-close" class="wp-x" title="关闭">×</button>
-    </div>
-    <div class="wp-cur muted" id="undo-note">你每发一条消息，面板会在 agent <b>动手前</b>给会话工作目录落一次快照（增量、约 10ms）。这里列出<b>这一轮改了哪些文件</b>，可以整体退回。</div>
-    <div class="wp-list" id="undo-list"></div>
-    <div class="wp-foot">
-      <span class="muted" id="undo-foot"></span>
-      <button id="undo-reload">重新对比</button>
-      <button id="undo-run">撤销这一轮</button>
+      <span class="muted" id="audit-foot">链完整才能当证据；给别人看请用「导出简报」（人话）/「导出 JSON」（可复核）。</span>
+      <button id="audit-reload">刷新</button>
     </div>
   </div>
 </div>
@@ -1264,6 +1344,25 @@
       <div class="anew-i-hd"><b>没装？直接在这里装</b><span class="muted" id="anew-i-note"></span><button type="button" class="anew-i-chk" id="anew-i-check" title="去 registry 问一下有没有新版（结果缓存 10 分钟）">检查更新</button></div>
       <div id="anew-i-list" class="anew-i-list"></div>
       <div id="anew-i-log" class="anew-i-log" hidden></div>
+      <!-- ★Node 运行时：独立检查 / 更新 / 回滚（2026-11-03） -->
+      <div class="anew-node" id="anew-node">
+        <div class="anew-node-line">
+          <b>Node 运行时</b>
+          <span id="anew-node-cur">—</span>
+          <span id="anew-node-latest"></span>
+          <button type="button" class="anew-i-b" id="anew-node-check">检查</button>
+          <button type="button" class="anew-i-b up" id="anew-node-up">更新</button>
+          <button type="button" class="anew-i-b" id="anew-node-back">回滚</button>
+        </div>
+        <div class="muted" id="anew-node-note">更新会先收起 ACP 子进程；旧版本会备份，可回滚。</div>
+        <div class="anew-node-bar" id="anew-node-bar" hidden><i></i></div>
+      </div>
+      <!-- ★后台检查 / 自动更新（默认：检查开、自动装关） -->
+      <div class="anew-auto">
+        <button type="button" id="anew-auto-check" class="toggle">后台检查：开</button>
+        <button type="button" id="anew-auto-install" class="toggle">自动更新：关</button>
+        <span class="muted" id="anew-auto-note">自动更新只在没有会话正在跑时执行，且默认只装 patch 版本</span>
+      </div>
     </div>
     <div class="wp-list" id="anew-list"></div>
     <div class="wp-foot">
@@ -1327,17 +1426,87 @@
 <div id="drop-veil" class="drop-veil" hidden>
   <div class="veil-box">松手即可添加附件<br><span>图片支持粘贴（Ctrl+V）或拖入</span></div>
 </div>
-<script src="/js/00-util.js?v=0.2.63"></script>
-<script src="/js/01-chat.js?v=0.2.63"></script>
-<script src="/js/02-shell.js?v=0.2.63"></script>
-<script src="/js/21-cocraft.js?v=0.2.63"></script>
-<script src="/js/40-music.js?v=0.2.63"></script>
-<script src="/js/12-asks.js?v=0.2.63"></script>
-<script src="/js/11-engine.js?v=0.2.63"></script>
-<script src="/js/41-visual.js?v=0.2.63"></script>
-<script src="/js/30-code.js?v=0.2.63"></script>
-<script src="/js/20-collab.js?v=0.2.63"></script>
-<script src="/app.js?v=0.2.63"></script>
+<div id="restore" class="wp" hidden>
+  <div class="wp-box restore-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">可逆执行</span><b>忏悔室</b><i class="mk-cap">confessional</i>
+      <button id="restore-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="wp-cur muted" id="restore-note">删除的文件、被修改的旧版，都会按「群聊 / 工作流 / 单聊 → 项目 → 文件」留在这里。选一个版本点「回滚到此版本」——回滚前会先把当前文件也存进忏悔室。项目一旦 <b>git 提交</b>，提交前的旧版会在后台按 git 出清（只清旧内容已在 git 里的；未提交的保留）。</div>
+    <div class="restore-body">
+      <aside class="restore-left">
+        <div class="restore-sec-title">分类</div>
+        <div id="restore-cats" class="restore-cats"></div>
+        <div class="restore-sec-title">项目</div>
+        <div id="restore-projects" class="restore-projects"></div>
+      </aside>
+      <section class="restore-right">
+        <div id="restore-head" class="restore-head muted">选一个分类 / 项目</div>
+        <div id="restore-files" class="restore-files"></div>
+      </section>
+    </div>
+    <div class="wp-foot">
+      <span class="muted" id="restore-foot"></span>
+      <button id="restore-git" title="按项目当前 git 提交出清：只清提交前、且旧内容已在 git 里的旧版；未提交的保留">按 git 提交清理…</button>
+      <button id="restore-all" title="忏悔室的全部原始记录、保留期与低风险删除策略">全部记录与策略…</button>
+      <button id="restore-reload">刷新</button>
+    </div>
+  </div>
+</div>
+
+<div id="sessmgr" class="wp" hidden>
+  <div class="wp-box sessmgr-box">
+    <div class="wp-head">
+      <svg class="mk" aria-hidden="true"><use class="mk-tree" href="#mk-tree"></use><use class="mk-chapel" href="#mk-chapel"></use></svg>
+      <span class="wp-kind">会话</span><b id="sessmgr-title">会话管理</b><i class="mk-cap">sessions</i>
+      <button id="sessmgr-close" class="wp-x" title="关闭">×</button>
+    </div>
+    <div class="wp-cur muted" id="sessmgr-note"></div>
+    <div class="wp-list" id="sessmgr-list"></div>
+    <div class="wp-foot">
+      <span class="muted" id="sessmgr-foot"></span>
+      <button id="sessmgr-reload">刷新</button>
+    </div>
+  </div>
+</div>
+
+
+  <!-- 策划会话（P0） -->
+  <div id="planner" class="wp wp-wide" hidden>
+    <div class="wp-box planner-box">
+      <div class="wp-head">
+        <div class="wp-title"><span class="wp-kind">策划</span><b>策划会话</b><i class="mk-cap">planner</i></div>
+        <button id="planner-close" class="wp-x" title="关闭">×</button>
+      </div>
+      <div class="planner-layout">
+        <aside class="planner-side">
+          <div class="planner-side-actions">
+            <button type="button" id="planner-new" class="primary">＋ 新建</button>
+            <button type="button" id="planner-reload">刷新</button>
+          </div>
+          <div id="planner-list" class="planner-list"></div>
+        </aside>
+        <section id="planner-body" class="planner-body"><div class="muted" style="padding:18px">选择或新建一个策划会话。</div></section>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/00-util.js?v=0.2.123"></script>
+<script src="/js/01-chat.js?v=0.2.123"></script>
+<script src="/js/02-shell.js?v=0.2.123"></script>
+<script src="/js/21-cocraft.js?v=0.2.123"></script>
+<script src="/js/40-music.js?v=0.2.123"></script>
+<script src="/js/12-asks.js?v=0.2.123"></script>
+<script src="/js/11-engine.js?v=0.2.123"></script>
+<script src="/js/41-visual.js?v=0.2.123"></script>
+<script src="/js/42-cu.js?v=0.2.123"></script>
+<script src="/js/30-code.js?v=0.2.123"></script>
+<script src="/js/20-collab.js?v=0.2.123"></script>
+<script src="/js/14-sessions.js?v=0.2.123"></script>
+<script src="/js/15-planner.js?v=0.2.123"></script>
+  <script src="js/13-restore.js?v=0.2.123"></script>
+<script src="/app.js?v=0.2.123"></script>
 <script>
 /* app.js 没跑起来时（例如加载正好撞上服务重启 / 404）自动重试几次，别卡在「脚本没加载成功」。
    最多 3 次，避免真坏了时无限刷新；加载成功后 app.js 会清掉这个计数。 */

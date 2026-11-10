@@ -35,6 +35,17 @@ $("session-list").addEventListener("click", (e) => {
     if (root) codeOpenAt(root, sfile.dataset.sfile);
     return;
   }
+  // ★工作区胶囊：点一下复制完整路径（别让它同时触发"打开会话"）
+  const ws = e.target.closest("[data-ws]");
+  if (ws) {
+    e.preventDefault();
+    e.stopPropagation();
+    const dir = ws.dataset.ws || "";
+    copyToClipboard(dir).then((okv) => {
+      setBanner(okv ? ("已复制工作区路径：" + dir) : "复制失败：请手动选中这条路径");
+    });
+    return;
+  }
   // 树 / 详情里的空白处：不算"打开会话"
   if (e.target.closest(".session-tree") || e.target.closest(".det")) return;
   const info = e.target.closest(".info");          // 详情展开按钮：先判断，别让它同时触发"打开会话"
@@ -1082,7 +1093,16 @@ const CODE_TERM_H_DEFAULT = 240;
 
 const CODE = {
   open: false, root: "", data: {}, expanded: {}, sel: "", dirty: false, lang: "plain",
+  autoSeen: {}, autoAt: 0,             // ★自动打开的去重表 / 节流时间（`ui 0.2.86`）
+  priming: false,                      // ★只记账不打开：页面重载 / 切会话后的第一次扫描
 };
+
+/** 切会话 / 重载后调用：下一次扫描只"记住"已有文件，不弹抽屉（不然一进会话就自己开） */
+function codePrimeAuto() {
+  CODE.priming = true;
+  CODE.autoSeen = {};
+  CODE.autoAt = 0;
+}
 
 function codeSetStatus(text, dirty) {
   const el = $("code-status");
@@ -1165,6 +1185,7 @@ function codeResetTo(dir) {
   const pre = $("code-highlight"); if (pre) pre.innerHTML = "";
   const p = $("code-path"); if (p) { p.textContent = "未打开文件"; p.title = ""; }
   const wrap = document.querySelector(".code-edit-wrap"); if (wrap) wrap.classList.remove("disabled");
+  codeHidePreview();                       // ★换根目录时把预览层也收掉（否则会显示上一个项目的图）
   codeSetStatus("");
   codeLoadDir(dir);
   // 若「run」终端正开着，让它跟着换到新目录（重开一次 cwd 才是新根）
@@ -1208,6 +1229,129 @@ async function codeClose() {
 }
 
 /* ---- 内嵌终端：在编码抽屉底部嵌入终端（宽度 = 抽屉宽度，高度可拖） ---- */
+/* ---------------- ★自动打开（`ui 0.2.86`）：agent 生成 / 改了文件就在这儿代开 ----------------
+ * 用户要的是：「涉及生成文件时，右边自动打开对应文件」（原来是"生成完还得自己去文件夹里找"）。
+ * 触发源两条（互为兜底，跨引擎都成立）：
+ *   ① 实时事件 `session.tool.called` → 记下 input，`session.tool.success` 时打开（快）；
+ *   ② 一轮结束的权威消息里扫 `edit/write/patch` 工具（慢一点，但 ACP 也漏不掉）。
+ * ⚠ 几条纪律（不然会很烦人）：
+ *   · 只打开**在工作目录内**、且**确实存在**的文件（fsview 会做 realpath 越界校验）；
+ *   · 当前文件**有未保存改动**时**不切**（只给横幅，避免静默丢草稿）；
+ *   · 同一个文件 10 秒内不重复开；3 秒内最多一次；
+ *   · 自动打开走 `quiet`：不抢焦点（用户可能正在输入框里打字）。
+ */
+
+function codeAutoOn() { return SET.autoOpen !== false; }      // 默认开
+
+function codeAutoToggle() {
+  setSetting("autoOpen", !codeAutoOn());
+  codeRenderAutoBtn();
+  setBanner(codeAutoOn()
+    ? "已打开「自动打开」：agent 生成 / 修改文件后会在「文件查看」里自动打开"
+    : "已关闭「自动打开」：需要时点工具栏的「文件查看」自己开", { ms: 7000 });
+}
+
+function codeRenderAutoBtn() {
+  const b = $("code-auto");
+  if (!b) return;
+  const on = codeAutoOn();
+  b.textContent = on ? "自动打开：开" : "自动打开：关";
+  b.classList.toggle("on", on);
+}
+
+/** 绝对 / 相对 / `D:\a\b` 都归一成**相对工作目录**的路径；不在根下 → 返回 ""。
+ *  `rootArg` 不传就用 `CODE.root`（自动打开时会传"当前会话目录"，见 `codeAutoOpen`）。 */
+function codeRelPath(p, rootArg) {
+  let s = String(p || "").trim().replace(/^file:\/\//i, "");
+  const base = String(rootArg || CODE.root || "");
+  if (!s || !base) return "";
+  s = s.replace(/\\/g, "/");
+  const root = String(base).replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!root) return "";
+  const low = s.toLowerCase(), rl = root.toLowerCase();
+  if (low === rl) return "";
+  if (low.startsWith(rl + "/")) return s.slice(root.length + 1);
+  if (/^[a-zA-Z]:\//.test(s) || s.startsWith("/")) return "";   // 别的盘 / 绝对路径 → 不在本项目里
+  return s.replace(/^\.\//, "");
+}
+
+/** 从一条工具调用里抠出"它写了哪些文件"（OpenCode / ACP 两种形状都认） */
+function codeFilesOfTool(name, input, metadata) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v || "").trim();
+    if (s && !out.includes(s)) out.push(s);
+  };
+  const n = String(name || "").toLowerCase();
+  const writes = /^(edit|write|patch|multiedit|create|newfile|write_file|edit_file|delete|move)$/.test(n)
+    || /(edit|write|patch)/.test(n);
+  if (!writes) return out;
+  const inp = (input && typeof input === "object") ? input : {};
+  push(inp.filePath || inp.file_path || inp.path || inp.file || inp.target);
+  const md = (metadata && typeof metadata === "object") ? metadata : {};
+  (Array.isArray(md.files) ? md.files : []).forEach((f) => {
+    if (typeof f === "string") push(f);
+    else if (f && typeof f === "object") push(f.file || f.path || f.from);
+  });
+  (Array.isArray(inp.files) ? inp.files : []).forEach((f) => {
+    if (typeof f === "string") push(f);
+    else if (f && typeof f === "object") push(f.file || f.path);
+  });
+  return out;
+}
+
+/** 真正去开（自动）—— 各种"别烦人"的判断都在这里 */
+async function codeAutoOpen(paths, key, prime) {
+  if (!paths || !paths.length) return false;
+  // ★根目录：优先**当前会话的工作目录**（用户实测 bug：`CODE.root` 只在抽屉打开过之后才有值
+  //   → "从没开过文件查看"时自动打开永远不生效；切了会话也会拿旧目录去比，同样失效）。
+  const rootNow = String(((typeof currentDir === "function" ? currentDir() : "") || CODE.root || ""))
+    .replace(/\/+$/, "");
+  if (!rootNow) return false;
+  const rels = paths.map((p) => codeRelPath(p, rootNow)).filter(Boolean);
+  if (!rels.length) return false;
+  const now = Date.now();
+  const seen = CODE.autoSeen || (CODE.autoSeen = {});
+  // ★prime = 只记账、不开（页面重载 / 切会话后的第一次扫描：那是历史文件，不是"刚生成"）
+  if (prime) { rels.forEach((p) => { seen[key + "|" + p] = now; }); return false; }
+  if (!codeAutoOn()) return false;
+  // ★用户意图闸门（`ui 0.2.91`）：**只有他这条提问明确要求动文件**才自动打开。
+  //   否则（改个界面 / 顺手更文档 / 纯问问题）只在横幅里说一句"已生成 xxx"，不抢屏幕。
+  const want = (typeof state !== "undefined" && state.wantFiles) || null;
+  const allowed = !!(want && want.on && (now - (want.at || 0) < 30 * 60 * 1000));
+  // ⚠ 不弹横幅（用户 2026-11-01：「不要每次修改文件都弹横幅」）——
+  //   这里只是"不自动打开"，属于安静行为；要安静就别再拿横幅提醒第二次。
+  if (!allowed) return false;
+  const rel = rels.slice().reverse()                       // 倒序：最后一个写的最可能是主角
+    .find((p) => !seen[key + "|" + p]);
+  if (!rel) return false;
+  // ★"当前文件有未保存改动"时**不切**（避免静默丢草稿）；提示只给一次/分钟，别每写一个文件弹一次
+  if (CODE.open && CODE.dirty) {
+    if (now - (CODE.dirtyHintAt || 0) > 60000) {
+      CODE.dirtyHintAt = now;
+      setBanner(`已生成 ${rel} · 当前文件还有未保存的改动，没有自动切换`, { ms: 8000 });
+    }
+    return false;
+  }
+  if (now - (CODE.autoAt || 0) < 3000) return false;              // 3 秒内最多一次
+  seen[key + "|" + rel] = now;
+  if (Object.keys(seen).length > 300) {                            // 别无限长
+    Object.keys(seen).slice(0, 100).forEach((k) => { delete seen[k]; });
+  }
+  CODE.autoAt = now;
+  try {
+    const sameRoot = String(CODE.root || "").replace(/\/+$/, "") === rootNow;
+    if (CODE.open && sameRoot) {
+      // 抽屉本来就开着、根目录也对得上 → 只换文件，不重置文件树（不闪）
+      await codeOpenFile(rel, { quiet: true });
+      return CODE.sel === rel;
+    }
+    // 抽屉没开 / 根目录不是这个会话 → 重新按当前会话目录打开（`codeOpenAt` 会设 CODE.root）
+    await codeOpenAt(rootNow, rel);
+    return true;
+  } catch { return false; }
+}
+
 function syncCodeRunBtn() {
   const b = $("code-menu");                  // 终端开着时把「菜单」按钮点亮
   if (b) b.classList.toggle("on", !!(TERM.embedded && TERM.open));
@@ -1348,11 +1492,28 @@ function codeRenderTree() {
   box.innerHTML = html || `<div class="empty">空目录</div>`;
 }
 
-async function codeOpenFile(path) {
+async function codeOpenFile(path, opts) {
+  const quiet = !!(opts && opts.quiet);            // 自动打开时不抢焦点（用户可能正在输入框里打字）
   if (CODE.dirty) {                          // 切文件前先把挂起的自动保存补交掉
     await codeFlushSave();
     if (CODE.dirty && !confirm("自动保存失败，放弃改动并打开别的文件？")) return;
   }
+  const kind = codeKindOf(path);
+  if (kind === "markdown") {                 // Markdown → 渲染成富文本（可切「源码」）
+    await codeShowMarkdown(path, quiet);
+    return;
+  }
+  if (kind === "html") {                     // HTML → 沙箱 iframe 渲染（可切「源码」）
+    await codeShowHtml(path, quiet);
+    return;
+  }
+  if (kind !== "text") {                     // 图片 / PDF / 音视频 → 走预览层
+    codeShowPreview(path, kind, quiet);
+    return;
+  }
+  codeHidePreview();
+  const wrap0 = document.querySelector(".code-edit-wrap");
+  if (wrap0) wrap0.classList.remove("md-src");   // 普通文本 → 回到"代码"模式（不折行）
   const ed = $("code-editor");
   try {
     const r = await api(`/fs/read?root=${encodeURIComponent(CODE.root)}&path=${encodeURIComponent(path)}`);
@@ -1370,14 +1531,194 @@ async function codeOpenFile(path) {
     if (p) { p.textContent = path; p.title = path; }
     codeRenderTree();
     codeRenderHighlight();
-    if (!d.binary) setTimeout(() => { try { ed.focus(); } catch { /* ignore */ } }, 30);
+    if (!d.binary && !quiet) setTimeout(() => { try { ed.focus(); } catch { /* ignore */ } }, 30);
   } catch (err) {
     setBanner("打开文件失败：" + err.message);
   }
 }
 
-async function codeSave() {
-  if (!CODE.sel) return;
+/* ---------------- ★预览（`ui 0.2.86`）：图片 / PDF / 音视频 ----------------
+ * 原来的「编码模式」只能看文本，agent 生成一张图 / 一份 PDF 就只能去文件夹里找。
+ * 现在同一个抽屉兼「文件查看」：文本照旧可编辑，这几类直接渲染（`/fs/raw` 发原始字节）。 */
+
+const CODE_MEDIA = {
+  image: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico"],
+  pdf: ["pdf"],
+  video: ["mp4", "webm", "m4v", "mov", "mkv"],
+  audio: ["mp3", "wav", "m4a", "flac", "ogg", "opus"],
+  markdown: ["md", "markdown"],            // ★渲染成富文本，再给一个「源码」切换
+  html: ["html", "htm"],                   // ★沙箱 iframe 渲染（`ui 0.2.94`）
+};
+
+/** 按扩展名判"能不能直接预览"（和后端 `fsview.media_kind` 同一套口径） */
+function codeKindOf(path) {
+  const ext = String(path || "").split(".").pop().toLowerCase();
+  for (const [kind, exts] of Object.entries(CODE_MEDIA)) {
+    if (exts.includes(ext)) return kind;
+  }
+  return "text";
+}
+
+function codeRawUrl(path) {
+  return `/fs/raw?root=${encodeURIComponent(CODE.root)}&path=${encodeURIComponent(path)}`;
+}
+
+function codeHidePreview() {
+  const pv = $("code-preview");
+  if (pv) { pv.hidden = true; pv.innerHTML = ""; }
+  const wrap = document.querySelector(".code-edit-wrap");
+  if (wrap) wrap.hidden = false;
+}
+
+/** 在预览层里渲染（`quiet` = 自动打开，不切焦点、不打断输入） */
+function codeShowPreview(path, kind, quiet) {
+  const pv = $("code-preview");
+  const wrap = document.querySelector(".code-edit-wrap");
+  if (wrap) wrap.hidden = true;
+  CODE.sel = path;
+  CODE.dirty = false;
+  CODE.lang = "plain";
+  const p = $("code-path");
+  if (p) { p.textContent = path; p.title = path; }
+  const ed = $("code-editor");
+  if (ed) { ed.value = ""; ed.disabled = true; }
+  const url = codeRawUrl(path);
+  const label = { image: "图片", pdf: "PDF", video: "视频", audio: "音频" }[kind] || "文件";
+  let inner = "";
+  if (kind === "image") inner = `<img src="${esc(url)}" alt="${esc(path)}">`;
+  else if (kind === "pdf") inner = `<embed src="${esc(url)}#view=FitH" type="application/pdf">`;
+  else if (kind === "video") inner = `<video src="${esc(url)}" controls preload="metadata"></video>`;
+  else if (kind === "audio") inner = `<audio src="${esc(url)}" controls preload="metadata"></audio>`;
+  inner += `<div class="cp-note">${esc(label)}预览 · ${esc(path)}<br>`
+    + `这是只读预览；要改内容请用能生成它的工具，或换文本文件。</div>`
+    + `<div class="cp-acts">`
+    + `<button type="button" data-cp="reload">重新载入</button>`
+    + `<button type="button" data-cp="folder">在文件夹里看</button>`
+    + `<button type="button" data-cp="ext">在外部打开</button>`
+    + `</div>`;
+  if (pv) { pv.innerHTML = inner; pv.hidden = false; }
+  codeSetStatus(`${label} · 预览`, false);
+  if (!quiet) { try { pv && pv.focus(); } catch { /* ignore */ } }
+  codeRenderTree();
+}
+
+/** ★Markdown → **渲染后的富文本**（`ui 0.2.91`）。
+ *  以前 `.md` 走文本框、`wrap="off"`：一整屏原始 `##`/`**`，长行还被切掉 —— 用户直接说"渲染有问题"。
+ *  现在默认渲染（`renderText`，和聊天区同一个渲染器），底部给「源码」切回可编辑的文本框。 */
+async function codeShowMarkdown(path, quiet) {
+  const pv = $("code-preview");
+  const wrap = document.querySelector(".code-edit-wrap");
+  const ed = $("code-editor");
+  CODE.sel = path;
+  CODE.dirty = false;
+  CODE.lang = "md";
+  const p = $("code-path");
+  if (p) { p.textContent = path; p.title = path; }
+  if (wrap) wrap.hidden = true;
+  if (ed) { ed.value = ""; ed.disabled = true; }
+  if (pv) {
+    pv.hidden = false;
+    pv.innerHTML = `<div class="cp-note">读取中…</div>`;
+  }
+  try {
+    const r = await api(`/fs/read?root=${encodeURIComponent(CODE.root)}&path=${encodeURIComponent(path)}`);
+    const d = (r && r.data) || {};
+    const text = String(d.text || "");
+    CODE.mdText = text;
+    const tooBig = text.length > 300000;          // 30 万字以上渲染会卡：只给源码
+    const body = tooBig
+      ? `<div class="md-p">（文件太大（${fmtBytes(d.size || text.length)}），这里只给源码 → 点「源码」）</div>`
+      : `<div class="cp-md">${renderText(text)}</div>`;
+    if (pv) {
+      pv.innerHTML = `<div class="cp-acts cp-acts-top">`
+        + (tooBig ? "" : `<button type="button" data-cp="srcedit" data-cp-path="${esc(path)}">源码</button>`)
+        + `<button type="button" data-cp="reload">重新载入</button>`
+        + `<button type="button" data-cp="folder">在文件夹里看</button>`
+        + `<button type="button" data-cp="ext">在外部打开</button>`
+        + `</div>`
+        + body
+        + `<div class="cp-note">${fmtBytes(d.size || text.length)} · Markdown 渲染（只读）</div>`;
+    }
+    codeSetStatus(`Markdown · ${fmtBytes(d.size || text.length)}`, false);
+    if (!quiet) { try { pv && pv.focus(); } catch { /* ignore */ } }
+  } catch (err) {
+    if (pv) {
+      pv.innerHTML = `<div class="cp-note">读不到这个文件：${esc(err.message)}</div>
+        <div class="cp-acts"><button type="button" data-cp="reload">重试</button></div>`;
+    }
+  }
+  codeRenderTree();
+}
+
+/** ★HTML → **沙箱 iframe 渲染**（`ui 0.2.94`）。
+ *
+ *  用户实测：agent 生成一份 `.html` 报告，文件查看里却是原始标签 + 横向切行 —— 等于没预览。
+ *  这里用 `iframe[srcdoc]` 渲染；**默认不带 `allow-scripts`**（静态预览，最安全），
+ *  需要跑图表脚本时点「脚本」重载 —— 但仍**不给 `allow-same-origin`**：
+ *  沙箱里的页面是 opaque origin，`fetch('/api/…')` 会被 CORS 挡掉，碰不到本机接口。 */
+async function codeShowHtml(path, quiet, allowScripts) {
+  const pv = $("code-preview");
+  const wrap = document.querySelector(".code-edit-wrap");
+  const ed = $("code-editor");
+  CODE.sel = path;
+  CODE.dirty = false;
+  CODE.lang = "html";
+  const p = $("code-path");
+  if (p) { p.textContent = path; p.title = path; }
+  if (wrap) wrap.hidden = true;
+  if (ed) { ed.value = ""; ed.disabled = true; }
+  if (pv) { pv.hidden = false; pv.innerHTML = `<div class="cp-note">读取中…</div>`; }
+  try {
+    const r = await api(`/fs/read?root=${encodeURIComponent(CODE.root)}&path=${encodeURIComponent(path)}`);
+    const d = (r && r.data) || {};
+    const text = String(d.text || "");
+    CODE.mdText = text;                       // 「源码」直接复用这份
+    const sandbox = allowScripts ? "allow-scripts" : "";
+    if (pv) {
+      pv.innerHTML = `<div class="cp-acts cp-acts-top">`
+        + `<button type="button" data-cp="srcedit">源码</button>`
+        + `<button type="button" data-cp="html-scripts" data-on="${allowScripts ? "1" : "0"}"
+             title="默认不跑脚本（更安全）；需要图表脚本时点这里重载（仍不允许访问本机接口）"
+             >${allowScripts ? "脚本：已允许" : "脚本：关"}</button>`
+        + `<button type="button" data-cp="reload">重新载入</button>`
+        + `<button type="button" data-cp="folder">在文件夹里看</button>`
+        + `<button type="button" data-cp="ext">在外部打开</button>`
+        + `</div>`
+        + `<iframe class="cp-html" sandbox="${sandbox}" referrerpolicy="no-referrer"
+                   srcdoc="${esc(text)}" title="${esc(path)}"></iframe>`
+        + `<div class="cp-note">${fmtBytes(d.size || text.length)} · HTML 渲染（沙箱${allowScripts ? " · 脚本已允许" : ""}）</div>`;
+    }
+    codeSetStatus(`HTML · ${fmtBytes(d.size || text.length)}`, false);
+    if (!quiet) { try { pv && pv.focus(); } catch { /* ignore */ } }
+  } catch (err) {
+    if (pv) {
+      pv.innerHTML = `<div class="cp-note">读不到这个文件：${esc(err.message)}</div>
+        <div class="cp-acts"><button type="button" data-cp="reload">重试</button></div>`;
+    }
+  }
+  codeRenderTree();
+}
+
+/** ★切到「源码」：可编辑的 textarea（`wrap` 打开，别再把长行切掉）。 */
+async function codeShowSource(path) {
+  codeHidePreview();
+  const wrap = document.querySelector(".code-edit-wrap");
+  if (wrap) { wrap.hidden = false; wrap.classList.add("md-src"); }
+  const ed = $("code-editor");
+  if (ed) {
+    if (CODE.mdText != null && ed.value !== CODE.mdText) ed.value = CODE.mdText;
+    ed.disabled = false;
+    ed.placeholder = "";
+    setTimeout(() => { try { ed.focus(); } catch { /* ignore */ } }, 20);
+  }
+  CODE.sel = path || CODE.sel;
+  CODE.lang = "md";
+  CODE.dirty = false;
+  codeRenderHighlight();
+  codeSetStatus("Markdown 源码（可编辑 · 自动保存）", false);
+}
+
+async function codeSave() {  if (!CODE.sel) return;
   const ed = $("code-editor");
   if (!ed || ed.disabled) return;
   try {
@@ -1443,6 +1784,31 @@ function initCode() {
   const on = (id, fn) => { const el = $(id); if (el) el.addEventListener("click", fn); };
   on("code-close", codeClose);
   on("code-exec", codeExec);
+  on("code-auto", codeAutoToggle);
+  codeRenderAutoBtn();
+  // 预览层的三个动作（重新载入 / 文件夹里看 / 外部打开）
+  const pv = $("code-preview");
+  if (pv) {
+    pv.addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-cp]");
+      if (!b || !CODE.sel) return;
+      const act = b.dataset.cp;
+      if (act === "reload") codeOpenFile(CODE.sel);
+      else if (act === "srcedit") codeShowSource(CODE.sel);
+      else if (act === "html-scripts") {
+        // 「脚本」开关：按当前文件类型重载（保持只读预览，只是放不放行 sandbox 里的脚本）
+        codeShowHtml(CODE.sel, false, b.dataset.on !== "1");
+      }
+      else if (act === "folder") {
+        const parent = String(CODE.sel).replace(/\\/g, "/").split("/").slice(0, -1).join("/");
+        const dir = parent ? (CODE.root.replace(/\\/g, "/").replace(/\/+$/, "") + "/" + parent) : CODE.root;
+        try { api("/open/dir", { method: "POST", body: JSON.stringify({ dir: dir, what: "explorer" }) }); } catch { /* ignore */ }
+      } else if (act === "ext") {
+        const abs = CODE.root.replace(/\\/g, "/").replace(/\/+$/, "") + "/" + String(CODE.sel).replace(/\\/g, "/");
+        try { api("/open/dir", { method: "POST", body: JSON.stringify({ dir: abs, what: "editor" }) }); } catch { /* ignore */ }
+      }
+    });
+  }
   on("code-refresh", () => {
     if (!CODE.root) return;
     CODE.data = {}; CODE.expanded = {};
@@ -1785,6 +2151,7 @@ const COLLAB = {
   run: null, runId: "", runErr: "", poll: 0, tickBusy: false, wasActive: false,
   arbEngine: "", pickId: "", diffOpen: false,
   memSel: "", memAll: false, permOpen: false,        // ★运行详情：只看选中的成员 / 权限抽屉
+  permSig: "",                                          // 待批/待回答卡片签名（避免 1.5s 重建冲掉输入）
   projFilter: "",                                        // ★左栏「按项目筛选」：空 = 全部
   runsPoll: 0, runsBusy: false, runsSeq: 0,
   // ★工作流（0.2.11）：可复用配置 + 画布
@@ -1793,6 +2160,10 @@ const COLLAB = {
   wfArchOpen: false,          // ★左栏「已归档」折叠区（P3）
   splitHinted: {},            // ★「这个工作流还是单阶段」提示只弹一次（按工作流 id）
   runWfFilter: "",            // 运行历史只看某个工作流
+  runsOpen: false,            // ★运行历史默认收起（主控会话记录占它的位置）
+  planner: null,              // ★当前工作流的主控（策划）会话（按 cwd 查；左栏记录 + 头按钮用）
+  plannerOpen: false,         // ★右侧主控面板是否展开（和工作流画布同时可见）
+  plannerSid: "", plannerData: null, plannerChat: null, plannerHelp: false, plannerReport: "",
   canvas: { zoom: 1, pan: { x: 20, y: 14 }, nodes: {}, sel: "", drag: null, panning: null,
             saveTimer: 0 },
 };
@@ -1808,13 +2179,13 @@ const COLLAB_DEC = {
 };
 
 // ★节点级权限等级（后端 catalog 会回同一份；这里留兜底，后端没重启也能用）
+// ⚠ 工作流**不再跟随面板**：每个成员必须单独设一个等级（空 = 未设置 → 按「全部询问」处理）
 const COLLAB_PERM_FALLBACK = [
-  { id: "", label: "跟随面板", note: "用面板当前等级" },
   { id: "ask", label: "全部询问", note: "每条命令都问" },
   { id: "read", label: "只读自动", note: "读自动；写/执行要问" },
   { id: "edit", label: "读写自动", note: "工作区内读写自动" },
   { id: "exec", label: "执行自动", note: "工作区内读写执行自动" },
-  { id: "trust", label: "信任（非破坏性自动）", note: "不再逐条问；破坏性仍然必须确认" },
+  { id: "trust", label: "信任（非破坏性自动）", note: "不再逐条问；破坏性 / 敏感读取仍然必须确认" },
 ];
 
 function collabPermLevels() {

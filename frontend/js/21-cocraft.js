@@ -280,9 +280,9 @@ function ccActRender() {
   if (atBottom) ccScrollBottom(box);
 }
 
-/** 顶栏群聊入口的「工作中」角标（抽屉关着时也看得见）。 */
+/** 工具菜单（扳手）里「在线协作」的「工作中」角标（抽屉关着时也看得见）。 */
 function ccActBadge() {
-  const b = $("btn-hub");
+  const b = $("tm-chat");
   if (!b) return;
   const busy = ccActItems(CC.chatID).some((a) => CC_ACT_BUSY_ST[a.status]);
   b.classList.toggle("cc-busy", !!busy);

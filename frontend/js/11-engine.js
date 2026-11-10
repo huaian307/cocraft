@@ -32,10 +32,13 @@ const SET_DEFAULT = {
   liveAlways: false,
   petals: true, gold: true, bamboo: true, zh: true,
   glass: true,                       // ★液态玻璃皮肤（面板半透明磨砂 + 壁纸透出）
-  // ★可逆执行：每轮工作区快照（发消息前留底 → 「撤销这一轮」）。
+  // ★可逆执行：每轮工作区快照（发消息前留底 → 忏悔室版本时间线）。
   //   ⚠ **默认关**（用户 2026-10-16 反馈：把整个工作区镜像进内容仓太重）——
-  //   关掉后**只保留破坏性操作的隔离区**（那条不走这个开关）。
+  //   关掉后**只保留破坏性操作的忏悔室**（那条不走这个开关）。
   turnSnap: false,
+  // ★文件查看（`ui 0.2.86`）：agent 生成 / 修改文件后，自动在右侧抽屉里打开
+  //   （当前文件有未保存改动时不切；自动打开不抢焦点）
+  autoOpen: true,
   // 空会话首屏那几行文案（留空 = 用自带的）
   heroL1: "", heroL2: "", heroCredit: "",
 };
@@ -201,7 +204,9 @@ async function setEngine(id) {
   if (!id || id === ENGINE.active) return;
   // ★ 跨引擎接续：记下当前这条会话在 **agent 侧**的 id（ACP 用 agentSessionId，OpenCode 就是 id 本身），
   //   切完引擎后优先把"同一条会话"再接回来。
-  const prev = state.current
+  //   ⚠ 主控（策划）会话不是 agent 侧会话：别拿 `planner:…` 去接续 —— 否则切完引擎又被拉回
+  //     策划面板，看起来像"引擎切不了 / 会话切不走"。
+  const prev = (state.current && state.current._kind !== "planner")
     ? { agent: state.current.agentSessionId || state.current.id,
         title: state.current.title || "" }
     : null;
@@ -238,6 +243,7 @@ async function setEngine(id) {
     $("input").disabled = true;
     $("btn-send").disabled = true;
     $("btn-stop").disabled = true;
+    $("input").placeholder = "写在这里…… Enter 送出，Shift+Enter 换行（可粘贴/拖入图片）";
     renderMessages();
     if (typeof connectEvents === "function") connectEvents();
     await loadSessions();
@@ -265,10 +271,13 @@ async function setEngine(id) {
     }
     // 换引擎后像开机一样自动打开最近一个会话，别停留在"未选择会话"空状态
     // （否则期间若有 SSE 事件会被误画到空状态下面）。
-    if (!resumed && state.sessions.length && !state.current) {
-      await openSession(state.sessions[0].id);
+    // ⚠ 只挑**真实聊天会话**：策划会话排在最前面，打开它又会把输入框变成主控视图。
+    const firstChat = (state.sessions || []).find((s) => !String(s.id || "").startsWith("planner:"));
+    if (!resumed && firstChat && !state.current) {
+      await openSession(firstChat.id);
     }
   } catch (err) {
+    console.error("[engine] 切换引擎失败", err);
     alert("切换引擎失败：" + err.message);
   }
   await loadEngineStatus();
@@ -956,11 +965,11 @@ async function openImport() {
 
 function closeImport() { const b = $("import"); if (b) b.hidden = true; OVERLAY.pop("import"); }
 
-/* ---------------- ★可逆执行：隔离区（工具 → 隔离区） ----------------
+/* ---------------- ★可逆执行：忏悔室（工具 → 忏悔室） ----------------
  * 破坏性操作**放行前**先把要动的目标复制进 runtime/quarantine/（见 backend/snapshots.py）。
- * 这里只做三件事：列出 / 一键恢复 / 删除记录（「撤销这一轮」建在同一个快照底座上，后续接）。 */
+ * 这里只做三件事：列出 / 一键恢复 / 删除记录（忏悔室版本时间线与它共用快照底座）。 */
 
-const QUAR = { items: [], stats: null, err: "", busy: false };
+const QUAR = { items: [], stats: null, policy: null, plan: null, err: "", busy: false };
 
 async function quarOpen() {
   const box = $("quar");
@@ -986,6 +995,163 @@ async function quarLoad() {
     QUAR.err = (e && e.message) ? e.message : String(e);
   }
   renderQuar();
+  // ★轮快照带内容开关（`ui 0.2.85`）：群聊 / 工作流的每一轮要不要连内容一起存
+  try {
+    const cfg = unwrap(await api("/snapshot/config")) || {};
+    const btn = $("quar-snap-toggle");
+    if (btn) {
+      const on = !!cfg.groupContent;
+      btn.classList.toggle("on", on);
+      btn.textContent = on ? "轮快照带内容：已开（可一键退回）" : "轮快照带内容：关（只记文件名）";
+    }
+  } catch { /* 老后端没有这个接口 → 保持默认文案 */ }
+  // ★低风险删除策略 + 保留期计划（`ui 0.2.95`）
+  try {
+    const p = unwrap(await api("/quarantine/plan")) || {};
+    QUAR.plan = p;
+    QUAR.policy = p.config || null;
+  } catch { /* 老后端没有这个接口 → 保持 null（策略条显示为不可用） */ }
+  quarRenderPolicy();
+}
+
+/** 切换「轮快照带内容」：开了才能把群聊 / 工作流的一轮退回去（代价是磁盘占用）。 */
+async function quarToggleSnap() {
+  try {
+    const cur = unwrap(await api("/snapshot/config")) || {};
+    const next = !cur.groupContent;
+    await api("/snapshot/config", { method: "POST",
+      body: JSON.stringify({ groupContent: next }) });
+    setBanner(next
+      ? "已打开「轮快照带内容」：群聊 / 工作流每一轮动手前连内容一起存 —— 之后能在审计页一键退回（会占磁盘）"
+      : "已关闭「轮快照带内容」：之后只记文件名（省磁盘，但这一轮撤不回）", { ms: 9000 });
+    await quarLoad();
+  } catch (e) {
+    setBanner("切换失败：" + ((e && e.message) || e)
+      + (typeof backendStaleHint === "function" ? backendStaleHint("") : ""), { sticky: true });
+  }
+}
+
+/* ---------------- ★低风险删除：策略（`ui 0.2.95`） ----------------
+ * 评分在 `backend/file_rank.py`：★ 级 = 构建产物 / 缓存 / 日志 / 临时文件。
+ * 只有「可完整隔离」时才自动放行；源码 / 配置 / git 跟踪文件、关机·杀进程·格式化
+ * 一律照旧弹窗（它们没有可恢复的"原件"）。 */
+function quarStars(n) {
+  const k = Math.max(1, Math.min(5, Number(n) || 1));
+  return "★".repeat(k) + "☆".repeat(5 - k);
+}
+
+function quarRenderPolicy() {
+  const cfg = QUAR.policy || {};
+  const btn = $("quar-auto");
+  const days = $("quar-days");
+  const note = $("quar-plan-note");
+  if (btn) {
+    const on = !!cfg.enabled;
+    btn.classList.toggle("on", on);
+    btn.textContent = on ? "低风险删除：开（★ 自动隔离）" : "低风险删除：关";
+  }
+  const cfgBtn = $("cfg-auto-delete");
+  if (cfgBtn && QUAR.policy) {
+    cfgBtn.classList.toggle("on", !!cfg.enabled);
+    cfgBtn.textContent = cfg.enabled ? "开" : "关";
+  }
+  if (days && document.activeElement !== days) days.value = String(cfg.days || 7);
+  const p = QUAR.plan || {};
+  const c = p.counts || {};
+  if (note) {
+    if (!QUAR.policy) {
+      note.textContent = "后端还没有这个接口（可能是旧服务）—— 重启一次面板服务再试。";
+    } else {
+      note.textContent = `到期前 ${cfg.remindHours || 24} 小时提醒 · 当前：`
+        + `${c.soon || 0} 条快到期 / ${c.due || 0} 条可清 / ${c.hold || 0} 条需你确认`;
+    }
+  }
+}
+
+async function quarToggleAuto() {
+  try {
+    const cfg = QUAR.policy || {};
+    const next = !cfg.enabled;
+    const r = unwrap(await api("/quarantine/policy", { method: "POST",
+      body: JSON.stringify({ enabled: next }) })) || {};
+    QUAR.policy = r;
+    const t = $("cfg-auto-delete");
+    if (t) { t.classList.toggle("on", !!r.enabled); t.textContent = r.enabled ? "开" : "关"; }
+    setBanner(next
+      ? "已开启「低风险删除」：★ 级（构建产物 / 缓存 / 日志 / 临时文件）先隔离再自动放行；其它照旧问你"
+      : "已关闭「低风险删除」：所有删除都照旧弹窗", { ms: 9000 });
+    await quarLoad();
+  } catch (e) {
+    setBanner("切换失败：" + ((e && e.message) || e)
+      + (typeof backendStaleHint === "function" ? backendStaleHint("") : ""), { sticky: true });
+  }
+}
+
+async function quarSaveDays() {
+  const el = $("quar-days");
+  if (!el) return;
+  const days = Math.max(1, Math.min(90, Number(el.value) || 7));
+  el.value = String(days);
+  try {
+    const r = unwrap(await api("/quarantine/policy", { method: "POST",
+      body: JSON.stringify({ days }) })) || {};
+    QUAR.policy = r;
+    setBanner(`忏悔室保留期已改为 ${days} 天（到期前 24 小时提醒）`, { ms: 7000 });
+    await quarLoad();
+  } catch (e) {
+    setBanner("保存失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function quarCleanupNow() {
+  if (QUAR.busy) return;
+  const p = QUAR.plan || {};
+  const c = p.counts || {};
+  const n = Number(c.due || 0);
+  if (!n) {
+    setBanner(`现在没有可清理的到期项（${c.hold || 0} 条风险项需要你手动确认）`);
+    return;
+  }
+  if (!confirm(`清理 ${n} 条到期记录？\n`
+    + "只清「安全项」（原件已恢复 / 本来就是可再生成的东西）。\n"
+    + "涉及 git 跟踪文件或无法判断的会保留。")) return;
+  QUAR.busy = true;
+  try {
+    const r = unwrap(await api("/quarantine/cleanup", { method: "POST",
+      body: JSON.stringify({}) })) || {};
+    setBanner(`已清理 ${(r.dropped || []).length} 条 · 释放 ${fmtBytes(r.freed || 0)}`
+      + ((r.held || []).length ? ` · ${r.held.length} 条风险项保留` : ""));
+    await quarLoad();
+  } catch (e) {
+    setBanner("清理失败：" + ((e && e.message) || e), { sticky: true });
+  } finally {
+    QUAR.busy = false;
+  }
+}
+
+/** 启动时检查一次：有快到期 / 需确认的记录就提示（点横幅直接开忏悔室）。 */
+async function quarBootCheck() {
+  try {
+    const p = unwrap(await api("/quarantine/plan")) || {};
+    QUAR.plan = p;
+    QUAR.policy = p.config || null;
+    quarRenderPolicy();
+    const c = p.counts || {};
+    const soon = Number(c.soon || 0), hold = Number(c.hold || 0), due = Number(c.due || 0);
+    if (!soon && !hold && !due) return;
+    const parts = [];
+    if (soon) parts.push(`${soon} 条将在 ${(p.config || {}).remindHours || 24} 小时内到期`);
+    if (due) parts.push(`${due} 条已到期（${(p.config || {}).remindHours || 24} 小时后清理安全项）`);
+    if (hold) parts.push(`${hold} 条需要你确认（不会自动清）`);
+    setBanner(`忏悔室：${parts.join(" · ")} —— 点这里检查项目文件是否完整`, {
+      clickable: true, sticky: true, onClick: () => quarOpen(),
+    });
+  } catch { /* 老后端 / 没数据 → 安静 */ }
+}
+
+/** 启动后延迟检查（别和首屏抢带宽）：有快到期 / 需确认的记录就给一条可点横幅。 */
+function initQuarantine() {
+  setTimeout(() => { quarBootCheck(); }, 2500);
 }
 
 function quarWhen(ts) {
@@ -1008,9 +1174,13 @@ function renderQuar() {
   const items = QUAR.items || [];
   const st = QUAR.stats || {};
   if (foot) {
-    foot.textContent = st.quarantine_dir
-      ? `共 ${items.length} 条记录 · 隔离区占用 ${fmtBytes(st.quarantine || 0)}（${st.quarantine_dir}）`
-      : `共 ${items.length} 条记录`;
+    const c = (QUAR.plan || {}).counts || {};
+    const tail = QUAR.policy
+      ? ` · 到期：${c.due || 0} 条可清 / ${c.hold || 0} 条需确认`
+      : "";
+    foot.textContent = (st.quarantine_dir
+      ? `共 ${items.length} 条记录 · 忏悔室占用 ${fmtBytes(st.quarantine || 0)}（${st.quarantine_dir}）`
+      : `共 ${items.length} 条记录`) + tail;
   }
   if (!items.length) {
     box.innerHTML = `<div class="muted" style="padding:10px">还没有隔离记录。<br>`
@@ -1019,13 +1189,20 @@ function renderQuar() {
   }
   box.innerHTML = items.map((it) => {
     const missed = Number(it.missed || 0);
+    const auto = !!it.auto;
+    const star = Number(it.max_star || 0);
+    const ends = auto && it.expires_at ? quarWhen(it.expires_at) : "";
     return `<div class="q-row" data-qid="${esc(it.id)}">
       <div class="q-top">
         <b>🛡 ${it.count} 项</b>
+        ${auto ? `<span class="q-badge auto" title="低风险删除：先隔离后自动放行">自动</span>` : ""}
+        ${auto && star ? `<span class="q-stars" title="最高星级（越低越可再生成）">${quarStars(star)}</span>` : ""}
+        ${it.tombstone ? `<span class="q-badge tomb" title="超过 64MB，只记了清单、没有复制内容（可再生文件）">仅清单</span>` : ""}
         <span class="q-size">${fmtBytes(it.bytes || 0)}</span>
         <span class="q-time" title="${esc(it.ts || "")}">${esc(quarWhen(it.taken_at))}</span>
       </div>
       <div class="q-note">${esc(it.note || "（无说明）")}</div>
+      ${ends ? `<div class="q-ends">保留至 ${esc(ends)}（到期只清安全项；风险项永久保留）</div>` : ""}
       ${it.cmd ? `<div class="q-cmd mono" title="${esc(it.cmd)}">${esc(it.cmd)}</div>` : ""}
       ${missed ? `<div class="q-warn">⚠️ 另有 ${missed} 项没保住（太大 / 不存在 / 范围过大）—— 这几项找不回来</div>` : ""}
       <div class="q-acts">
@@ -1048,7 +1225,7 @@ async function quarRestore(qid, override = false) {
     const bad = Number(r.failed || 0) + Number(r.missing || 0);
     if (cf && !override) {
       if (confirm(`有 ${cf} 项的目标位置**已经有文件**了（可能被重建过）。\n`
-        + `要用隔离区的备份**覆盖**它们吗？（取消 = 保留现在的文件）`)) {
+        + `要用忏悔室的备份**覆盖**它们吗？（取消 = 保留现在的文件）`)) {
         QUAR.busy = false;
         return quarRestore(qid, true);
       }
@@ -1075,203 +1252,30 @@ async function quarDrop(qid) {
   }
 }
 
-/* ---------------- ★可逆执行：「撤销这一轮」（工具 → 撤销这一轮） ----------------
- * 每发一条消息、**在 prompt 之前**给会话工作目录落一次快照（后端 `/snapshot/take`，走 hash 缓存，热扫 ~10ms）。
- * 这里显示「这一轮改了哪些文件」→ 点开看行级 diff → 一键退回（后端 `/snapshot/undo`）。 */
-
-const UNDO = { scope: "", root: "", ts: "", diff: null, err: "", busy: false, note: "" };
+/* ---------------- ★可逆执行：每轮工作区快照（供忏悔室版本时间线） ----------------
+ * 每发一条消息、**在 prompt 之前**给会话工作目录落一次快照（后端 `/snapshot/take`）。
+ * ⚠ 「撤销这一轮」已删除（`ui 0.2.102`）：快照只作为忏悔室的版本来源，不再提供整轮批量撤销。 */
 
 /** 轮开始落快照。**失败绝不挡住发消息**（返回 null）。开关关着就直接跳过。 */
 async function snapTurnStart(sid, dir) {
-  if (!SET.turnSnap) return null;      // ★默认关：只留破坏性操作的隔离区
+  if (!SET.turnSnap) return null;      // 默认关；关着时仍有审批前自动留存
   if (!sid || !dir) return null;
   try {
-    const r = unwrap(await api("/snapshot/take", { method: "POST",
+    return unwrap(await api("/snapshot/take", { method: "POST",
       body: JSON.stringify({ root: dir, scope: String(sid), label: "turn", content: true }) }));
-    if (r && r.ts) {
-      UNDO.scope = String(sid); UNDO.root = dir; UNDO.ts = r.ts;
-    }
-    return r;
   } catch (e) {
     return null;                       // 安静失败：快照只是安全网，不该挡住干活
   }
 }
 
-async function undoOpen() {
-  const box = $("undo");
-  if (!box) return;
-  box.hidden = false;
-  OVERLAY.push("undo", undoClose);           // ★P3：Esc 只关栈顶
-  await undoLoad();
-}
-
-function undoClose() { const b = $("undo"); if (b) b.hidden = true; OVERLAY.pop("undo"); }
-
-async function undoLoad() {
-  const list = $("undo-list");
-  if (list) list.innerHTML = `<div class="muted" style="padding:10px">对比中…</div>`;
-  UNDO.diff = null;
-  UNDO.err = "";
-  UNDO.note = "";
-  UNDO.ts = "";                        // ★ 先清掉：否则"这次没有快照"时按钮还是可点的
-  UNDO.scope = state.current ? String(state.current.id) : "";
-  UNDO.root = currentDir();
-  if (!UNDO.scope) {
-    UNDO.err = "先选一个会话 —— 「撤销这一轮」是**按会话**记的。";
-    renderUndo();
-    return;
-  }
-  if (!UNDO.root) {
-    UNDO.err = "这个会话没有工作目录，没法对比工作区。";
-    renderUndo();
-    return;
-  }
-  try {
-    const lst = unwrap(await api(`/snapshot/list?scope=${encodeURIComponent(UNDO.scope)}`));
-    const latest = ((lst && lst.items) || [])[0];
-    if (!latest) {
-      UNDO.note = SET.turnSnap
-        ? "还没有快照 —— 发出第一条消息时面板会自动记录一次。"
-        : "还没有快照。「每轮工作区快照」现在是关着的 —— 在 设置 →「每轮工作区快照」打开它，"
-          + "之后每发一条消息就会先留一次底；破坏性操作的隔离区不受这个开关影响。";
-      renderUndo();
-      return;
-    }
-    UNDO.ts = latest.ts;
-    const d = unwrap(await api(`/snapshot/diff?scope=${encodeURIComponent(UNDO.scope)}`
-      + `&root=${encodeURIComponent(UNDO.root)}`));
-    UNDO.diff = d;
-  } catch (e) {
-    UNDO.err = (e && e.message) ? e.message : String(e);
-  }
-  renderUndo();
-}
-
-function undoWhen(ts) {
-  const t = Number(ts || 0);
-  if (!t) return "";
-  const d = new Date(t * 1000);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-/** 一行改动：⚠ 不给它生成"按路径拼出来的 id" —— `getElementById` 收到的是**字面量**，
- *  用 `CSS.escape()` 转义过的字符串必然找不到元素（这次踩到过）。diff 块就取它的**下一个兄弟**。 */
-function undoRow(kind, cls, label, extra, rel) {
-  return `<div class="u-row" data-upath="${esc(rel)}" data-ukind="${esc(kind)}">
-    <span class="u-kind ${cls}">${label}</span>
-    <span class="u-path" title="${esc(rel)}">${esc(rel)}</span>
-    <span class="u-meta">${extra || ""}</span>
-  </div>`;
-}
-
-function renderUndo() {
-  const box = $("undo-list");
-  const foot = $("undo-foot");
-  const runBtn = $("undo-run");
-  if (!box) return;
-  if (runBtn) runBtn.disabled = !!UNDO.busy || !UNDO.ts;
-  if (UNDO.err) {
-    box.innerHTML = `<div class="muted" style="padding:10px">${esc(UNDO.err)}</div>`;
-    if (foot) foot.textContent = "";
-    return;
-  }
-  if (UNDO.note) {
-    box.innerHTML = `<div class="muted" style="padding:10px">${esc(UNDO.note)}</div>`;
-    if (foot) foot.textContent = "工作目录：" + (UNDO.root || "");
-    return;
-  }
-  const d = UNDO.diff || {};
-  const st = d.stats || {};
-  const n = (st.added || 0) + (st.deleted || 0) + (st.changed || 0) + (st.renamed || 0);
-  if (foot) {
-    foot.textContent = n
-      ? `这一轮：改 ${st.changed || 0} · 增 ${st.added || 0} · 删 ${st.deleted || 0}`
-        + ` · 改名 ${st.renamed || 0}（基准 ${undoWhen(st.base_at)}）`
-      : `没有改动（基准 ${undoWhen(st.base_at)}）· ${UNDO.root}`;
-  }
-  if (!n) {
-    box.innerHTML = `<div class="muted" style="padding:10px">`
-      + `工作区**没有变化** —— 这一轮 agent 没动文件（只聊了天 / 只跑了只读命令）。</div>`;
-    return;
-  }
-  let html = "";
-  const row = (kind, cls, label, extra, rel) =>
-    undoRow(kind, cls, label, extra, rel) + `<div class="u-diff" hidden></div>`;
-  for (const x of (d.changed || [])) {
-    const dl = Number(x.size_before || 0) - Number(x.size || 0);
-    html += row("changed", "ch", "改", `${dl === 0 ? "" : (dl > 0 ? "−" + dl + " B" : "+" + (-dl) + " B")}`, x.path);
-  }
-  for (const x of (d.added || [])) html += row("added", "ad", "增", fmtBytes(x.size || 0), x.path);
-  for (const x of (d.deleted || [])) html += row("deleted", "dl", "删", fmtBytes(x.size || 0), x.path);
-  for (const x of (d.renamed || [])) html += row("renamed", "mv", "名", esc(x.from || ""), x.to);
-  box.innerHTML = html;
-}
-
-/** 点一行：展开 / 收起该文件的行级 diff（diff 块 = 这一行的下一个兄弟）。 */
-async function undoToggleFile(rowEl) {
-  if (!rowEl) return;
-  const rel = rowEl.dataset.upath || "";
-  const box = rowEl.nextElementSibling;
-  if (!box || !box.classList.contains("u-diff")) return;
-  if (!box.hidden) {
-    box.hidden = true;
-    rowEl.classList.remove("open");
-    return;
-  }
-  rowEl.classList.add("open");
-  box.hidden = false;
-  await undoLoadFile(box, rel);
-}
-
-async function undoLoadFile(box, rel) {
-  if (!box) return;
-  box.hidden = false;
-  if (box.dataset.loaded === "1") return;
-  box.innerHTML = `<div class="muted" style="padding:6px 0">读取…</div>`;
-  try {
-    const r = unwrap(await api(`/snapshot/file?scope=${encodeURIComponent(UNDO.scope)}`
-      + `&ts=${encodeURIComponent(UNDO.ts)}&path=${encodeURIComponent(rel)}`));
-    if (r && r.ok && r.lines && r.lines.length) {
-      box.innerHTML = renderDiff(r.lines.join("\n"));
-      box.dataset.loaded = "1";
-    } else {
-      box.innerHTML = `<div class="muted" style="padding:6px 0">${esc((r && r.reason) || "拿不到行级 diff")}</div>`;
-    }
-  } catch (e) {
-    box.innerHTML = `<div class="muted" style="padding:6px 0">读取失败：${esc(e && e.message ? e.message : e)}</div>`;
-  }
-}
-
-async function undoRun() {
-  if (UNDO.busy || !UNDO.ts) return;
-  if (!confirm(`把「${UNDO.root}」退回这一轮开始时的状态？\n\n`
-    + `被删的会恢复、被改的写回旧内容、这一轮新增的会被删掉\n`
-    + `（新增的文件会先自动进隔离区，所以撤销本身也可以再撤回来）`)) return;
-  UNDO.busy = true;
-  renderUndo();
-  try {
-    const r = await api("/snapshot/undo", { method: "POST",
-      body: JSON.stringify({ scope: UNDO.scope, ts: UNDO.ts }) });
-    setBanner(`已撤销这一轮：恢复 ${r.restored || 0} · 删掉新增 ${r.removed || 0}`
-      + ((r.skipped || 0) ? ` · 跳过 ${r.skipped}（内容仓里没有那一版）` : ""));
-    UNDO.busy = false;
-    await undoLoad();
-  } catch (e) {
-    UNDO.busy = false;
-    setBanner("撤销失败：" + (e && e.message ? e.message : e));
-    renderUndo();
-  }
-}
-
 async function loadImport() {
   try {
-    // ★internal=1：一次拿全，前端再按 `internal` 标记拆成两个标签
-    const r = await api("/api/session/remote?internal=1");
+    // ★只列单聊/项目会话；工作流成员 / 群聊 AI 成员有各自的管理界面（不混进来）
+    const r = await api("/api/session/remote");
     IMP.supported = !!(r && r.supported);
     IMP.all = (r && r.sessions) || [];
     IMP.list = IMP.all.filter((x) => !x.internal);
-    IMP.internal = IMP.all.filter((x) => !!x.internal);
+    IMP.internal = [];
     IMP.cursor = (r && r.cursor) || null;
     IMP.err = (r && r.error) || "";
   } catch (e) {
@@ -1287,48 +1291,25 @@ async function loadImport() {
 function renderImport() {
   const box = $("imp-list");
   const cur = $("imp-cur");
-  const tabs = $("imp-tabs");
   if (!box) return;
-  const np = $("imp-n-project"), ni = $("imp-n-internal");
-  if (np) np.textContent = String((IMP.list || []).length);
-  if (ni) ni.textContent = String((IMP.internal || []).length);
-  if (tabs) {
-    Array.prototype.forEach.call(tabs.querySelectorAll("[data-imp-tab]"), (b) => {
-      b.classList.toggle("on", String(b.dataset.impTab) === String(IMP.tab));
-    });
-  }
   if (IMP.supported === false) {
-    if (tabs) tabs.hidden = true;
     if (cur) cur.textContent = IMP.err || "当前 agent / 引擎不支持列会话（session/list）";
     box.innerHTML = `<div class="muted" style="padding:10px">`
       + `只有 ACP 引擎 + 支持 <code>session/list</code> 的 agent 才能列出来。`
       + `（OpenCode 自带的 ACP 支持；Codex 也支持）</div>`;
     return;
   }
-  if (tabs) tabs.hidden = false;
-  const internal = IMP.tab === "internal";
-  const rows = internal ? (IMP.internal || []) : (IMP.list || []);
+  const rows = IMP.list || [];
   const n = rows.length;
   const fresh = rows.filter((x) => !x.imported).length;
   if (cur) {
     if (IMP.err) cur.textContent = IMP.err;
-    else if (internal) {
-      cur.textContent = n
-        ? `内部会话 ${n} 条（群聊 AI 成员 / 本地协作——通常不需要接续到项目列表）`
-        : "没有内部会话（群聊 AI 成员 / 本地协作）";
-    } else {
-      cur.textContent = n
-        ? `项目会话 ${n} 条${fresh ? `，其中 ${fresh} 条还没接续` : "（都已在面板里）"}`
-          + ((IMP.internal || []).length ? `　·　另有 ${IMP.internal.length} 条内部会话（另一个标签）` : "")
-        : ((IMP.internal || []).length
-          ? `没有项目会话；内部会话有 ${IMP.internal.length} 条（点上面的「内部会话」看）`
-          : "agent 侧没有会话");
-    }
+    else cur.textContent = n
+      ? `单聊 / 项目会话 ${n} 条${fresh ? `，其中 ${fresh} 条还没接续` : "（都已在面板里）"}`
+      : "agent 侧没有单聊 / 项目会话";
   }
   if (!n) {
-    box.innerHTML = `<div class="muted" style="padding:10px">`
-      + (internal ? "没有内部会话。" : "agent 那边没有项目会话。")
-      + `</div>`;
+    box.innerHTML = `<div class="muted" style="padding:10px">agent 那边没有单聊 / 项目会话。</div>`;
     return;
   }
   box.innerHTML = rows.map((s) => {
@@ -1336,13 +1317,16 @@ function renderImport() {
     const when = s.updatedAt ? String(s.updatedAt).replace("T", " ").slice(0, 16) : "";
     const hist = Number(s.messages || 0);
     const histTip = hist ? `<span class="muted" style="font-size:11px">对面 ${hist} 条历史</span>` : "";
-    return `<div class="agents-row${s.imported ? " on" : ""}${s.internal ? " imp-internal" : ""}" data-imp="${esc(s.id)}">`
-      + `<div class="an"><span class="dot ${s.internal ? "" : "ok"}"></span>${esc(title)}`
-      + (s.internal ? `<span class="badge">内部</span>` : "")
+    return `<div class="agents-row${s.imported ? " on" : ""}" data-imp="${esc(s.id)}">`
+      + `<div class="an"><span class="dot ok"></span>${esc(title)}`
       + `<span class="muted" style="font-size:11px">${esc(s.id)}</span>`
       + histTip
       + `<span class="muted" style="font-size:11px;margin-left:auto">`
-      + `${s.imported ? "已接续 · 点开" : "点一下接续"}</span></div>`
+      + `${s.imported ? "已接续 · 点开" : "点一下接续"}</span>`
+      // ★在 agent 侧删除（测试留下的 / 不想再接续的会话）；不碰面板本地记录
+      + `<button type="button" class="p-x" data-imp-del="${esc(s.id)}" `
+      + `title="从 agent 侧删除这条会话（不可撤销）">×</button>`
+      + `</div>`
       + `<div class="ab">${esc(s.cwd || "")}${when ? "　·　" + esc(when) : ""}</div>`
       + `</div>`;
   }).join("");
@@ -1378,6 +1362,27 @@ async function doImport(remoteId) {
     if (local.id) await openSession(local.id);
   } catch (e) {
     if (cur) cur.textContent = "接续失败：" + (e && e.message ? e.message : e);
+  }
+}
+
+/** ★从 **agent 侧**删除一条会话（「接续」列表里的 ×）。
+ *  只删 agent 那边；如果这条已经在面板里接续过，左边列表里那条要单独删。 */
+async function impDeleteRemote(id) {
+  const s = (IMP.all || []).find((x) => String(x.id) === String(id)) || {};
+  const title = s.title || id;
+  const warn = s.imported
+    ? "\n\n⚠ 这条已经接续进面板：这里只删 agent 那边，左边列表里的那条要单独删。"
+    : "";
+  if (!confirm(`从 agent 侧删除会话「${title}」？\n\n删了它就不会再出现在「接续」列表（对话历史也一并删除，无法撤销）。${warn}`)) return;
+  try {
+    await api("/api/session/remote/delete", { method: "POST",
+      body: JSON.stringify({ id: s.id || id }) });
+    setBanner(`已从 agent 侧删除：${title}`, { ms: 6000 });
+    await loadImport();
+    loadSessions();
+  } catch (e) {
+    setBanner("删除失败：" + ((e && e.message) || e)
+      + (typeof backendStaleHint === "function" ? backendStaleHint("") : ""), { sticky: true });
   }
 }
 
@@ -1659,7 +1664,7 @@ function closeAgentsNew() {
 /* ---------------- ★面板内安装 Agent（联网 npm；装到 agents\npm\<id>） ---------------- */
 
 const AINST = {
-  items: [], job: null, timer: null, err: "",
+  items: [], bundled: [], job: null, timer: null, err: "", node: null, auto: null, nodeBusy: false, nodeJob: null,
   stop() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } },
 };
 
@@ -1668,6 +1673,7 @@ async function loadInstallCatalog() {
   try {
     const r = unwrap(await api("/agent/catalog")) || {};
     AINST.items = r.items || [];
+    AINST.bundled = r.bundled || [];
     AINST.err = "";
     if (r.status && r.status.busy) { AINST.job = r.status; AINST.poll(); }
     else if (r.status && r.status.phase) AINST.job = r.status;
@@ -1682,6 +1688,8 @@ async function loadInstallCatalog() {
   }
   renderInstallCatalog();
   renderInstallLog();
+  loadNodeInfo();                 // ★ Node 运行时：当前版本 / 更新 / 回滚
+  loadAgentAuto();                // ★ 后台检查 / 自动更新配置
   loadAgentVersions();            // ★ 顺带问一下「有没有新版」（网络，慢也没关系：先显示已装）
 }
 
@@ -1701,6 +1709,8 @@ async function loadAgentVersions(force) {
         latest: v.latest || "",
         hasUpdate: !!v.hasUpdate,
         pkg: v.pkg || it.pkg || "",
+        hasBackup: !!v.hasBackup || !!it.hasBackup,
+        backupVersion: v.backupVersion || it.backupVersion || "",
       });
     });
     // 目录里有、但「可装目录」里没列出来的（自定义 npm 包）也补进来，让它们同样能更新
@@ -1725,15 +1735,204 @@ async function agentCheckUpdates() {
   }
 }
 
+/* ---------------- ★Node 运行时 + 自动更新（2026-11-03） ---------------- */
+async function loadNodeInfo() {
+  try {
+    const r = unwrap(await api("/node/info")) || {};
+    AINST.node = r;
+    renderNode();
+  } catch { /* 老后端没有这个接口 */ }
+  // 如果上次关掉弹窗时更新还在跑，这里恢复轮询
+  try {
+    const s = unwrap(await api("/node/status")) || {};
+    if (s.busy) {
+      AINST.nodeJob = s;
+      AINST.nodeBusy = true;
+      renderNode();
+      nodePoll();
+    }
+  } catch { /* 老后端 */ }
+}
+
+function renderNode() {
+  const n = AINST.node || {};
+  const job = AINST.nodeJob || {};
+  const busy = !!(AINST.nodeBusy || job.busy);
+  const cur = (n.current && n.current.version) || "";
+  const latest = n.latest || "";
+  const curEl = $("anew-node-cur"), latEl = $("anew-node-latest"), note = $("anew-node-note");
+  if (curEl) curEl.textContent = cur ? `当前 ${cur}` : "当前未知";
+  if (latEl) latEl.textContent = latest ? `最新 ${latest}` : "";
+  const hasNew = !!(cur && latest
+    && latest.replace(/^v/, "").localeCompare(cur.replace(/^v/, ""), undefined, { numeric: true }) > 0);
+  const up = $("anew-node-up"), back = $("anew-node-back"), chk = $("anew-node-check");
+  if (up) up.disabled = !hasNew || busy;
+  if (back) back.disabled = !(n.backups && n.backups.length) || busy;
+  if (chk) chk.disabled = busy;
+  if (note) {
+    if (busy && job.busy) {
+      const pct = typeof job.percent === "number" ? job.percent : null;
+      const mb = job.bytesTotal
+        ? ` · ${(job.bytesDone / 1048576).toFixed(1)}/${(job.bytesTotal / 1048576).toFixed(1)} MB`
+        : "";
+      note.textContent = `${job.phase || "更新中"}${pct !== null ? " · " + pct + "%" : ""}` + mb
+        + (job.elapsed ? ` · ${job.elapsed}s` : "")
+        + (job.detail ? ` · ${job.detail}` : "");
+    } else {
+      const b = (n.backups || [])[0];
+      note.textContent = b ? `旧版本备份：${b.name}（可回滚）`
+        : "更新会先收起 ACP 子进程；旧版本会备份，可回滚。";
+    }
+  }
+  const bar = $("anew-node-bar"), fill = bar && bar.querySelector("i");
+  if (bar && fill) {
+    bar.hidden = !busy;
+    bar.classList.toggle("indet", busy && typeof job.percent !== "number");
+    fill.style.width = (typeof job.percent === "number") ? `${job.percent}%` : "40%";
+  }
+}
+
+async function nodeCheck() {
+  try {
+    const r = unwrap(await api("/node/check?force=1")) || {};
+    AINST.node = Object.assign({}, AINST.node || {}, r);
+    renderNode();
+    setBanner(r.hasUpdate ? `Node 有新版 ${r.latest}（当前 ${r.current || "?"}）` : "Node 已是最新（LTS）", { ms: 7000 });
+  } catch (e) { setBanner("检查 Node 失败：" + ((e && e.message) || e), { sticky: true }); }
+}
+
+async function nodeApply() {
+  if (AINST.nodeBusy) return;
+  const n = AINST.node || {};
+  const curMajor = String((n.current && n.current.version) || "").replace(/^v/, "").split(".")[0];
+  const newMajor = String(n.latest || "").replace(/^v/, "").split(".")[0];
+  if (curMajor && newMajor && curMajor !== newMajor
+    && !confirm(`Node ${curMajor}.x → ${newMajor}.x 是跨大版本升级。\n\n`
+      + "上游 agent 未必马上兼容；更新后如果跑不起来，可以点「回滚」回到旧版本。继续吗？")) return;
+  if (!confirm(`更新 Node 运行时${n.latest ? " 到 " + n.latest : ""}？\n\n`
+    + "会先收起正在跑的 ACP 子进程（会话可能中断）；旧版本会备份，可回滚。")) return;
+  AINST.nodeBusy = true;
+  AINST.nodeJob = { busy: true, phase: "准备", percent: 0, elapsed: 0, detail: "" };
+  renderNode();
+  try {
+    await api("/node/apply", { method: "POST",
+      body: JSON.stringify({ version: n.latest || "" }) });
+    nodePoll();
+  } catch (e) {
+    AINST.nodeBusy = false; AINST.nodeJob = null; renderNode();
+    setBanner("更新 Node 失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function nodePoll() {
+  try {
+    const s = unwrap(await api("/node/status")) || {};
+    AINST.nodeJob = s;
+    AINST.nodeBusy = !!s.busy;
+    renderNode();
+    if (s.busy) { setTimeout(nodePoll, 500); return; }
+    AINST.nodeBusy = false;
+    await loadNodeInfo();
+    if (s.ok) {
+      setBanner(`Node 已更新到 ${s.version || "?"}（旧版本已备份，可回滚）`, { ms: 9000 });
+    } else if (s.error) {
+      setBanner("更新 Node 失败：" + s.error, { sticky: true });
+    }
+  } catch (e) {
+    AINST.nodeBusy = false;
+    renderNode();
+    setBanner("读取 Node 进度失败：" + ((e && e.message) || e), { sticky: true });
+  }
+}
+
+async function nodeRollback() {
+  if (AINST.nodeBusy) return;
+  if (!confirm("回滚 Node 到上一版？会先收起 ACP 子进程。")) return;
+  AINST.nodeBusy = true; renderNode();
+  try {
+    const r = unwrap(await api("/node/rollback", { method: "POST", body: JSON.stringify({}) })) || {};
+    setBanner(`已回滚 Node 到 ${r.version || "上一版"}`, { ms: 9000 });
+    await loadNodeInfo();
+  } catch (e) { setBanner("回滚 Node 失败：" + ((e && e.message) || e), { sticky: true }); }
+  finally { AINST.nodeBusy = false; renderNode(); }
+}
+
+async function loadAgentAuto() {
+  try { AINST.auto = unwrap(await api("/agent/auto")) || {}; renderAgentAuto(); } catch { /* ignore */ }
+}
+
+function renderAgentAuto() {
+  const a = AINST.auto || {};
+  const c = $("anew-auto-check"), i = $("anew-auto-install");
+  if (c) { c.classList.toggle("on", !!a.check); c.textContent = "后台检查：" + (a.check ? "开" : "关"); }
+  if (i) {
+    i.classList.toggle("on", !!a.autoInstall);
+    i.textContent = "自动更新：" + (a.autoInstall ? "开（" + (a.channel === "all" ? "全部" : "patch") + "）" : "关");
+  }
+}
+
+async function toggleAgentAuto(kind) {
+  const cur = AINST.auto || {};
+  const body = { [kind]: !cur[kind] };
+  if (kind === "autoInstall" && body[kind] && !cur.check) body.check = true;
+  try {
+    AINST.auto = unwrap(await api("/agent/auto", { method: "POST", body: JSON.stringify(body) })) || {};
+    renderAgentAuto();
+    setBanner(kind === "autoInstall"
+      ? (AINST.auto.autoInstall ? "已开启自动更新：只在空闲时更新，默认只装 patch" : "已关闭自动更新")
+      : (AINST.auto.check ? "已开启后台检查（每 6 小时）" : "已关闭后台检查"), { ms: 7000 });
+  } catch (e) { setBanner("保存失败：" + ((e && e.message) || e), { sticky: true }); }
+}
+
+async function agentRollback(id) {
+  if (!confirm(`回滚 ${id} 到上一版？\n\n会先收起正在跑的 ACP 子进程。`)) return;
+  try {
+    const r = unwrap(await api("/agent/rollback", { method: "POST",
+      body: JSON.stringify({ id }) })) || {};
+    setBanner(`已回滚 ${id} 到 ${r.version || "上一版"}`, { ms: 9000 });
+    await loadInstallCatalog();
+  } catch (e) { setBanner("回滚失败：" + ((e && e.message) || e), { sticky: true }); }
+}
+
+/** 启动时优先读缓存（不联网）；没有缓存就 20 秒后再联网查一次。 */
+async function agentBootCheck(net) {
+  try {
+    const r = unwrap(await api("/agent/updates" + (net ? "" : "?cached=1"))) || {};
+    const n = (r.items || []).length + (r.node && r.node.hasUpdate ? 1 : 0);
+    if (n) {
+      setBanner(`有 ${n} 项可以更新（Agent / Node）—— 点这里打开`, {
+        clickable: true, sticky: true, onClick: () => openAgentsNew(),
+      });
+      return;
+    }
+    if (!net) setTimeout(() => agentBootCheck(true), 20000);
+  } catch { /* 老后端 */ }
+}
+
+function initAgentUpdates() {
+  setTimeout(() => { agentBootCheck(false); }, 4000);
+}
+
 function renderInstallCatalog() {
   const box = $("anew-i-list");
   if (!box) return;
-  if (!AINST.items.length) {
+  const busy = !!(AINST.job && AINST.job.busy);
+  const bundled = (AINST.bundled || []).map((b) => {
+    const btn = b.installed
+      ? `<button type="button" class="anew-i-b" data-ainst-go="${esc(b.managed)}" title="装一份可独立更新的 npm 版到 agents/npm/（不覆盖随包目录）">装可更新版</button>`
+      : "";
+    return `<div class="anew-i-row"><b>${esc(b.label)}</b><span class="anew-i-tag ok">随包</span>`
+      + (b.version ? `<span class="anew-i-ver">v${esc(b.version)}</span>` : "")
+      + `<span class="anew-i-note">${esc(b.note)}</span>${btn}</div>`;
+  }).join("");
+  const head = bundled
+    ? `<div class="anew-bundled-hd">随包 agent（默认随 cocraft 更新；要独立更新就装「可更新版」）</div>${bundled}`
+    : "";
+  if (!AINST.items.length && !bundled) {
     box.innerHTML = `<div class="muted" style="padding:4px 0">${esc(AINST.err || "没有可安装项")}</div>`;
     return;
   }
-  const busy = !!(AINST.job && AINST.job.busy);
-  box.innerHTML = AINST.items.map((it) => {
+  box.innerHTML = head + AINST.items.map((it) => {
     const hasNew = !!(it.hasUpdate && it.latest);
     const tag = it.installed
       ? `<span class="anew-i-tag ok">已装</span>`
@@ -1743,10 +1942,13 @@ function renderInstallCatalog() {
           : (it.latest ? `<span class="anew-i-tag" title="${esc(it.latest)}">已是最新</span>` : ""))
       : (it.ready ? "" : `<span class="anew-i-tag bad">缺 Node</span>`);
     const off = `<button type="button" class="anew-i-b" data-ainst-off="${esc(it.id)}" title="从注册表移除并删掉装的文件">卸载</button>`;
+    const back = it.hasBackup
+      ? `<button type="button" class="anew-i-b" data-ainst-back="${esc(it.id)}" title="回滚到 ${esc(it.backupVersion || "上一版")}">回滚</button>`
+      : "";
     const btn = it.installed
       ? (hasNew
         ? `<button type="button" class="anew-i-b up" data-ainst-up="${esc(it.id)}" title="npm 装最新版（${esc(it.pkg || it.id)}@latest）"${busy ? " disabled" : ""}>更新</button>`
-        : "") + off
+        : "") + back + off
       : `<button type="button" class="anew-i-b" data-ainst-go="${esc(it.id)}"${(busy || !it.ready) ? " disabled" : ""}>安装</button>`;
     return `<div class="anew-i-row">`
       + `<b>${esc(it.label)}</b>${tag}`
@@ -1768,7 +1970,18 @@ function renderInstallLog() {
     : (j.ok
       ? `${upd ? "更新完成" : "装好了"}：${esc(j.agent || j.id)}${j.version ? " · v" + esc(j.version) : ""}`
       : `${upd ? "更新" : "安装"}失败（${esc(j.error || j.phase || "")}）`);
+  const pct = (typeof j.percent === "number") ? Math.max(0, Math.min(100, j.percent)) : null;
+  const meta = [];
+  if (j.detail) meta.push(j.detail);
+  if (j.elapsed) meta.push("已用 " + j.elapsed + "s");
+  if (j.packages) meta.push(j.packages + " 个包");
+  const bar = j.busy
+    ? `<div class="anew-i-bar${pct === null ? " indet" : ""}"><i style="width:${pct === null ? 40 : pct}%"></i></div>`
+    : "";
+  const metaLine = (j.busy && meta.length)
+    ? `<div class="anew-i-meta">${esc(meta.join(" · "))}</div>` : "";
   box.innerHTML = `<div class="anew-i-lh${j.ok ? " ok" : (j.busy ? "" : " bad")}">${head}</div>`
+    + bar + metaLine
     + `<pre class="anew-i-pre">${esc(lines.join("\n") || "…")}</pre>`;
   box.hidden = false;
 }
@@ -1795,7 +2008,7 @@ function AINST_poll() {
     } catch (e) {
       AINST.stop();
     }
-  }, 1000);
+  }, 500);
 }
 AINST.poll = AINST_poll;
 
@@ -2195,7 +2408,7 @@ function renderSettings() {
    ["wpc-always", SET.liveAlways],
    ["cfg-petals", SET.petals], ["cfg-gold", SET.gold], ["cfg-bamboo", SET.bamboo],
    ["cfg-zh", SET.zh], ["cfg-glass", SET.glass],
-   ["cfg-turnsnap", SET.turnSnap]].forEach(([id, on]) => {
+   ["cfg-turnsnap", SET.turnSnap], ["cfg-auto-delete", true]].forEach(([id, on]) => {
     const b = $(id);
     if (!b) return;
     b.classList.toggle("on", !!on);
@@ -2240,6 +2453,36 @@ function cfgClose() {
   document.documentElement.classList.remove("cfg-open");
   syncDrawerOverlap();
   OVERLAY.pop("cfg");
+}
+
+/** ★哪些弹层打开时**先把设置抽屉收起来**（关掉再还原）。
+ *  它们都是居中 / 铺满的对话框 —— 不收起就会压在右侧设置抽屉上，两层字叠字，
+ *  用户实测直接踩到两个：「＋ 添加凭据」和「权限与批准（信任面板）」。
+ *  ⚠ **不收** 的那几个是有意的：`trace` 是左侧独立页（不和右侧抽屉打架）、
+ *  `copy-fb`（剪贴板兜底）与 `editq`（把提问放回输入框）不是对话框、`newsess` 见下（其实也收）。
+ *  以后新增居中弹层：把 id 加进这个集合就行（`OVERLAY.push` 会自动调用）。 */
+const CFG_YIELD_OVERLAYS = new Set([
+  "cred", "trust", "audit", "mode", "skill", "import", "quar", "setup",
+  "agents", "agents-new", "agent-edit", "themes", "wpc", "wp", "mdl", "cu", "newsess", "restore", "sessmgr",
+]);
+let CFG_YIELD = 0;                        // 计数：A→B 连着开两层时，只有最后一层关掉才还原
+
+/** 弹层要打开了 → 若设置开着就先收起来。返回**是否真的收过**（`OVERLAY.push` 记这笔账）。 */
+function cfgYieldToOverlay(id) {
+  if (!CFG_YIELD_OVERLAYS.has(String(id))) return false;
+  if (!cfgIsOpen()) return false;
+  cfgClose();
+  CFG_YIELD += 1;
+  return true;
+}
+
+/** 弹层关掉了 → 把刚才收起的设置还原（只还原我们自己收的那次）。 */
+function cfgRestoreFromOverlay() {
+  if (CFG_YIELD <= 0) return;
+  CFG_YIELD -= 1;
+  if (CFG_YIELD > 0) return;
+  if (cfgIsOpen()) return;                // 用户自己又打开了 → 别重复开
+  cfgOpen();
 }
 
 /** ★壁纸与外观独立页（`#wpc`）：那些行**静态就写在 `#wpc-body` 里**（背景 / 外观 / 身份与素材 /
@@ -2357,6 +2600,11 @@ function initSettings() {
   });
   $("anew-reload").addEventListener("click", loadCandidates);
   $("anew-i-check").addEventListener("click", agentCheckUpdates);  $("anew-folder").addEventListener("click", addFromFolder);
+  $("anew-node-check").addEventListener("click", nodeCheck);
+  $("anew-node-up").addEventListener("click", nodeApply);
+  $("anew-node-back").addEventListener("click", nodeRollback);
+  $("anew-auto-check").addEventListener("click", () => toggleAgentAuto("check"));
+  $("anew-auto-install").addEventListener("click", () => toggleAgentAuto("autoInstall"));
   $("anew-addall").addEventListener("click", addAllCandidates);
   // ★面板内安装 agent：点「安装」/「更新」/「卸载」
   $("anew-i-list").addEventListener("click", (e) => {
@@ -2364,6 +2612,8 @@ function initSettings() {
     if (go && !go.disabled) { agentInstall(go.dataset.ainstGo); return; }
     const up = e.target.closest && e.target.closest("[data-ainst-up]");
     if (up && !up.disabled) { agentUpdate(up.dataset.ainstUp); return; }
+    const bk = e.target.closest && e.target.closest("[data-ainst-back]");
+    if (bk && !bk.disabled) { agentRollback(bk.dataset.ainstBack); return; }
     const off = e.target.closest && e.target.closest("[data-ainst-off]");
     if (off) agentUninstall(off.dataset.ainstOff);
   });
@@ -2407,24 +2657,26 @@ function initSettings() {
   }));
   $("imp-close").addEventListener("click", closeImport);
   $("imp-reload").addEventListener("click", loadImport);
-  const impTabs = $("imp-tabs");
-  if (impTabs) impTabs.addEventListener("click", (e) => {
-    const b = e.target.closest("[data-imp-tab]");
-    if (!b) return;
-    IMP.tab = String(b.dataset.impTab) === "internal" ? "internal" : "project";
-    renderImport();
-  });
   $("import").addEventListener("click", (e) => { if (e.target === $("import")) closeImport(); });
   $("imp-list").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-imp-del]");
+    if (del) { e.stopPropagation(); impDeleteRemote(del.dataset.impDel); return; }
     const row = e.target.closest("[data-imp]");
     if (row) doImport(row.dataset.imp);
   });
   $("quar-close").addEventListener("click", quarClose);
   $("quar-reload").addEventListener("click", quarLoad);
+  $("quar-snap-toggle").addEventListener("click", quarToggleSnap);
+  // ★低风险删除：策略开关 / 保留天数 / 立即清理（`ui 0.2.95`）
+  $("quar-auto").addEventListener("click", quarToggleAuto);
+  $("quar-days").addEventListener("change", quarSaveDays);
+  $("quar-cleanup").addEventListener("click", quarCleanupNow);
+  $("cfg-auto-delete").addEventListener("click", quarToggleAuto);
+  $("cfg-quar-open").addEventListener("click", () => quarOpen());
   $("quar").addEventListener("click", (e) => { if (e.target === $("quar")) quarClose(); });
   $("quar-open").addEventListener("click", async () => {
     const dir = (QUAR.stats && QUAR.stats.quarantine_dir) || "";
-    if (!dir) { setBanner("隔离区目录还没生成（还没隔离过任何东西）"); return; }
+    if (!dir) { setBanner("忏悔室目录还没生成（还没隔离过任何东西）"); return; }
     try {
       await api("/open/dir", { method: "POST", body: JSON.stringify({ what: "explorer", dir }) });
     } catch (e) {
@@ -2436,14 +2688,6 @@ function initSettings() {
     if (r) { quarRestore(r.dataset.qrestore); return; }
     const d = e.target.closest("[data-qdrop]");
     if (d) quarDrop(d.dataset.qdrop);
-  });
-  $("undo-close").addEventListener("click", undoClose);
-  $("undo-reload").addEventListener("click", undoLoad);
-  $("undo-run").addEventListener("click", undoRun);
-  $("undo").addEventListener("click", (e) => { if (e.target === $("undo")) undoClose(); });
-  $("undo-list").addEventListener("click", (e) => {
-    const row = e.target.closest("[data-upath]");
-    if (row) undoToggleFile(row);
   });
   // ★模型凭据（多 Key）：添加 / 编辑 / 删除 / 设默认
   $("cred-add").addEventListener("click", () => openCredEdit(""));
@@ -2474,7 +2718,6 @@ function initSettings() {
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (!$("quar").hidden) { quarClose(); return; }
-    if (!$("undo").hidden) { undoClose(); return; }
     if (!$("mode").hidden) { closeModes(); return; }
     if (!$("import").hidden) { closeImport(); return; }
     if (!$("agent-edit").hidden) { closeAgentEdit(); return; }
@@ -2509,8 +2752,8 @@ function initSettings() {
   $("cfg-turnsnap").addEventListener("click", () => {
     setSetting("turnSnap", !SET.turnSnap);
     setBanner(SET.turnSnap
-      ? "已打开「每轮工作区快照」：下次发消息前会先给工作目录留一次底（工具 →「撤销这一轮」）"
-      : "已关闭「每轮工作区快照」：只保留破坏性操作的隔离区");
+      ? "已打开「每轮工作区快照」：下次发消息前会先给工作目录留一次底（供忏悔室显示版本）"
+      : "已关闭「每轮工作区快照」：只保留破坏性操作的忏悔室");
   });
   $("cfg-zh").addEventListener("click", () => {
     setSetting("zh", !SET.zh);
@@ -2569,7 +2812,7 @@ async function initLiveBg() {
   let rampTimer = null;
   let fadeTimer = null;
 
-  const themeNow = () => "hiru";      // 夜主题已删除
+  const themeNow = () => "hiru";      // 壁纸槽位（只有一个槽；`hiru` 是历史 id，后端 `/live/pick` 仍认它）
   const urlOf = (t) => ((urls && urls[t]) || "");
   const kindOf = (t) => ((urls && urls[t + "Kind"]) || "video");   // video | scene
   const other = (v) => (v === A ? B : A);
@@ -2905,8 +3148,8 @@ async function initLiveBg() {
 function initStaticBg() {
   const root = document.documentElement;
   const apply = () => {
-    // ★静态背景槽跟着**内置主题**走：chapel → 暗调版（同一张官方壁纸），hiru → 和纸浅纱
-    const t = root.dataset.theme === "hiru" ? "hiru" : "chapel";
+    // ★静态背景槽：`ui 0.2.123` 起只有一个内置主题 → 恒用 chapel 槽（暗调版，同一张官方壁纸）
+    const t = "chapel";
     document.querySelectorAll("#static-bg .sb").forEach((el) => el.classList.toggle("on", el.dataset.bg === t));
   };
   new MutationObserver(apply).observe(root, { attributes: true, attributeFilter: ["data-theme"] });

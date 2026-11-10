@@ -2,7 +2,7 @@
 
 /* ---------------- 内置主题 + 用户主题（主题工坊） ----------------
  * 两条属性：
- *   html[data-theme]      = hiru            —— 「底盘」（**夜主题已删除，只剩昼**），决定内置样式与背景槽
+ *   html[data-theme]      = chapel          —— 唯一定盘（`ui 0.2.123` 删掉了「和纸白昼」）
  *   html[data-theme-user] = <用户主题 id>    —— 用户主题身份（变量 / 图标 / 背景覆盖）
  * 用户变量注入在 [data-theme-user] 下（特异性更高）覆盖内置变量。详见 docs/THEMES.md。 */
 
@@ -59,12 +59,16 @@ function setThemeStyle(css) {
   el.textContent = css || "";
 }
 
-/** 主题自带背景：覆盖静态背景槽与 #live-bg 的兜底图。 */
+/** 主题自带背景：覆盖静态背景槽与 #live-bg 的兜底图。
+ *  ⚠ `ui 0.2.123` 起只有一个定盘（chapel）：两个槽都写 + `#live-bg` 无条件兜底，
+ *    免得用户主题的背景因为"底盘改名"而失效。 */
 function _themeBgCss(bg) {
   let css = "";
   if (bg && bg.light) {
-    css += '#static-bg .sb[data-bg="hiru"]{background-image:url("' + bg.light + '");}\n';
-    css += 'html[data-theme="hiru"] #live-bg{background-image:url("' + bg.light + '");}\n';
+    const u = 'url("' + bg.light + '")';
+    css += '#static-bg .sb[data-bg="chapel"]{background-image:' + u + ';}\n';
+    css += '#static-bg .sb[data-bg="hiru"]{background-image:' + u + ';}\n';
+    css += '#live-bg{background-image:' + u + ';}\n';
   }
   return css;
 }
@@ -88,12 +92,11 @@ function clearUserTheme() {
   } catch { /* ignore */ }
 }
 
-/* ---------------- 内置主题（0.2.47） ----------------
- * `chapel` = 「圣烛教堂」（**默认**，暗色）；`hiru` = 「和纸白昼」（原来的浅色，保留）。
- * ⚠ 夜主题 `yoru` 早已删除，别再当底盘用。 */
-const BUILTIN_THEMES = ["chapel", "hiru"];
-const BUILTIN_THEME_NAMES = { chapel: "圣烛教堂", hiru: "和纸白昼" };
-const THEME_SEEN_KEY = "cocraft.themeSeen";
+/* ---------------- 内置主题（`ui 0.2.123`：只剩「圣烛教堂」） ----------------
+ * 以前还有 `hiru`「和纸白昼」，已按用户要求**删除**：现在 `data-theme` 恒为 `chapel`，
+ * 老浏览器里存着 "hiru" 的会被 `normThemeId()` 归一成 chapel（不弹提示、不留残影）。 */
+const BUILTIN_THEMES = ["chapel"];
+const BUILTIN_THEME_NAMES = { chapel: "圣烛教堂" };
 
 function normThemeId(id) {
   const t = String(id || "").trim();
@@ -147,22 +150,8 @@ function initThemeCards() {
   syncThemeCards();
 }
 
-/** 老用户提示：以前存的是 `hiru` → 侧栏一条可点的小提示（"换成圣烛教堂"），只提示一次。
- *  为什么不用顶部横幅：横幅是**单槽**，启动时会被"已连接 / 更新"这类提示顶掉；侧栏这条能一直挂着直到点掉/关掉。 */
-function themeHintOnce(saved) {
-  const box = $("theme-hint");
-  if (!box) return;
-  let seen = "";
-  try { seen = localStorage.getItem(THEME_SEEN_KEY) || ""; } catch { /* ignore */ }
-  if (!seen) { try { localStorage.setItem(THEME_SEEN_KEY, "1"); } catch { /* ignore */ } }
-  if (seen || (saved && saved !== "hiru")) { box.hidden = true; return; }
-  box.hidden = false;
-  const hide = () => { box.hidden = true; };
-  const go = box.querySelector("[data-theme-hint-go]");
-  if (go) go.addEventListener("click", () => { hide(); pickBuiltinTheme("chapel"); });
-  const x = box.querySelector("[data-theme-hint-x]");
-  if (x) x.addEventListener("click", hide);
-}
+/** 老浏览器里存的 `hiru` 已经没意义了 → `normThemeId()` 会归一成 chapel，这里什么都不用做。
+ *  以前这里会弹「新增主题」提示条（`#theme-hint`），`ui 0.2.123` 起随「和纸白昼」一起删除。 */
 
 /** 应用一个用户主题（从后端取变量 / CSS / 图标 / 背景）；`mode` 指定明或暗。 */
 async function applyUserTheme(id, mode) {
@@ -172,7 +161,7 @@ async function applyUserTheme(id, mode) {
   if (!r || !r.ok) throw new Error((r && r.error) || "主题读取失败");
   _userThemeModes = (Array.isArray(r.modes) && r.modes.length) ? r.modes : [r.mode];
   _userThemeMode = r.mode;
-  _setBaseTheme("hiru");                 // 只有一个「昼」底盘
+  _setBaseTheme("chapel");               // 唯一定盘（用户主题在上面叠变量）
   document.documentElement.dataset.themeUser = id;
   setThemeStyle(_themeCss(id, r));
   setThemeIcons(r.icons);
@@ -192,10 +181,9 @@ function initTheme() {
     umode = localStorage.getItem(THEME_USER_MODE_KEY) || "";
     saved = localStorage.getItem(THEME_KEY) || "";
   } catch { /* ignore */ }
-  applyTheme(saved || BUILTIN_THEMES[0]);      // 没存过 → 圣烛教堂（新默认）
+  applyTheme(saved || BUILTIN_THEMES[0]);      // 没存过 / 存着旧的 "hiru" → 圣烛教堂
   if (user) applyUserTheme(user, umode).catch(() => { clearUserTheme(); });
   initThemeCards();
-  themeHintOnce(saved);
 }
 
 /* ---------------- 主题工坊（浏览 / 安装 / 套用 / 卸载） ---------------- */
@@ -276,7 +264,7 @@ function renderThemes() {
   if (cur) {
     const user = themeUser();
     cur.textContent = TH.err ? ("读取失败：" + TH.err)
-      : (user ? ("当前：用户主题 " + user) : ("当前：内置 " + (TH.active || "hiru")));
+      : (user ? ("当前：用户主题 " + user) : ("当前：内置 " + (TH.active || "chapel")));
   }
   const foot = $("th-foot");
   if (foot) foot.textContent = "内置 " + TH.builtin.length + " · 已安装 " + TH.installed.length;
@@ -434,7 +422,7 @@ function initThemes() {
   });
   const rst = $("th-reset");
   if (rst) rst.addEventListener("click", () => {
-    applyTheme("hiru");
+    applyTheme("chapel");
     setBanner("已恢复内置主题");
     renderThemes();
   });
@@ -503,18 +491,21 @@ function syncToolsBtn() {
   if (b) b.classList.toggle("on", !!(TERM.open || CODE.open));
 }
 
-/** 工具菜单（扳手）：面板终端 / 编码模式。打开期间保持展开，方便两个都切。 */
+/** 工具菜单（扳手）：在线协作 / 音乐 + 面板终端 / 编码模式。
+ *  ★ 原来顶栏那个「工具」方阵按钮（#btn-hub / #hub-menu）已删，两项收进这里。 */
 function initToolsMenu() {
   const btn = $("btn-tools");
   const menu = $("tools-menu");
   if (!btn || !menu) return;
   const refresh = () => {
     $("tm-dir").textContent = (CODE.open && CODE.root) ? CODE.root : (currentDir() || "（当前会话没有工作目录）");
-    const t = $("tm-term"), c = $("tm-code"), q = $("tm-quar"), u = $("tm-undo");
+    const t = $("tm-term"), c = $("tm-code"), q = $("tm-quar");
     if (t) t.classList.toggle("on", !!TERM.open);
     if (c) c.classList.toggle("on", !!CODE.open);
     if (q) q.classList.toggle("on", !!($("quar") && !$("quar").hidden));
-    if (u) u.classList.toggle("on", !!($("undo") && !$("undo").hidden));
+    const ch = $("tm-chat"), mu = $("tm-music");
+    if (ch) ch.classList.toggle("on", !!(typeof cocraftIsOpen === "function" && cocraftIsOpen()));
+    if (mu) mu.classList.toggle("on", !!MUSIC.shown);
   };
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -526,43 +517,24 @@ function initToolsMenu() {
     e.stopPropagation();
     if (b.dataset.tool === "term") termToggle();
     else if (b.dataset.tool === "code") codeToggle();
+    else if (b.dataset.tool === "cu") { menu.hidden = true; cuOpen(); return; }
+    else if (b.dataset.tool === "chat") { menu.hidden = true; setCocraft(!cocraftIsOpen()); return; }
+    else if (b.dataset.tool === "music") {
+      const on = !MUSIC.shown;
+      menu.hidden = true;
+      setPlayerShown(on);
+      if (on) { try { setPlayerFold(false); } catch (err) { /* ignore */ } }   // 打开时展开，别只剩个 ▾
+      return;
+    }
     else if (b.dataset.tool === "quar") { menu.hidden = true; quarOpen(); return; }
-    else if (b.dataset.tool === "undo") { menu.hidden = true; undoOpen(); return; }
+    else if (b.dataset.tool === "restore") { menu.hidden = true; restoreOpen(); return; }
+    else if (b.dataset.tool === "audit") { menu.hidden = true; auditOpen(); return; }
     refresh();
   });
   document.addEventListener("click", (e) => {
     if (!menu.hidden && !menu.contains(e.target) && !btn.contains(e.target)) menu.hidden = true;
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu.hidden = true; });
-}
-
-/** 顶栏「群聊 / 音乐」小抽屉（取代原来右边那条透明触发带）。 */
-function initHubMenu() {
-  const btn = $("btn-hub"), menu = $("hub-menu");
-  if (!btn || !menu) return;
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (menu.hidden) { syncHubBtn(); menu.hidden = false; } else { menu.hidden = true; }
-  });
-  menu.addEventListener("click", (e) => {
-    const b = e.target.closest("button");
-    if (!b) return;
-    e.stopPropagation();
-    const tool = b.dataset.tool || "";
-    if (tool === "chat") { setCocraft(!cocraftIsOpen()); }
-    else if (tool === "music") {
-      const on = !MUSIC.shown;
-      setPlayerShown(on);
-      if (on) { try { setPlayerFold(false); } catch (err) { /* ignore */ } }   // 打开时展开，别只剩个 ▾
-    }
-    menu.hidden = true;
-    syncHubBtn();
-  });
-  document.addEventListener("click", (e) => {
-    if (!menu.hidden && !menu.contains(e.target) && !btn.contains(e.target)) menu.hidden = true;
-  });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu.hidden = true; });
-  syncHubBtn();
 }
 
 /* ---------------- 落樱 + 落水涟漪 ----------------

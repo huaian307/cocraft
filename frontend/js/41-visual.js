@@ -972,7 +972,13 @@ async function writeSessionModel(sid, ref) {
       { method: "POST", body: JSON.stringify({ model: { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" } }) });
   } catch { return null; }
   const m = { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" };
-  if (state.current && state.current.id === sid) state.current.model = m;
+  if (state.current && state.current.id === sid) {
+    const prev = state.current.model || {};
+    state.current.model = m;
+    // ★换模型 → 上一轮上报的窗口上限作废（否则会拿旧模型的 256K 配新模型的名字）
+    if (String(prev.id || "") !== String(m.id || "")) state.current.context = null;
+    if (typeof ctxSync === "function") ctxSync();
+  }
   const s = state.sessions.find((x) => x.id === sid);
   if (s) s.model = m;
   updateModelBtn();
@@ -1239,12 +1245,16 @@ async function pickModel(ref) {
   await api(`/api/session/${encodeURIComponent(sid)}/model`,
     { method: "POST", body: JSON.stringify({ model: ref }) });
   // 服务端在没给 variant 时会填 "default"，这里保持一致
+  const prev = state.current.model || {};
   state.current.model = { id: ref.id, providerID: ref.providerID, variant: ref.variant || "default" };
+  // ★换模型 → 旧窗口上限立刻作废（等下一次 usage_update 再显示真实窗口）
+  if (String(prev.id || "") !== String(state.current.model.id || "")) state.current.context = null;
   saveDefaultModel(state.current.model);            // ★ 顺带记为"新会话默认模型"，下次新建自动跟随
   const s = state.sessions.find((x) => x.id === sid);
   if (s) s.model = state.current.model;
   renderModels();
   updateModelBtn();
+  ctxSync();
   setBanner(`已切换模型：${modelText(state.current.model, true)}`);
 }
 

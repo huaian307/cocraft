@@ -30,18 +30,10 @@
    开关：<html class="glass">（设置 →「液态玻璃」；默认开）。移除这个 class 即整套失效、回到纸面面板。
    ============================================================================ */
 
-/* 玻璃材质参数（昼 / 夜各一套） */
+/* 玻璃材质参数（圣烛教堂：暖棕黑 tint + 金色 hairline + 顶部烛光汗光） */
 :root {
   --g-sat: 120%;       /* 背景饱和度 */
   --g-radius: 16px;    /* 悬浮玻璃（弹窗 / 菜单 / 抽屉）的圆角 */
-}
-[data-theme="hiru"] {
-  /* 白昼：**无色玻璃 + 白字** —— 中性灰 tint（无暖白）、主面不填色；
-     文字白色高亮、区块靠「中性暗底 + 浅色边线」区分（见下方 html.glass[data-theme=hiru]）。 */
-  --g-tint: 128,128,128; --g-ink: 36,31,29;
-  --g-a1: 0; --g-a2: .05; --g-a3: .04;
-  --g-edge: rgba(255,255,255,.30);   /* 区块 / 气泡之间的浅色边线（明显） */
-  --g-top:  transparent;             /* 不要白色上沿高光 */
 }
 
 /* 把「纸」换成「玻璃」：--paper 系列全部半透明
@@ -87,55 +79,12 @@ html.glass .ask-box {
 
 /* 模糊程度统一由 --g-blur 控制（见设置「模糊程度」）—— 会话界面 / 气泡 / 群聊共用同一个值。
    设成 0 = 全透明不模糊；越大越"磨砂"。 */
-/* 白昼的下拉菜单 / 小浮层：**实底**（透明的底会把下面的字透上来、糊成一片）+ 更强磨砂 */
-html.glass[data-theme="hiru"] .open-menu,
-html.glass[data-theme="hiru"] .perm-menu,
-html.glass[data-theme="hiru"] .cc-menu-pop,
-html.glass[data-theme="hiru"] .sel-copy {
-  background: rgba(12, 12, 15, .86);
-  backdrop-filter: blur(calc(var(--g-blur) + 10px)) saturate(100%);
-  -webkit-backdrop-filter: blur(calc(var(--g-blur) + 10px)) saturate(100%);
-}
-/* 权限申请小弹窗：深底 + 一丝红（原来几乎是透明的 → 字会跟底下的糊在一起） */
-html.glass[data-theme="hiru"] .cc-perm { background: rgba(34, 12, 17, .88); }
+/* 悬浮小浮层（实底 + 更强磨砂）：暗色定盘下这些值来自 `html.glass` 基础块。 */
 
 /* ============================================================================
-   ★白昼玻璃：**白色高亮文字 + 区块分明**（对齐 DeepSeek Harness 的观感）
-   —— 透明面板上深色字看不清：文字统一**白色**（叠中性深色柔光兜底）；
-      结构性区块给一层**中性暗底**（不是白！）→ 区块彼此 / 和壁纸都分得开、白字也清楚；
-      区块之间用**浅色边线**分隔。
+   ★（`ui 0.2.123`）「和纸白昼」已删除，暗色定盘是唯一一套：
+   区块暗底 / 白字 / 浅边线这些规则合并进上面的 `html.glass` 基础块。
    ============================================================================ */
-html.glass[data-theme="hiru"] {
-  --ink: #fff;
-  --ink-dim: rgba(255,255,255,.86);
-  --ink-faint: rgba(255,255,255,.62);
-  --line: rgba(255,255,255,.26);        /* 区块 / 气泡边界（浅色 → 深色壁纸上也看得见） */
-  --line-soft: rgba(255,255,255,.13);
-  --hi-wash: rgba(200,16,46,.34);       /* 绯红淡染改半透明（否则白字压在上面看不清） */
-  --g-scrim: rgba(8,8,10,.52);          /* 区块底色：中性暗（不是白） */
-  text-shadow: 0 1px 3px rgba(0,0,0,.55), 0 0 6px rgba(0,0,0,.32);
-}
-/* 结构性区块：一层中性暗底 → 区块彼此 / 和壁纸都分得开 */
-html.glass[data-theme="hiru"] #sidebar,
-html.glass[data-theme="hiru"] #topbar,
-html.glass[data-theme="hiru"] #composer,
-html.glass[data-theme="hiru"] .player,
-html.glass[data-theme="hiru"] .cocraft,
-html.glass[data-theme="hiru"] .code,
-html.glass[data-theme="hiru"] .term,
-html.glass[data-theme="hiru"] .mus-home,
-html.glass[data-theme="hiru"] .collab-home,
-html.glass[data-theme="hiru"] .cfg,
-html.glass[data-theme="hiru"] .wp-box,
-html.glass[data-theme="hiru"] .ask-box { background: var(--g-scrim); }
-
-/* 透明底会让「选中 / 悬停」看不出来 → 给一层浅色（白字仍清楚） */
-html.glass[data-theme="hiru"] .session:hover { background: rgba(255,255,255,.10); }
-html.glass[data-theme="hiru"] .session.active { background: rgba(255,255,255,.16); }
-html.glass[data-theme="hiru"] .cc-chats .cc-chat:hover { background: rgba(255,255,255,.08); }
-html.glass[data-theme="hiru"] .mus-pl:hover,
-html.glass[data-theme="hiru"] .mus-song:hover,
-html.glass[data-theme="hiru"] .p-results .it:hover { background: rgba(255,255,255,.10); }
 html.glass #sidebar,
 html.glass #topbar,
 html.glass #composer { background: var(--paper); border-color: var(--g-edge); }
@@ -429,8 +378,8 @@ html.glass .trace {
   -webkit-backdrop-filter: blur(var(--g-blur)) saturate(var(--g-sat));
   box-shadow: 14px 0 34px rgba(0,0,0,.22), inset 0 0 0 1px var(--g-edge);
 }
-html.glass[data-theme="hiru"] .trace { background: var(--g-scrim); }
-html.glass[data-theme="hiru"] .tr-item .tr-body { background: rgba(255,255,255,.06); }
+html.glass .trace { background: var(--g-scrim); }
+html.glass .tr-item .tr-body { background: rgba(255,255,255,.06); }
 
 /* ================= 右侧抽屉「重合」→ 页面雾化 =================
    多个右抽屉同时开，或主内容被压得太窄（抽屉已盖在内容上）时，给页面加一层雾化，
@@ -481,34 +430,73 @@ html.glass select option { background-color: #17171b; color: #f2f2f2; }
 .q-acts button { padding: 4px 10px; font-size: 12px; }
 .q-acts .q-restore { border-color: color-mix(in srgb, var(--hi) 55%, transparent); color: var(--hi); }
 .q-acts .q-drop { color: var(--ink-faint); }
+/* ★低风险删除（0.2.95）：策略条 + 星级 / 自动 / 仅清单 徽标 */
+.q-policy { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 6px; }
+.q-policy-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.q-policy-line .muted { font-size: 12px; }
+.q-days { width: 64px; margin: 0 2px; }
+.q-stars { color: var(--hi); font-size: 12px; letter-spacing: 1px; }
+.q-badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--ink-dim); }
+.q-badge.auto { color: #ffd9a0; border-color: color-mix(in srgb, #ffd9a0 45%, transparent); }
+.q-badge.tomb { color: #ffb4a2; border-color: color-mix(in srgb, #ffb4a2 45%, transparent); }
+.q-hold { margin-top: 4px; color: #ffb4a2; font-size: 12px; }
+.q-ends { color: var(--ink-faint); font-size: 12px; }
 #tm-quar.on { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 55%, transparent); }
 
-/* ================= ★可逆执行：「撤销这一轮」 ================= */
-#undo .wp-box { width: min(760px, 92vw); }
-.u-row {
-  display: flex; align-items: baseline; gap: 8px;
-  padding: 5px 8px; border-radius: 6px; cursor: pointer;
+/* ================= ★恢复中心：分类 → 项目 → 文件时间线 ================= */
+#restore .restore-box {
+  width: min(1080px, 94vw); height: min(720px, 86vh);
+  display: flex; flex-direction: column;
 }
-.u-row:hover { background: color-mix(in srgb, var(--paper-2) 70%, transparent); }
-.u-row.open { background: color-mix(in srgb, var(--paper-2) 85%, transparent); }
-.u-kind {
-  flex: none; width: 22px; text-align: center; font-size: 12px;
-  border-radius: 4px; border: 1px solid var(--line); color: var(--ink-dim);
+.restore-body { display: flex; gap: 10px; min-height: 0; flex: 1; }
+.restore-left {
+  width: 250px; flex: none; display: flex; flex-direction: column; gap: 4px;
+  overflow: auto; padding-right: 4px;
 }
-.u-kind.ch { color: #f5c26b; border-color: color-mix(in srgb, #f5c26b 45%, transparent); }
-.u-kind.ad { color: #7ee0a1; border-color: color-mix(in srgb, #7ee0a1 45%, transparent); }
-.u-kind.dl { color: #ff8b7a; border-color: color-mix(in srgb, #ff8b7a 45%, transparent); }
-.u-kind.mv { color: #8fb8ff; border-color: color-mix(in srgb, #8fb8ff 45%, transparent); }
-.u-path {
-  min-width: 0; flex: 1; font-family: var(--mono); font-size: 12.5px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+.restore-sec-title { font-size: 11px; color: var(--hi); margin-top: 4px; }
+.restore-cats, .restore-projects { display: flex; flex-direction: column; gap: 3px; }
+.restore-cat, .restore-proj {
+  text-align: left; padding: 5px 7px; border-radius: 6px; font-size: 12px;
+  border: 1px solid transparent; background: transparent; color: var(--ink-dim);
+  cursor: pointer;
 }
-.u-meta { flex: none; color: var(--ink-faint); font-size: 12px; white-space: nowrap; }
-.u-diff { padding: 0 0 6px 30px; }
-/* ⚠ 撤销列表要**单列**：`.wp-list` 默认是 auto-fill 网格，而 diff 块是那一行的兄弟节点 ——
-   多列时 diff 会跑到别的格子里，跟它的文件对不上。 */
-#undo-list { grid-template-columns: 1fr; }
-#tm-undo.on { color: var(--hi); border-color: color-mix(in srgb, var(--hi) 55%, transparent); }
+.restore-cat:hover, .restore-proj:hover { color: var(--ink); background: color-mix(in srgb, var(--hi) 7%, transparent); }
+.restore-cat.on, .restore-proj.on {
+  color: var(--hi); border-color: color-mix(in srgb, var(--hi) 50%, transparent);
+  background: color-mix(in srgb, var(--hi) 10%, transparent);
+}
+.restore-proj .rp-root { display: block; font: 9.5px var(--mono); color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.restore-right { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.restore-head { font-size: 11.5px; padding: 4px 2px; }
+.restore-files { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+.restore-file { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: color-mix(in srgb, var(--paper-2) 70%, transparent); }
+.restore-file-hd { display: flex; align-items: baseline; gap: 8px; }
+.restore-file-hd b { font: 11.5px var(--mono); color: var(--ink); word-break: break-all; }
+.restore-file-hd .rf-count { margin-left: auto; flex: none; font-size: 10px; color: var(--ink-faint); }
+.restore-vs { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+.restore-v { display: flex; align-items: center; gap: 7px; font-size: 11px; padding: 3px 0; border-top: 1px dashed color-mix(in srgb, var(--line) 60%, transparent); }
+.restore-v:first-child { border-top: 0; }
+.restore-v time { flex: none; font: 10px var(--mono); color: var(--ink-faint); }
+.restore-badge { flex: none; font-size: 9.5px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--line); color: var(--ink-dim); }
+.restore-badge.q { color: #ffd9a0; border-color: color-mix(in srgb, #ffd9a0 45%, transparent); }
+.restore-badge.m { color: #d8b4ff; border-color: color-mix(in srgb, #d8b4ff 45%, transparent); }
+.restore-badge.s { color: #9cc7ff; border-color: color-mix(in srgb, #9cc7ff 45%, transparent); }
+.restore-v .desc { flex: 1; min-width: 0; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.restore-v .r-size { flex: none; font: 10px var(--mono); color: var(--ink-faint); }
+.restore-v button { flex: none; padding: 1px 8px; font-size: 10px; cursor: pointer; border-radius: 999px; color: var(--hi); background: transparent; border: 1px solid color-mix(in srgb, var(--hi) 45%, transparent); }
+.restore-v button:disabled { opacity: .4; cursor: default; }
+
+/* ================= ★会话管理（工作流成员 / 群聊成员） ================= */
+#sessmgr .sessmgr-box { width: min(760px, 94vw); }
+.sm-row {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+.sm-row:last-child { border-bottom: 0; }
+.sm-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sm-main b { font-size: 12.5px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sm-main span { font-size: 10.5px; color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sm-row button { flex: none; font-size: 10.5px; padding: 2px 8px; }
 
 
 
@@ -520,7 +508,8 @@ html.glass select option { background-color: #17171b; color: #f2f2f2; }
    ⚠ 危险色（破坏性 / 拒绝）**不许**被主题染成金色 —— 安全语义优先。
    ============================================================================ */
 
-/* ---- 1. 玻璃材质参数 ---- */
+/* ---- 1. 玻璃材质参数（`ui 0.2.123`：`hiru` 已删，这套就是唯一一套，`:root` 也吃它） ---- */
+:root,
 [data-theme="chapel"] {
   --g-tint: 30,24,19;                     /* 暖棕黑 */
   --g-ink:  246,239,227;                  /* 玻璃里的"墨"是浅色（暗底上的线） */
@@ -604,10 +593,9 @@ html.glass[data-theme="chapel"] {
   box-shadow: 0 0 10px rgba(224,162,74,.55);
 }
 
-/* ---- 9. 弹窗圣徽：chapel 用「尖拱窗 + 烛焰」(#mk-chapel)，hiru 仍用世界树标记 ---- */
-.mk-chapel { display: none; }
-[data-theme="chapel"] .mk-tree { display: none; }
-[data-theme="chapel"] .mk-chapel { display: inline-block; }
+/* ---- 9. 弹窗圣徽：唯一主题用「尖拱窗 + 烛焰」(#mk-chapel)；世界树标记已随「和纸白昼」移除 ---- */
+.mk-chapel { display: inline-block; }
+.mk-tree { display: none; }
 
 /* ---- 10. 消息气泡：**暗玻璃**（叠在壁纸亮部不再糊成一块"白色蒙版"） ---- */
 /* 为什么需要：气泡背景是 `--paper` = rgba(30,24,19,.38)（38% 暖黑 + 28px 模糊）。

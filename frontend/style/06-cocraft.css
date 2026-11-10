@@ -140,7 +140,7 @@ html[data-sidebar="closed"]:not(.music-playing) .lyric-ball { display: none; }
 .ly-scroll p.noly { font-family: var(--sans); font-size: 15px; opacity: .5; }
 
 /* ---------- 群聊（cocraft）：右侧抽屉（**面板内自建 UI**）。
-   入口 = 顶栏的「群聊 / 音乐」小抽屉（#btn-hub / #hub-menu）；原来右边那条透明触发带已删。 ---------- */
+   入口 = 顶栏「工具」（扳手）菜单里的「在线协作」（#tm-chat）；原来的方阵按钮 #btn-hub 已删。 ---------- */
 
 /* 抽屉：从右侧滑入；**左边缘可拖动改宽度**（--cc-w）；z-index 低于弹窗（20+） */
 .cocraft {
@@ -553,6 +553,7 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
   background: color-mix(in srgb, var(--hi) 6%, transparent);
 }
 .anew-i-hd { display: flex; align-items: baseline; gap: 6px; font-size: 11.5px; }
+.anew-bundled-hd { margin: 6px 0 2px; font-size: 10.5px; color: var(--hi); }
 .anew-i-hd b { color: var(--hi); }
 .anew-i-hd span { font-size: 10.5px; }
 .anew-i-chk {
@@ -584,7 +585,41 @@ button.busy { animation: ui-spin .7s linear infinite; pointer-events: none; }
 .anew-i-b:disabled { opacity: .4; cursor: default; }
 .anew-i-b[data-ainst-off] { color: var(--ink-faint); border-color: var(--line); }
 .anew-i-b.up { color: #d29922; border-color: color-mix(in srgb, #d29922 55%, transparent); }
+.anew-node { margin-top: 8px; padding-top: 7px; border-top: 1px dashed color-mix(in srgb, var(--line) 75%, transparent); }
+.anew-node-line { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; flex-wrap: wrap; }
+.anew-node-line b { color: var(--hi); }
+.anew-node-line > span { font: 10px var(--mono); color: var(--ink-faint); }
+.anew-node-line .anew-i-b { margin-left: 0; }
+.anew-node #anew-node-note { margin-top: 3px; font-size: 10.5px; }
+.anew-node-bar {
+  height: 5px; margin-top: 5px; border-radius: 3px; overflow: hidden;
+  background: color-mix(in srgb, var(--line) 55%, transparent);
+}
+.anew-node-bar > i {
+  display: block; height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--hi), #d29922);
+  transition: width .25s ease;
+}
+.anew-node-bar.indet > i { width: 40%; animation: anewIndet 1.2s ease-in-out infinite; }
+.anew-auto { margin-top: 7px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.anew-auto .toggle { font-size: 10.5px; }
+.anew-auto .muted { font-size: 10.5px; }
 .anew-i-log { margin-top: 6px; }
+.anew-i-bar {
+  height: 5px; margin-top: 5px; border-radius: 3px; overflow: hidden;
+  background: color-mix(in srgb, var(--line) 55%, transparent);
+}
+.anew-i-bar > i {
+  display: block; height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--hi), #d29922);
+  transition: width .25s ease;
+}
+.anew-i-bar.indet > i { width: 40%; animation: anewIndet 1.2s ease-in-out infinite; }
+@keyframes anewIndet {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+.anew-i-meta { margin-top: 3px; font-size: 10.5px; color: var(--ink-faint); }
 .anew-i-lh { font-size: 11px; color: var(--ink-dim); }
 .anew-i-lh.ok { color: #3fb950; }
 .anew-i-lh.bad { color: #e5534b; }

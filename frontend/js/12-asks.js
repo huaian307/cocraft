@@ -279,7 +279,8 @@ function permMenuToggle() {
   m.id = "perm-menu"; m.className = "perm-menu";
   m.innerHTML = PERM.levels.map((it) =>
     `<button type="button" data-lv="${esc(it.id)}" class="${it.id === PERM.level ? "on" : ""}">${esc(it.label)}</button>`
-  ).join("") + `<button type="button" class="perm-more" data-trust-open="1">信任面板…</button>`;
+  ).join("") + `<button type="button" class="perm-more" data-trust-open="1">信任面板…</button>`
+    + `<button type="button" class="perm-more" data-audit-open="1">审计与活动…</button>`;
   document.body.appendChild(m);
   // ★ 定位要按**界面缩放**换算（`html{zoom}`）：`getBoundingClientRect()` 给的是**真实像素**，
   //   而 `style.left/top` 是**设计像素**（渲染时还会乘一次 zoom）。以前直接用 rect，
@@ -301,6 +302,8 @@ function permMenuToggle() {
   m.addEventListener("click", (e) => {
     const more = e.target.closest("button[data-trust-open]");
     if (more) { m.remove(); trustOpen(true); return; }
+    const aud = e.target.closest("button[data-audit-open]");
+    if (aud) { m.remove(); auditOpen(); return; }
     const t = e.target.closest("button[data-lv]");
     if (!t) return;
     setPermLevel(t.dataset.lv);
@@ -326,6 +329,7 @@ const TRUST = { open: false, busy: false, pend: [], pendErr: "",
                 audit: null, auditErr: "", auditVerify: null,
                 files: null, filesErr: "",
                 dec: [],
+                scopes: null, scopesErr: "",
                 orch: null, orchErr: "" };
 
 /** 列表数据一律过这一道：接口形状万一变了（对象 / null）也不会把面板整块打崩。 */
@@ -356,10 +360,10 @@ function trustActZh(st) {
 }
 
 function trustIsOpen() { const b = $("trust"); return !!b && !b.hidden; }
-
 function trustOpen(open) {
   const box = $("trust");
   if (!box) return;
+  if (!!open === !!TRUST.open) return;              // 幂等：别把 OVERLAY 叠两层
   TRUST.open = !!open;
   box.hidden = !open;
   if (open) { trustRefresh(); OVERLAY.push("trust", trustClose); }
@@ -367,6 +371,25 @@ function trustOpen(open) {
 }
 
 function trustClose() { trustOpen(false); }
+
+/* ---- ★审计页（`ui 0.2.85`）：从信任面板拆出来 -------------------------------
+   信任面板只管**权限**（等级 / 待批 / 始终允许）；「链状态与校验 / 五种导出 /
+   AI 成员改了什么 / 审批时间线 / agent 活动 / 仲裁结论 / 可撤销入口 / 本地协作」
+   全搬到这一页 —— 那边塞到 9 段，用户说「点太多了」。
+   ⚠ 两页共用同一份 `TRUST.*` 数据与渲染函数（id 没变），所以这里只负责开关。 */
+function auditIsOpen() { const b = $("audit"); return !!b && !b.hidden; }
+
+function auditOpen() {
+  const box = $("audit");
+  if (!box) return;
+  if (!box.hidden) return;                          // 已经开着 → 别重复 push
+  box.hidden = false;
+  OVERLAY.push("audit", auditClose);
+  if (trustIsOpen()) trustClose();                  // 从信任面板点进来 → 收掉那层
+  trustRefresh();                                   // 同一份数据：链状态 / 时间线 / 活动 / 仲裁 / 协作
+}
+
+function auditClose() { const b = $("audit"); if (b) b.hidden = true; OVERLAY.pop("audit"); }
 
 /** 每一档**实际**会自动放行什么（和后端 allowed_by_level / 前端 permAllowedByLevel 保持一致）。 */
 function trustLevelDesc(id) {
@@ -475,9 +498,11 @@ function trustRender() {
         + `</span>`
         + `<em>${esc(String(st.badLines || 0))} 坏行</em>`
         + `<button type="button" data-audit-verify="1" title="逐条重算哈希，确认没被改过">重新校验</button>`
-        + `<button type="button" data-audit-export="1" title="导出带文件头与链尾的 JSON（别人可用 tools\\cocraft_audit_verify.py 离线复核）">导出 JSON</button>`
-        + `<button type="button" data-audit-csv="1" title="导出 CSV（Excel 能直接开；每行仍带 prev/hash，可逐行复核）">导出 CSV</button>`
-        + `<button type="button" data-audit-report="1" title="一页报告（Markdown）：结论分布 + 破坏性逐条 + 明细，可交给同事/甲方">导出报告</button>`
+        + `<button type="button" data-audit-export="1" title="导出带文件头与链尾的 JSON（弹出「另存为」，默认桌面；别人可用 tools\\cocraft_audit_verify.py 离线复核）">导出 JSON…</button>`
+        + `<button type="button" data-audit-csv="1" title="导出 CSV（弹出「另存为」，默认桌面；Excel 能直接开；每行仍带 prev/hash）">导出 CSV…</button>`
+        + `<button type="button" data-audit-report="1" title="一页报告（Markdown）：结论分布 + 破坏性逐条 + 明细；弹出「另存为」，默认桌面">导出报告…</button>`
+        + `<button type="button" data-audit-brief="1" title="一页「人话简报」（Markdown）：一句话结论 + 需要你知道的 3 件事 + 按人/按天 + 可复核附录；给老板/合规看">导出简报…</button>`
+        + `<button type="button" data-audit-human="1" title="人话版 CSV（9 列：时间/谁/动作/对象/结论/批准人/不可撤销/恢复点/序号）—— 给 Excel 看；原 CSV 仍保留 prev/hash 供复核">导出人话 CSV…</button>`
         + `</div>`);
       broken.slice(0, 3).forEach((b) => {
         rows.push(`<div class="trust-row"><i class="v-deny">断裂</i>`
@@ -492,6 +517,14 @@ function trustRender() {
              + (arch && arch.records
                ? `（含归档 ${arch.records} 条 / ${arch.files} 个文件）` : ""))
           : "0 条 · 还没有人批准过";
+      }
+      // 信任面板那一行摘要（点进去才看明细）—— 数据就在上面这段里算好了
+      const brief = $("trust-audit-brief");
+      if (brief) {
+        brief.textContent = n
+          ? (okNow ? `链完整 · ${n} 条` : `⚠ 第 ${String((broken[0] || {}).index || "?")} 条断裂`)
+            + ` · 待你批准 ${trustList(TRUST.pend).length} 条`
+          : `空链 · 还没有人批准过 · 待你批准 ${trustList(TRUST.pend).length} 条`;
       }
     }
   }
@@ -557,42 +590,29 @@ function trustRender() {
       if (plnote) plnote.textContent = TRUST.permLog.length + " 条（最近 30 条）";
     }
   }
-  // ★可撤销：隔离区（破坏性操作放行前留的原件）+ 当前会话的每轮快照
+  // ★忏悔室：删除 / 修改放行前留的原件
   const ubox = $("trust-undo");
   const unote = $("trust-undo-note");
   if (ubox) {
     const rows = [];
     if (TRUST.quarErr) {
-      rows.push(`<div class="trust-empty">隔离区读不到：${esc(TRUST.quarErr)}</div>`);
+      rows.push(`<div class="trust-empty">忏悔室读不到：${esc(TRUST.quarErr)}</div>`);
     } else {
       (TRUST.quar || []).slice(0, 3).forEach((q) => {
-        rows.push(`<div class="trust-row"><i>隔离区</i>`
-          + `<b title="${esc(q.id || "")}">${esc(q.note || "破坏性操作")}</b>`
-          + `<span title="${esc(q.cmd || "")}">${esc(q.cmd || (String(q.count || 0) + " 项被隔离"))}</span>`
+        rows.push(`<div class="trust-row"><i>忏悔室</i>`
+          + `<b title="${esc(q.id || "")}">${esc(q.note || "删除 / 修改前")}</b>`
+          + `<span title="${esc(q.cmd || "")}">${esc(q.cmd || (String(q.count || 0) + " 项被留存"))}</span>`
           + `<em>${esc(trustWhen(q.taken_at || q.ts))}</em>`
           + `<button type="button" data-trust-jump="quar">打开</button></div>`);
       });
       if (!(TRUST.quar || []).length) {
-        rows.push(`<div class="trust-empty">隔离区是空的 —— 破坏性命令放行前会自动留一份（不占 OS 回收站）。</div>`);
+        rows.push(`<div class="trust-empty">忏悔室是空的 —— 删除 / 修改文件在放行前会自动留一份；项目 git 提交后会按 git 出清。</div>`);
       }
-    }
-    if (!state.current) {
-      rows.push(`<div class="trust-empty">先选一个会话，才能看/撤销它的每轮快照。</div>`);
-    } else if (TRUST.snapsErr) {
-      rows.push(`<div class="trust-empty">快照读不到：${esc(TRUST.snapsErr)}</div>`);
-    } else {
-      const snaps = TRUST.snaps || [];
-      const latest = snaps[0];
-      rows.push(`<div class="trust-row"><i>快照</i>`
-        + `<b>${esc(String(snaps.length) + " 次")}</b>`
-        + `<span>${latest ? ("最近 " + esc(trustWhen(latest.taken_at)) + " · " + esc(String(latest.count || 0)) + " 个文件") : "还没有快照"}</span>`
-        + `<button type="button" data-trust-jump="undo">${latest ? "撤销这一轮" : "查看"}</button></div>`);
     }
     ubox.innerHTML = rows.join("");
     if (unote) {
-      unote.textContent = TRUST.quarErr ? "隔离区不可用"
-        : (TRUST.snapsErr ? "快照不可用"
-          : `${(TRUST.quar || []).length} 条隔离 · ${(TRUST.snaps || []).length} 次快照`);
+      unote.textContent = TRUST.quarErr ? "忏悔室不可用"
+        : `${(TRUST.quar || []).length} 条留存 · 在忏悔室里按文件回滚`;
     }
   }
   // ★agent 活动（群聊 AI 成员最近在做什么；桥的内存缓冲，面板重启后从零开始）
@@ -669,6 +689,34 @@ function trustRender() {
       if (onote) onote.textContent = `${pend.length} 条待批 · ${(TRUST.orch.runs || []).length} 个任务`;
     }
   }
+  // ★轮快照（群聊 / 工作流 / 单聊）：带内容的才能一键退回（`ui 0.2.85`）
+  const sbox = $("aud-snaps");
+  const snote = $("aud-snaps-note");
+  if (sbox) {
+    if (TRUST.scopes === null) {
+      sbox.innerHTML = `<div class="trust-empty">${esc(TRUST.scopesErr || "拿不到轮快照")}</div>`;
+      if (snote) snote.textContent = TRUST.scopesErr ? "不可用" : "";
+    } else if (!TRUST.scopes.length) {
+      sbox.innerHTML = `<div class="trust-empty">还没有轮快照 —— 群聊派活 / 工作流跑一轮 / 打开「每轮工作区快照」后发消息，都会在动手前记一份。</div>`;
+      if (snote) snote.textContent = "0 条";
+    } else {
+      sbox.innerHTML = TRUST.scopes.slice(0, 12).map((s) => {
+        const can = !!s.with_content;
+        return `<div class="trust-row">`
+          + `<i class="${can ? "v-allow" : ""}">${can ? "可退回" : "仅清单"}</i>`
+          + `<b title="${esc(s.scope || "")}">${esc(String(s.count || 0) + " 个文件")}</b>`
+          + `<span title="${esc(s.root || "")}">${esc(s.scope || "")}${s.label ? (" · " + esc(s.label)) : ""}</span>`
+          + `<em>${esc(trustWhen(s.taken_at))}</em>`
+          + (can
+            ? `<button type="button" data-snap-undo="${esc(s.scope || "")}" data-snap-ts="${esc(s.ts || "")}"
+                 title="把工作区退回这一次快照（新增的会先自动进忏悔室）">退回</button>`
+            : `<button type="button" disabled title="这次快照没存内容（只记了文件名），撤不了 —— 想能退回请到「忏悔室」打开「轮快照带内容」">撤不了</button>`)
+          + `</div>`;
+      }).join("");
+      const n = TRUST.scopes.filter((x) => x.with_content).length;
+      if (snote) snote.textContent = `${TRUST.scopes.length} 个 scope · ${n} 个可退回（最近 12 个）`;
+    }
+  }
 }
 
 async function trustRefresh() {
@@ -710,7 +758,7 @@ async function trustRefresh() {
         ? "当前版本没有本地协作接口（需要 0.2.1+ 的后端；重启面板服务）"
         : ("拿不到本地协作任务：" + msg);
     }
-    // ★可撤销：隔离区记录 + 当前会话的每轮快照（都用现成接口，不另造一套）
+    // ★可撤销：忏悔室记录 + 当前会话的每轮快照（都用现成接口，不另造一套）
     TRUST.quar = null; TRUST.quarErr = "";
     try {
       const r = unwrap(await api("/quarantine/list")) || {};
@@ -766,6 +814,12 @@ async function trustRefresh() {
     } catch (e) { TRUST.actsErr = (e && e.message) || String(e); }
     // ★派活 / 仲裁结论（localStorage 历史；只读）
     TRUST.dec = trustList((typeof ccDecisionHistory === "function") ? ccDecisionHistory() : []);
+    // ★所有轮快照（群聊 / 工作流 / 单聊）：带内容的才能一键退回（`ui 0.2.85`）
+    TRUST.scopes = null; TRUST.scopesErr = "";
+    try {
+      const r = unwrap(await api("/snapshot/scopes")) || {};
+      TRUST.scopes = trustList(r.items);
+    } catch (e) { TRUST.scopesErr = (e && e.message) || String(e); }
     trustRender();
   } finally {
     TRUST.busy = false;
@@ -788,8 +842,24 @@ async function trustPickLevel(lv) {
   setBanner("权限等级已切到：" + permLevelLabel(lv));
 }
 
-async function trustForget(id) {
+/** ★把某个 scope 的工作区退回某次轮快照（`ui 0.2.85`）。新增的文件会先自动进忏悔室。 */
+async function snapUndo(scope, ts) {
+  if (!scope || !ts) return;
+  if (!confirm("把工作区退回这次快照？\n\n" + scope + " / " + ts
+    + "\n\n被删的会恢复、被改的写回旧内容、被新增的会先丢进忏悔室再删除。")) return;
   try {
+    const r = unwrap(await api("/snapshot/undo", { method: "POST",
+      body: JSON.stringify({ scope: scope, ts: ts }) })) || {};
+    setBanner(`已退回：恢复 ${r.restored || 0} · 删除 ${r.removed || 0}`
+      + (r.skipped ? ` · 跳过 ${r.skipped}` : ""), { ms: 9000 });
+    await trustRefresh();
+  } catch (e) {
+    setBanner("退回失败：" + ((e && e.message) || e)
+      + (typeof backendStaleHint === "function" ? backendStaleHint("") : ""), { sticky: true });
+  }
+}
+
+async function trustForget(id) {  try {
     await api("/api/permission/always", { method: "DELETE", body: JSON.stringify({ id: id }) });
     setBanner("已撤销一条「始终允许」—— 以后这类请求会重新问你");
     await trustRefresh();
@@ -825,61 +895,105 @@ async function trustAuditVerify() {
   }
 }
 
+/** 走服务端「另存为…」原生对话框导出审计（不再用浏览器 blob 下载 ——
+ *  原生 WebView2 窗口里 anchor 下载可能**静默不落地**，用户会以为导出了却找不到文件）。 */
+async function auditExportSave(fmt, opts = {}) {
+  const q = new URLSearchParams();
+  q.set("format", fmt);
+  if (opts.run) q.set("run", String(opts.run));
+  if (opts.limit) q.set("limit", String(opts.limit));
+  if (opts.since) q.set("since", String(opts.since));
+  if (opts.until) q.set("until", String(opts.until));
+  const r = (await api("/audit/export/save?" + q.toString(), { method: "POST" })) || {};
+  if (r.canceled) {
+    setBanner("已取消导出");
+    return null;
+  }
+  if (!r.ok || !r.path) throw new Error(r.error || "后端没有返回保存路径");
+  return r;
+}
+
+/** 前端已有文本（如运行记录）→ 原生「另存为」框落盘；不再靠浏览器 blob 下载。 */
+async function saveTextViaDialog(name, text) {
+  const r = (await api("/save/text", {
+    method: "POST",
+    body: JSON.stringify({ name: String(name || "cocraft-export.txt"), text: String(text ?? "") }),
+  })) || {};
+  if (r.canceled) {
+    setBanner("已取消导出");
+    return null;
+  }
+  if (!r.ok || !r.path) throw new Error(r.error || "后端没有返回保存路径");
+  return r;
+}
+
+/** 导出成功后的横幅：**显示完整路径**；点一下直接在资源管理器里打开所在文件夹。 */
+function exportBanner(text, path) {
+  const p = String(path || "");
+  const dir = p.replace(/[\\/][^\\/]*$/, "");
+  const opts = { sticky: true };
+  if (dir && dir !== p) {
+    opts.clickable = true;
+    opts.onClick = () => {
+      api("/open/dir", { method: "POST", body: JSON.stringify({ what: "explorer", dir }) })
+        .catch((e) => setBanner("打开文件夹失败：" + ((e && e.message) || e), { sticky: true }));
+    };
+  }
+  setBanner(text + (p ? (" → " + p) : ""), opts);
+}
+
 /** 导出审计链（服务端权威记录 + 文件头 + 链尾）；别人可用 tools\cocraft_audit_verify.py 离线复核。 */
 async function trustAuditExport() {
   try {
-    const data = unwrap(await api("/audit/export")) || {};
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    const stamp = String(data.exported || "").replace(/[:.]/g, "-") || String(Date.now());
-    a.href = url;
-    a.download = "cocraft-audit-" + stamp + ".json";
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
-    setBanner("已导出审计链：" + Number(data.records || 0) + " 条（带哈希链，可离线校验）");
+    const r = await auditExportSave("json");
+    if (!r) return;
+    exportBanner("已导出审计链：" + Number(r.records || 0) + " 条", r.path);
   } catch (e) {
-    setBanner("导出审计失败：" + ((e && e.message) || e), { sticky: true });
+    setBanner("导出审计失败：" + backendStaleHint((e && e.message) || e), { sticky: true });
   }
 }
-
-/** 导出 CSV（Excel 留档用）；每行仍带 prev/hash，照样能逐行复核。 */async function trustAuditExportCsv() {
+/** 导出 CSV（Excel 留档用）；每行仍带 prev/hash，照样能逐行复核。 */
+async function trustAuditExportCsv() {
   try {
-    const res = await fetch("/audit/export?format=csv");
-    if (!res.ok) throw new Error(res.status + " " + (await res.text()).slice(0, 120));
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "cocraft-audit-" + String(Date.now()) + ".csv";
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
-    setBanner("已导出 CSV：" + (res.headers.get("X-Audit-Records") || "0")
-      + " 条（Excel 可直接打开）");
+    const r = await auditExportSave("csv");
+    if (!r) return;
+    exportBanner("已导出 CSV：" + Number(r.records || 0) + " 条", r.path);
   } catch (e) {
-    setBanner("导出 CSV 失败：" + ((e && e.message) || e), { sticky: true });
+    setBanner("导出 CSV 失败：" + backendStaleHint((e && e.message) || e), { sticky: true });
   }
 }
 
 /** 导出**一页报告**（Markdown）：结论分布 + 破坏性逐条 + 明细；给人看，不是给机器校验的。 */
 async function trustAuditReport() {
   try {
-    const r = await api("/audit/report");
-    const md = (unwrap(r) || {}).markdown || "";
-    if (!md) throw new Error("后端没返回报告内容");
-    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "cocraft-audit-report-" + String(Date.now()) + ".md";
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } a.remove(); }, 0);
-    setBanner("已导出审计报告（Markdown，可交同事/甲方）");
+    const r = await auditExportSave("md");
+    if (!r) return;
+    exportBanner("已导出审计报告（Markdown）", r.path);
   } catch (e) {
-    setBanner("导出报告失败：" + ((e && e.message) || e), { sticky: true });
+    setBanner("导出报告失败：" + backendStaleHint((e && e.message) || e), { sticky: true });
+  }
+}
+
+/** 导出**一页人话简报**（Markdown）：一句话结论 + 3 件事 + 按人/按天 + 可复核附录。
+ *  确定性生成（同一份记录 → 同一份正文），给老板/合规看，不用懂哈希。 */
+async function trustAuditBrief() {
+  try {
+    const r = await auditExportSave("brief");
+    if (!r) return;
+    exportBanner("已导出人话简报（Markdown）", r.path);
+  } catch (e) {
+    setBanner("导出简报失败：" + backendStaleHint((e && e.message) || e), { sticky: true });
+  }
+}
+
+/** 导出**人话版 CSV**（9 列，给 Excel）：不含哈希，但保留「序号」可回查链。 */
+async function trustAuditHumanCsv() {
+  try {
+    const r = await auditExportSave("humancsv");
+    if (!r) return;
+    exportBanner("已导出人话 CSV（" + Number(r.records || 0) + " 条）", r.path);
+  } catch (e) {
+    setBanner("导出人话 CSV 失败：" + backendStaleHint((e && e.message) || e), { sticky: true });
   }
 }
 
@@ -889,6 +1003,13 @@ function initTrust() {
   if (close) close.addEventListener("click", trustClose);
   const reload = $("trust-reload");
   if (reload) reload.addEventListener("click", trustRefresh);
+  // ★审计页（0.2.85）：从信任面板拆出来的独立页
+  const toAudit = $("trust-open-audit");
+  if (toAudit) toAudit.addEventListener("click", () => auditOpen());
+  const auditX = $("audit-close");
+  if (auditX) auditX.addEventListener("click", auditClose);
+  const auditReload = $("audit-reload");
+  if (auditReload) auditReload.addEventListener("click", trustRefresh);
   const tighten = $("trust-tighten");
   if (tighten) tighten.addEventListener("click", async () => {
     if (PERM.level === "ask") { setBanner("已经是「全部询问」了"); return; }
@@ -912,23 +1033,33 @@ function initTrust() {
         }
         return;
       }
-      const jump = e.target.closest("[data-trust-jump]");
-      if (jump) {
-        trustClose();
-        if (jump.dataset.trustJump === "quar") { try { quarOpen(); } catch { /* ignore */ } }
-        else { try { undoOpen(); } catch { /* ignore */ } }
-        return;
-      }
       const del = e.target.closest("[data-alw-del]");
       if (del) { trustForget(del.dataset.alwDel); return; }
       if (e.target.closest("[data-alw-clear]")) { trustForgetAll(); return; }
+    });
+  }
+  // ★审计页的交互（0.2.85 搬过来的那些段）：挂在 `#audit` 上，别留在信任面板的委托里
+  const abox = $("audit");
+  if (abox) {
+    abox.addEventListener("click", (e) => {
+      if (e.target === abox) { auditClose(); return; }
+      const jump = e.target.closest("[data-trust-jump]");
+      if (jump) {
+        auditClose();
+        if (jump.dataset.trustJump === "quar") { try { quarOpen(); } catch { /* ignore */ } }
+        return;
+      }
       if (e.target.closest("[data-audit-verify]")) { trustAuditVerify(); return; }
       if (e.target.closest("[data-audit-export]")) { trustAuditExport(); return; }
       if (e.target.closest("[data-audit-csv]")) { trustAuditExportCsv(); return; }
       if (e.target.closest("[data-audit-report]")) { trustAuditReport(); return; }
+      if (e.target.closest("[data-audit-brief]")) { trustAuditBrief(); return; }
+      if (e.target.closest("[data-audit-human]")) { trustAuditHumanCsv(); return; }
+      const snapU = e.target.closest("[data-snap-undo]");
+      if (snapU) { snapUndo(snapU.dataset.snapUndo, snapU.dataset.snapTs); return; }
       const orch = e.target.closest("[data-orch-run]");
       if (orch) {
-        trustClose();
+        auditClose();
         collabOpen(true);
         collabOpenRun(orch.dataset.orchRun);
         return;
@@ -954,6 +1085,19 @@ function inWorkspace(paths) {
   }
   return true;
 }
+/* ---------------- ★低风险删除（`ui 0.2.95`） ----------------
+ * 只在 OpenCode 引擎上用到：ACP 那条已经在后端 `_ask_permission` 里处理。
+ * 前端只负责"看到删除类申请就递票"；**能不能自动放行由 `backend/file_rank.py` 说了算**，
+ * 返回 `auto=false` 就照旧弹窗。递过的票 30 秒内不重复递（避免每条轮询都打一次后端）。 */
+const ASK_TICKETS = new Map();
+
+function permLooksDelete(pm) {
+  const meta = (pm && pm.metadata && typeof pm.metadata === "object") ? pm.metadata : {};
+  const hay = [pm.kind, pm.action, pm.message, meta.command]
+    .map((x) => String(x || "")).join(" ").toLowerCase();
+  return /(?:^|[\s;&|()"'`])(?:rm|rd|del|erase|rmdir)\b|remove-item|delete|删除|移除|\.delete\s*\(|(?:os|shutil)\.(?:remove|unlink|rmtree)/.test(hay);
+}
+
 function permAllowedByLevel(pm) {
   const lv = PERM.level;
   if (!lv || lv === "ask") return false;
@@ -983,6 +1127,33 @@ async function pollAsks() {
         api(`/api/session/${sid}/permission`).catch(() => null),
       ]);
       let perms = (p && p.data) || [];
+      // ★低风险删除（`ui 0.2.95`）：先隔离再自动放行 —— 只对"删除类"申请递票，
+      //   后端判定 ★ 级且隔离完整才 auto=true；否则原样进下面的弹窗流程。
+      if (perms.length && state.current) {
+        const keep = [];
+        for (const pm of perms) {
+          const key = String(pm.id || "");
+          const seen = ASK_TICKETS.get(key) || 0;
+          if (key && permLooksDelete(pm) && (!seen || Date.now() - seen > 30000)) {
+            ASK_TICKETS.set(key, Date.now());
+            try {
+              const t = await api("/permission/ticket", { method: "POST",
+                body: JSON.stringify({ sessionID: state.current.id, id: key }) });
+              if (t && t.auto) {
+                setBanner(`已隔离并自动放行低风险删除（★${t.stars || 1} · ${t.count || 0} 项`
+                  + `${t.tombstone ? " · 仅清单" : ""}）：${pm.action || "删除"}`, { ms: 8000 });
+                continue;
+              }
+            } catch { /* 网络 / 旧后端 → 交给正常审批 */ }
+          }
+          keep.push(pm);
+        }
+        perms = keep;
+        if (ASK_TICKETS.size > 200) {
+          const cutoff = Date.now() - 600000;
+          for (const [k, ts] of ASK_TICKETS) if (ts < cutoff) ASK_TICKETS.delete(k);
+        }
+      }
       // ★ 权限等级：命中就直接自动放行（不弹窗、不需要理由）
       if (PERM.level && PERM.level !== "ask" && perms.length) {
         const keep = [];

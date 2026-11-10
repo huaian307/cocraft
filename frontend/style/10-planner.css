@@ -1,0 +1,80 @@
+/* 10-planner.css — 策划会话（Planner，P0） */
+.planner-box { width: min(1200px, 96vw); max-height: 86vh; display: flex; flex-direction: column; }
+.planner-layout { display: grid; grid-template-columns: 260px 1fr; gap: 12px; min-height: 520px; overflow: hidden; }
+.planner-side { border-right: 1px solid var(--line, rgba(255,255,255,.12)); padding-right: 10px; display: flex; flex-direction: column; min-height: 0; }
+.planner-side-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+.planner-list { overflow: auto; display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.pl-item { text-align: left; padding: 8px 10px; border: 1px solid var(--line, rgba(255,255,255,.1)); background: var(--paper-2, rgba(255,255,255,.04)); border-radius: 8px; cursor: pointer; }
+.pl-item.on { border-color: var(--acc, #d9bd83); background: rgba(217,189,131,.12); }
+.pl-item-title { font-weight: 600; font-size: 13px; }
+.pl-item-meta { font-size: 12px; margin-top: 4px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.planner-body { overflow: auto; min-height: 0; padding-right: 4px; }
+.pl-head { margin-bottom: 10px; }
+.pl-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+/* ★Plan JSON / 说明默认收起（用户：不要工程化） */
+.pl-card > summary { cursor: pointer; font-size: 12px; color: var(--ink-faint, #aaa); list-style: none; }
+.pl-card > summary::-webkit-details-marker { display: none; }
+.pl-json-adv { padding: 0; }
+.pl-json-adv > summary { padding: 10px; }
+.pl-json-adv[open] > summary { border-bottom: 1px solid var(--line, rgba(255,255,255,.1)); }
+.pl-json-adv .pl-json { border: 0; border-radius: 0 0 10px 10px; }
+.pl-cols { display: grid; grid-template-columns: 1.1fr .9fr; gap: 12px; align-items: start; }
+.pl-card { border: 1px solid var(--line, rgba(255,255,255,.1)); background: var(--paper-2, rgba(255,255,255,.03)); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+.pl-card-h { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.pl-json { width: 100%; min-height: 380px; resize: vertical; font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; background: rgba(0,0,0,.2); color: var(--ink, #eee); border: 1px solid var(--line, rgba(255,255,255,.12)); border-radius: 8px; padding: 10px; box-sizing: border-box; }
+.pl-badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line, rgba(255,255,255,.15)); }
+.pl-badge-ok { color: #7ee787; border-color: rgba(126,231,135,.35); }
+.pl-badge-run { color: #79c0ff; border-color: rgba(121,192,255,.35); }
+.pl-badge-bad { color: #ff7b72; border-color: rgba(255,123,114,.35); }
+.pl-badge-mut { color: var(--ink-faint, #aaa); }
+.pl-v { padding: 8px 10px; border-radius: 8px; margin: 8px 0; font-size: 13px; }
+.pl-v ul { margin: 4px 0 0 18px; padding: 0; }
+.pl-v-ok { background: rgba(126,231,135,.1); border: 1px solid rgba(126,231,135,.25); }
+.pl-v-warn { background: rgba(210,153,34,.12); border: 1px solid rgba(210,153,34,.25); }
+.pl-v-bad { background: rgba(255,123,114,.1); border: 1px solid rgba(255,123,114,.25); }
+.pl-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.pl-table th, .pl-table td { border-bottom: 1px solid var(--line, rgba(255,255,255,.08)); padding: 6px 4px; text-align: left; vertical-align: top; }
+@media (max-width: 900px) { .planner-layout, .pl-cols { grid-template-columns: 1fr; } .planner-side { border-right: none; border-bottom: 1px solid var(--line, rgba(255,255,255,.12)); padding-bottom: 8px; } }
+
+.session.kind-planner .t::before { content: "策划"; display:inline-block; margin-right:6px; font-size:11px; padding:1px 6px; border-radius:999px; background:rgba(99,102,241,.14); color:#818cf8; vertical-align:middle; }
+.pl-rich { padding: 14px 16px 40px; display:flex; flex-direction:column; gap:12px; max-width: 980px; }
+.pl-rich-card { border:1px solid rgba(255,255,255,.08); border-radius:12px; background:rgba(255,255,255,.03); overflow:hidden; }
+.pl-rich-hd { display:flex; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid rgba(255,255,255,.06); font-size:13px; }
+.pl-rich-bd { padding:10px 12px; font-size:13px; line-height:1.55; }
+.pl-rich-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.pl-rich-actions button { padding:6px 10px; border-radius:8px; }
+.pl-rich-list { margin:6px 0 0 18px; padding:0; }
+.pl-rich-members { display:flex; flex-direction:column; gap:8px; margin-top:8px; }
+.pl-rich-mem { padding:8px 10px; border-radius:8px; background:rgba(255,255,255,.03); }
+.pl-rich-pre { white-space:pre-wrap; word-break:break-word; margin:0; font-size:12px; line-height:1.5; max-height:360px; overflow:auto; }
+
+/* ★主控面板：计划 / 对话 两个页签（对话 = 绑定聊天会话，面板内直接输入） */
+.pl-tabs { display:flex; gap:6px; margin: 0 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line, rgba(255,255,255,.12)); }
+.pl-tabs button { padding: 5px 12px; border-radius: 8px 8px 0 0; font-size: 13px; cursor: pointer;
+  color: var(--ink-faint, #aaa); background: transparent; border: 1px solid transparent; }
+.pl-tabs button.on { color: var(--ink, #eee); border-color: var(--line, rgba(255,255,255,.14));
+  border-bottom-color: transparent; background: var(--paper-2, rgba(255,255,255,.04)); }
+.pl-chat { display: flex; flex-direction: column; gap: 8px; min-height: 400px; }
+.pl-chat-hd { display: flex; align-items: center; gap: 8px; }
+.pl-chat-list { flex: 1; min-height: 240px; max-height: 46vh; overflow: auto; display: flex;
+  flex-direction: column; gap: 8px; padding: 8px; border-radius: 10px;
+  border: 1px solid var(--line, rgba(255,255,255,.1)); background: rgba(0,0,0,.18); }
+.pl-chat-m { padding: 8px 10px; border-radius: 10px; font-size: 13px; line-height: 1.5; max-width: 88%; }
+.pl-chat-m.user { align-self: flex-end; background: rgba(217,189,131,.14); }
+.pl-chat-m.assistant { align-self: flex-start; background: rgba(255,255,255,.05); }
+.pl-chat-m b { display: block; font-size: 11px; opacity: .7; margin-bottom: 2px; }
+.pl-chat-send { display: flex; gap: 8px; align-items: flex-end; }
+.pl-chat-send textarea { flex: 1; min-height: 52px; max-height: 140px; resize: vertical;
+  font: 13px/1.5 inherit; padding: 8px 10px; border-radius: 8px; color: var(--ink, #eee);
+  border: 1px solid var(--line, rgba(255,255,255,.12)); background: rgba(0,0,0,.2); }
+.pl-chat-send button { height: 34px; padding: 0 16px; }
+
+/* ★主次操作分离：计划页只露 5 个常用按钮，报告/交接/重试/隔离/删除收进「更多操作」 */
+.pl-more { margin: -2px 0 10px; }
+.pl-more > summary { cursor: pointer; font-size: 12px; color: var(--ink-faint, #aaa); padding: 4px 2px; list-style: none; }
+.pl-more > summary::-webkit-details-marker { display: none; }
+.pl-more[open] > summary { color: var(--ink, #eee); }
+.pl-more-menu { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px;
+  margin-top: 4px; border: 1px solid var(--line, rgba(255,255,255,.1));
+  border-radius: 10px; background: rgba(0,0,0,.12); }
+.pl-more-menu button { padding: 5px 10px; border-radius: 8px; font-size: 12px; }

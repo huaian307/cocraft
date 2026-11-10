@@ -1,0 +1,135 @@
+/* 09-cu.css —— 通用工具（桌面 cu / 浏览器 CDP）列表
+ *
+ * 外壳复用 .wp / .wp-box / .wp-head / .wp-list / .wp-foot（见 05-settings.css），
+ * 这里只加「状态条 + 工具行」的样式。
+ */
+
+.cu-box { width: min(980px, 94vw); }
+
+/* ---- 顶部状态条：动作权限 / 租约 / UIA 宿主 / 浏览器 ---- */
+.cu-chips {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin: 8px 0 10px;
+}
+.cu-chip {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 4px 9px; border-radius: 999px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+  font-size: 11.5px; line-height: 1.5;
+}
+.cu-chip i { font-style: normal; color: var(--ink-faint); }
+.cu-chip b { font-weight: 600; color: var(--ink); }
+.cu-chip.cu-ok { border-color: color-mix(in srgb, #3fb950 45%, transparent); }
+.cu-chip.cu-ok b { color: #3fb950; }
+.cu-chip.cu-warn { border-color: color-mix(in srgb, var(--gold) 55%, transparent); }
+.cu-chip.cu-warn b { color: var(--gold); }
+.cu-chip.cu-mute b { color: var(--ink-faint); font-weight: 500; }
+
+/* ---- 分组标题（按「能力」分：观察 / 操作 / 导航 / 等待 / 取证 / 执行 / 资源） ---- */
+.cu-list { grid-template-columns: 1fr; }      /* 一行一条，说明更好读 */
+.cu-group {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 10px 2px 2px;
+  border-bottom: 1px solid var(--line);
+}
+.cu-group:first-child { padding-top: 0; }
+.cu-group b { font-family: var(--serif); font-size: 13px; letter-spacing: .04em; }
+.cu-group .cu-count {
+  flex: none; font-size: 10px; line-height: 1.5; padding: 0 5px;
+  border-radius: 999px; border: 1px solid var(--line); color: var(--ink-faint);
+}
+.cu-group .cu-hint { font-size: 11px; color: var(--ink-faint); }
+
+/* ---- 单个工具 ---- */
+.cu-item {
+  padding: 9px 10px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ink) 2%, transparent);
+}
+.cu-top {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.cu-top b {
+  font-size: 13px; letter-spacing: .02em; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 平台标签：桌面 / 网页 / 通用（能力分组之下再看跑在哪） */
+.cu-surface {
+  flex: none; font-size: 10px; line-height: 1.5; padding: 0 5px;
+  border-radius: 4px; border: 1px solid var(--line); color: var(--ink-faint);
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+.cu-surface.s-web { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 45%, transparent); }
+.cu-surface.s-desktop { color: #9db2ff; border-color: color-mix(in srgb, #9db2ff 45%, transparent); }
+.cu-perm {
+  flex: none;
+  font-size: 10px; line-height: 1.5; padding: 0 6px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--ink-faint);
+}
+.cu-perm.read { color: #3fb950; border-color: color-mix(in srgb, #3fb950 45%, transparent); }
+.cu-perm.action { color: var(--gold); border-color: color-mix(in srgb, var(--gold) 55%, transparent); }
+.cu-cmd {
+  margin-left: auto; flex: none;
+  font-family: var(--mono); font-size: 11px;
+  padding: 1px 6px; border-radius: 5px;
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--ink);
+}
+.cu-desc {
+  margin-top: 4px; font-size: 12px; line-height: 1.65; color: var(--ink-dim);
+}
+.cu-warn {
+  margin-top: 4px; font-size: 11px; color: var(--gold);
+}
+.cu-ex {
+  margin-top: 6px;
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px; border-radius: 6px;
+  border: 1px dashed color-mix(in srgb, var(--line) 90%, transparent);
+  cursor: copy;
+}
+.cu-ex:hover, .cu-ex:focus-visible {
+  border-color: color-mix(in srgb, var(--gold) 55%, transparent);
+  background: color-mix(in srgb, var(--gold) 7%, transparent);
+}
+.cu-ex code {
+  flex: 1 1 auto; min-width: 0;
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink);
+  overflow-x: auto; white-space: nowrap;
+}
+.cu-ex .cu-cp {
+  flex: none; font-size: 10.5px; color: var(--ink-faint);
+}
+.cu-ex:hover .cu-cp, .cu-ex:focus-visible .cu-cp { color: var(--gold); }
+
+/* ---- 「允许桌面操作」开关（本机治理；工作流不受它影响）---- */
+.cu-acts {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 8px; padding: 0 2px;
+}
+.cu-switch {
+  display: inline-flex; align-items: center; gap: 8px;
+  flex: none; width: auto;              /* ⚠ 顶栏是固定 34px 方钮，这里按 id 放开 */
+  padding: 5px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--paper-2);
+  color: var(--ink-dim); font-size: 11.5px; cursor: pointer;
+}
+.cu-switch .cu-st {
+  font-weight: 600; font-size: 11px;
+  padding: 1px 7px; border-radius: 999px;
+  background: transparent; border: 1px solid var(--line);
+}
+.cu-switch[aria-pressed="true"] {
+  color: var(--gold); border-color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 14%, transparent);
+}
+.cu-switch[aria-pressed="true"] .cu-st { border-color: var(--gold); color: var(--gold); }
+.cu-switch:hover { border-color: var(--gold); }
+.cu-acthint { flex: 1 1 240px; min-width: 0; font-size: 11px; line-height: 1.5; }
+
+@media (max-width: 720px) {
+  .cu-box { width: 100vw; }
+  .cu-cmd { margin-left: 0; }
+}

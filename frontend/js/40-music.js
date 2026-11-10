@@ -68,22 +68,21 @@ function setPlayerFold(folded) {
   try { localStorage.setItem("cocraft.player.folded2", MUSIC.folded ? "1" : "0"); } catch { /* 隐私模式 */ }
 }
 
-/** 顶栏「群聊 / 音乐」按钮：任一开着就高亮；菜单项也标一下。 */
+/** 工具菜单（扳手）里的「在线协作 / 音乐」：任一开着就高亮；顺手刷未读 / 工作中徽章。
+ *  ★ 原来挂在顶栏 #btn-hub 上，现在两项收进扳手菜单（#tm-chat / #tm-music）。 */
 function syncHubBtn() {
-  const b = $("btn-hub");
   const chatOn = (typeof cocraftIsOpen === "function") && cocraftIsOpen();
-  if (b) {
-    b.classList.toggle("on", !!(chatOn || MUSIC.shown));
+  const ch = $("tm-chat"), mu = $("tm-music");
+  if (ch) {
+    ch.classList.toggle("on", !!chatOn);
     // ★未读徽章（群聊）
     const u = (typeof ccUnreadTotal === "function") ? ccUnreadTotal() : 0;
-    b.classList.toggle("has-unread", u > 0);
-    if (u) b.setAttribute("data-unread", u > 99 ? "99+" : String(u));
-    else b.removeAttribute("data-unread");
+    ch.classList.toggle("has-unread", u > 0);
+    if (u) ch.setAttribute("data-unread", u > 99 ? "99+" : String(u));
+    else ch.removeAttribute("data-unread");
   }
+  if (mu) mu.classList.toggle("on", !!MUSIC.shown);
   if (typeof ccActBadge === "function") ccActBadge();   // ★C1：有成员在干活 → 「工作中」角标
-  const c = $("hm-chat"), m = $("hm-music");
-  if (c) c.classList.toggle("on", !!chatOn);
-  if (m) m.classList.toggle("on", !!MUSIC.shown);
 }
 
 /** 播放条是否显示：默认**隐藏**，从顶栏「群聊 / 音乐」里选「音乐」才出现在输入框上方；× 可隐去。 */
@@ -466,7 +465,7 @@ function buildVis(box, n) {
 }
 
 const VIS_WEIGHT = 48;               // 柱子数，与 spectrum.py 的 BANDS 对齐（没数据时先摆这些）
-let visIdleAt = 0;
+let spectrumWasPlaying = false;      // 刚停歌时把残留柱子落回基线（不再空闲轮询）
 
 /* 频谱值(0~1) → 柱高百分比。
    不做压缩的话等于把 0~1 直接当 0~100%，中等音量就顶到天（"一点声音就拉满"）；
@@ -523,24 +522,40 @@ async function drawSpectrum() {
   const playing = musicPlaying();
   const sidesOn = document.documentElement.classList.contains("spec-sides");
   // 三个目标：播放条里的 p-vis、收起时输入框上方的 vis-bar、会话区两侧的 spec-*
-  const activePlayer = MUSIC.real && !collapsed && playing && bar.classList.contains("on");
-  const activeVis = MUSIC.real && collapsed;
-  const activeSides = MUSIC.real && !collapsed && sidesOn;
+  // ★只有**正在放歌**才轮询 /qq/spectrum；空闲不再打接口、也不会拉起采集进程。
+  const activePlayer = !collapsed && playing && bar.classList.contains("on");
+  const activeVis = collapsed && playing;
+  const activeSides = !collapsed && sidesOn && playing;
   const active = activePlayer || activeVis || activeSides;
-  bar.classList.toggle("real", activePlayer);
-  vis.classList.toggle("real", activeVis);
-  vis.classList.toggle("playing", activeVis && playing);
-  if (!active || spectrumBusy) return;
-  if (!playing) {                                  // 没在放歌时降频，别 70ms 打一次接口
-    const now = Date.now();
-    if (now - visIdleAt < 600) return;
-    visIdleAt = now;
+
+  if (!playing) {
+    if (spectrumWasPlaying) {
+      spectrumWasPlaying = false;
+      const zeros = new Array(VIS_WEIGHT).fill(0);
+      try { paintBars(vis, zeros, 5); } catch { /* ignore */ }
+      try { const pv = $("p-vis"); if (pv) paintBars(pv, zeros, 8); } catch { /* ignore */ }
+      try { paintSides(zeros); } catch { /* ignore */ }
+    }
+    bar.classList.remove("real");
+    vis.classList.remove("real", "playing");
+    return;
   }
+  spectrumWasPlaying = true;
+  if (!active || spectrumBusy) return;
+
   spectrumBusy = true;
   try {
-    const r = await api("/qq/spectrum");
+    const r = await api("/qq/spectrum?playing=1");   // 带 playing=1：服务端才按需拉起采集器
     const bars = (r && r.bars) || [];
-    if (!bars.length) return;
+    if (!bars.length) {                              // 刚拉起/设备异常 → 先退回合成动画
+      bar.classList.remove("real");
+      vis.classList.remove("real");
+      return;
+    }
+    MUSIC.real = true;
+    bar.classList.toggle("real", activePlayer);
+    vis.classList.toggle("real", activeVis);
+    vis.classList.toggle("playing", activeVis);
     if (activeVis) paintBars(vis, bars, 5);
     if (activePlayer) paintBars($("p-vis"), pickEven(bars, 12), 8);
     if (activeSides) paintSides(bars);
