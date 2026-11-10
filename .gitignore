@@ -79,3 +79,7 @@ desktop.ini
 
 # 群聊文件落地目录（agent 工作区里的收件箱，运行期产物）
 cocraft-inbox/
+
+# ---- 随包 agent 的本地构建素材（node 运行时 + npm；由 packaging/build.py 复制进 payload）----
+#      107 MB 的二进制，按 docs/BUILD.md §2 从本机准备，不入库。
+agents/

@@ -30,12 +30,14 @@ r"""把 cocraft 打包成安装包（Inno Setup）要用的 payload。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 import zipfile
 
@@ -45,8 +47,37 @@ DIST = os.path.join(ROOT, "dist")
 PAYLOAD = os.path.join(DIST, "payload")
 CACHE = os.path.join(DIST, "cache")
 
-PY_VER = "3.12.10"
-PY_URL = f"https://www.python.org/ftp/python/{PY_VER}/python-{PY_VER}-embed-amd64.zip"
+LOCK_FILE = os.path.join(HERE, "deps.lock.json")
+
+
+def _load_lock() -> dict:
+    """读构建依赖锁（缺失/坏了不致命，回落到内置默认值；`--check-lock` 会明确报错）。"""
+    try:
+        with open(LOCK_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+LOCK = _load_lock()
+
+
+def _first_dir(*cands) -> str:
+    for c in cands:
+        if c and os.path.isdir(c):
+            return c
+    return ""
+
+
+NODE_VER = str((LOCK.get("node") or {}).get("version") or "22.23.3")
+NODE_SHA256 = str((LOCK.get("node") or {}).get("sha256_node_exe") or "")
+NPM_VER = str((LOCK.get("node") or {}).get("npm_version") or "")
+
+PY_VER = str((LOCK.get("python") or {}).get("version") or "3.12.10")
+PY_URL = str((LOCK.get("python") or {}).get("url") or
+             f"https://www.python.org/ftp/python/{PY_VER}/python-{PY_VER}-embed-amd64.zip")
+PY_SHA256 = str((LOCK.get("python") or {}).get("sha256") or "")
 
 # 项目核心（要进包的东西）
 CORE = ("backend", "frontend", "tools", "launchers", "scripts", "docs")
@@ -79,8 +110,19 @@ SITE_SKIP = {
 }
 
 # 随包 agent（codex 完整路线）
-NODE_SRC = r"D:\agentlist\deepseekharness\node\node-v22.23.3-win-x64"
-CODEX_NM = r"D:\agentlist\codex\node_modules"
+# ⚠ 不再写死本机路径：优先环境变量，其次常规位置，最后仓库内 `agents/`。
+#   换机器构建：set COCRAFT_NODE_SRC=... / COCRAFT_CODEX_NM=...（见 docs/BUILD.md）
+NODE_SRC = _first_dir(
+    os.environ.get("COCRAFT_NODE_SRC"),
+    r"D:\agentlist\deepseekharness\node\node-v%s-win-x64" % NODE_VER,
+    os.path.join(ROOT, "agents", "node", "node-v%s-win-x64" % NODE_VER),
+    os.path.join(ROOT, "agents", "node"),
+)
+CODEX_NM = _first_dir(
+    os.environ.get("COCRAFT_CODEX_NM"),
+    r"D:\agentlist\codex\node_modules",
+    os.path.join(ROOT, "agents", "codex", "node_modules"),
+)
 CODEX_ACP = os.path.join(CODEX_NM, "@agentclientprotocol", "codex-acp")
 # codex-acp 运行需要的依赖（package.json 里的 dependencies + 平台原生包）
 CODEX_DEPS = [
@@ -114,6 +156,26 @@ def log(msg: str) -> None:
     print(msg.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_sha256(path: str, expected: str, label: str) -> None:
+    """锁文件里有 sha256 就校验；不一致直接停（别把来路不明的二进制打进包）。"""
+    if not expected or os.environ.get("COCRAFT_SKIP_HASH"):
+        return
+    got = _sha256_file(path)
+    if got.lower() != str(expected).lower():
+        raise SystemExit(
+            "[BAD] %s 的 SHA256 与 deps.lock.json 不一致：\n  got: %s\n  want: %s\n"
+            "  如果你确实要换版本，先更新 packaging/deps.lock.json；临时跳过设 "
+            "COCRAFT_SKIP_HASH=1。" % (label, got, expected))
+
+
 def copytree(src, dst, skip_names=()):
     """复制目录；`skip_names` 里的名字（目录或文件）跳过。"""
     def ignore(_dir, names):
@@ -138,6 +200,7 @@ def fetch_python() -> str:
         urllib.request.urlretrieve(PY_URL, zip_path)
     else:
         log("[1/6] 复用缓存的嵌入式 Python")
+    _verify_sha256(zip_path, PY_SHA256, "嵌入式 Python %s" % PY_VER)
     out = os.path.join(PAYLOAD, "python")
     if os.path.isfile(os.path.join(out, "pythonw.exe")):
         return out
@@ -362,12 +425,87 @@ def _tier1_protect(app: str, init_state_path: str) -> None:
     log("      档1 去源码：.pyc %d / 启动壳 %d / 保留源码 %d" % (n_pyc, n_shim, n_keep))
 
 
+ALLOW_DRIFT = False
+
+
+def _pkg_json_version(pkg_dir: str) -> str:
+    pj = os.path.join(pkg_dir, "package.json")
+    try:
+        with open(pj, "r", encoding="utf-8") as fh:
+            return str((json.load(fh) or {}).get("version") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _check_codex_versions() -> None:
+    """本地 codex 依赖必须与 deps.lock.json 一致（除非 --allow-drift）。"""
+    want = LOCK.get("codex_deps") or {}
+    bad = []
+    for _src, rel in CODEX_DEPS:
+        got = _pkg_json_version(os.path.join(CODEX_NM, *rel.split("/")))
+        exp = str(want.get(rel) or "")
+        if exp and got and got != exp:
+            bad.append("%s: %s != %s" % (rel, got, exp))
+    if bad and not ALLOW_DRIFT:
+        raise SystemExit(
+            "[BAD] codex 依赖版本与 deps.lock.json 不一致：\n  " + "\n  ".join(bad) +
+            "\n  要么更新锁文件，要么临时加 --allow-drift。")
+
+
+def _site_versions(site: str) -> dict:
+    """从 `*.dist-info/METADATA` 读已安装版本（不依赖 pip）。"""
+    out = {}
+    try:
+        names = os.listdir(site)
+    except OSError:
+        return out
+    for d in names:
+        if not d.endswith(".dist-info"):
+            continue
+        meta = os.path.join(site, d, "METADATA")
+        name = ver = ""
+        try:
+            with open(meta, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("Name: "):
+                        name = line[6:].strip()
+                    elif line.startswith("Version: "):
+                        ver = line[9:].strip()
+                    if name and ver:
+                        break
+        except OSError:
+            continue
+        if name:
+            out[name.lower()] = ver
+    return out
+
+
+def _check_component_versions(name: str, site: str) -> None:
+    """组件 venv 的关键包版本必须与锁一致（除非 --allow-drift）。"""
+    want = (LOCK.get("components") or {}).get(name) or []
+    if not want:
+        return
+    got = _site_versions(site)
+    bad = []
+    for spec in want:
+        n, _, v = str(spec).partition("==")
+        g = got.get(n.lower())
+        if g and v and g != v:
+            bad.append("%s: %s != %s" % (n, g, v))
+    if bad and not ALLOW_DRIFT:
+        raise SystemExit(
+            "[BAD] 组件 %s 的版本与 deps.lock.json 不一致：\n  %s\n"
+            "  先按 docs/BUILD.md 重建 venv（或临时加 --allow-drift）。"
+            % (name, "\n  ".join(bad)))
+
+
 def stage_components(which) -> None:
     for name in which:
         src = VENV_SITE.get(name, "")
         if not src or not os.path.isdir(src):
             log("[!] 可选组件 %s 没有可用的 site-packages：%s" % (name, src))
             continue
+        _check_component_versions(name, src)
         dst = os.path.join(PAYLOAD, "components", name, "site-packages")
         if os.path.isdir(dst):
             shutil.rmtree(dst)
@@ -385,11 +523,28 @@ def stage_components(which) -> None:
 
 def _portable_node() -> str:
     """构建机上可用的 node.exe（便携那份优先）。"""
-    p = os.path.join(NODE_SRC, "node.exe")
-    if os.path.isfile(p):
+    p = os.path.join(NODE_SRC, "node.exe") if NODE_SRC else ""
+    if p and os.path.isfile(p):
         return p
     import shutil as _sh
     return _sh.which("node") or ""
+
+
+def _split_pkg(spec: str) -> tuple:
+    """`@scope/name@1.2.3` → (`@scope/name`, `1.2.3`)；没版本 → (name, "")。"""
+    name, sep, ver = str(spec or "").rpartition("@")
+    if sep and name:
+        return name, ver
+    return str(spec or ""), ""
+
+
+def _pinned_pkg(pkg: str) -> str:
+    """按锁文件补版本：`opencode-ai` → `opencode-ai@1.19.0`。"""
+    name, ver = _split_pkg(pkg)
+    if ver:
+        return pkg
+    want = (LOCK.get("npm") or {}).get(name)
+    return "%s@%s" % (name, want) if want else pkg
 
 
 def _npm_install_adapter(pkg: str) -> str:
@@ -397,21 +552,31 @@ def _npm_install_adapter(pkg: str) -> str:
 
     ⚠ 只在**构建机**上下载（联网），产物进 payload；目标机器不需要 npm。
       装的是"只有这一个包 + 它的运行依赖"（`--omit=dev`），所以 node_modules 很干净。
+    ★ 版本从 `packaging/deps.lock.json` 补（没锁到就退回不指定版本，并打印警告）。
     """
+    spec = _pinned_pkg(pkg)
+    name, ver = _split_pkg(spec)
+    if not ver:
+        log("      [!] deps.lock.json 没有 %s 的版本 —— 这次会装最新版（不建议）" % name)
     node = _portable_node()
     if not node:
-        log("      [skip] 构建机上没有 node，装不了 %s" % pkg)
+        log("      [skip] 构建机上没有 node，装不了 %s" % spec)
         return ""
     npm_cli = os.path.join(os.path.dirname(node), "node_modules", "npm", "bin", "npm-cli.js")
-    prefix = os.path.join(CACHE, "npm-" + re.sub(r"[^a-z0-9]+", "_", pkg.lower()))
+    prefix = os.path.join(CACHE, "npm-" + re.sub(r"[^a-z0-9]+", "_", name.lower()))
     nm = os.path.join(prefix, "node_modules")
-    if os.path.isdir(os.path.join(nm, *pkg.split("/"))):
-        log("      复用已下载的 %s" % pkg)
-        return nm
+    pkg_dir = os.path.join(nm, *name.split("/"))
+    if os.path.isdir(pkg_dir):
+        got = _pkg_json_version(pkg_dir)
+        if not ver or not got or got == ver:
+            log("      复用已下载的 %s（本地 %s）" % (spec, got or "?"))
+            return nm
+        log("      版本变了（%s -> %s），重装 %s" % (got, ver, name))
+        shutil.rmtree(prefix, ignore_errors=True)
     os.makedirs(prefix, exist_ok=True)
-    log("      npm 安装 %s（联网，首次会慢一点）..." % pkg)
+    log("      npm 安装 %s（联网，首次会慢一点）..." % spec)
     cmd = [node, npm_cli, "install", "--prefix", prefix, "--omit=dev",
-           "--no-audit", "--no-fund", "--loglevel=error", pkg]
+           "--no-audit", "--no-fund", "--loglevel=error", spec]
     # ⚠ npm 的 postinstall 会用裸 `node`（如 opencode-ai 是 `node ./postinstall.mjs`）——
     #   我们的便携 node 不在 PATH 上，必须把它的目录塞进 PATH，否则 postinstall 直接失败
     #   （实测：opencode-ai 装完 node_modules 是空的）。子进程继承这份 env 即可。
@@ -423,7 +588,7 @@ def _npm_install_adapter(pkg: str) -> str:
     except Exception as exc:  # noqa: BLE001
         log("      [skip] npm 失败：%r" % (exc,))
         return ""
-    if not os.path.isdir(os.path.join(nm, *pkg.split("/"))):
+    if not os.path.isdir(os.path.join(nm, *name.split("/"))):
         log("      [skip] npm 没装成（rc=%s）：%s" % (r.returncode, (r.stderr or "")[-300:]))
         return ""
     return nm
@@ -431,12 +596,37 @@ def _npm_install_adapter(pkg: str) -> str:
 
 def _stage_node() -> int:
     """随包 node 运行时（两个 agent 适配器共用）。"""
+    node_exe = _portable_node()
+    if not node_exe or not os.path.isfile(node_exe):
+        raise SystemExit(
+            "[BAD] 找不到 node.exe（需要 node v%s）。\n"
+            "  设 COCRAFT_NODE_SRC 指向解压目录，例如：\n"
+            "    set COCRAFT_NODE_SRC=D:\\agentlist\\deepseekharness\\node\\node-v%s-win-x64\n"
+            "  详见 docs/BUILD.md。" % (NODE_VER, NODE_VER))
+    _verify_sha256(node_exe, NODE_SHA256, "node.exe %s" % NODE_VER)
+    node_dir = os.path.dirname(node_exe)
     node_dst = os.path.join(PAYLOAD, "agents", "node")
     os.makedirs(node_dst, exist_ok=True)
     for f in ("node.exe", "LICENSE", "README.md"):
-        s = os.path.join(NODE_SRC, f)
+        s = os.path.join(node_dir, f)
         if os.path.isfile(s):
             shutil.copy2(s, os.path.join(node_dst, f))
+    # ★必须带 npm：面板内「安装 / 更新 agent」用的是 `<node> <npm-cli.js> install`
+    #   （以前只拷 node.exe，装出来的包在安装版上**根本没有 npm**，更新按钮必然不可用）。
+    npm_src = os.path.join(node_dir, "node_modules", "npm")
+    if not os.path.isdir(npm_src):
+        raise SystemExit(
+            "[BAD] node 目录里没有 node_modules/npm：%s\n"
+            "  随包 node 必须带 npm（面板内 agent 更新依赖它）。换一个官方 node 压缩包，"
+            "或检查 COCRAFT_NODE_SRC。" % node_dir)
+    copytree(npm_src, os.path.join(node_dst, "node_modules", "npm"),
+             skip_names=("__pycache__", "docs", "man"))
+    got_npm = _pkg_json_version(npm_src)
+    if NPM_VER and got_npm and got_npm != NPM_VER:
+        raise SystemExit(
+            "[BAD] 自带 npm 版本 %s 与 deps.lock.json 的 %s 不一致；"
+            "换回对应 node 版本，或更新锁文件。" % (got_npm, NPM_VER))
+    log("      node 自带 npm %s 一并打包（面板内安装/更新要用）" % (got_npm or "?"))
     tot = 0
     for root, _d, files in os.walk(node_dst):
         for f in files:
@@ -450,6 +640,13 @@ def _stage_node() -> int:
 
 def _stage_codex() -> None:
     """随包 Codex：适配器 + 依赖 + 原生 codex CLI + **干净**的 codex-home 模板。"""
+    if not CODEX_NM or not os.path.isdir(CODEX_NM):
+        raise SystemExit(
+            "[BAD] 找不到 codex 的 node_modules。\n"
+            "  设 COCRAFT_CODEX_NM 指向它，例如：\n"
+            "    set COCRAFT_CODEX_NM=D:\\agentlist\\codex\\node_modules\n"
+            "  详见 docs/BUILD.md。")
+    _check_codex_versions()
     nm_dst = os.path.join(PAYLOAD, "agents", "codex", "node_modules")
     os.makedirs(nm_dst, exist_ok=True)
     pj = os.path.join(CODEX_NM, "..", "package.json")
@@ -588,7 +785,8 @@ def kill_stale_build_helpers() -> None:
     """
     try:
         r = subprocess.run(["taskkill", "/IM", "ISCC.exe", "/F"],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30)
         if "SUCCESS" in (r.stdout or "").upper() or r.returncode == 0:
             log("      已清掉残留的 ISCC.exe")
     except Exception:  # noqa: BLE001
@@ -597,7 +795,10 @@ def kill_stale_build_helpers() -> None:
     try:
         helper = os.path.join(ROOT, "backend", "cleanup.py")
         if os.path.isfile(helper):
-            subprocess.run([sys.executable, helper], capture_output=True, timeout=120)
+            # ⚠ 一定要给 encoding/errors：cleanup.py 打的是 UTF-8，控制台默认 GBK，
+            #   不给就会在读取线程里抛 UnicodeDecodeError（看起来像"打包失败"，其实只是噪声）。
+            subprocess.run([sys.executable, helper], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=120)
     except Exception:  # noqa: BLE001
         pass
 
@@ -667,6 +868,43 @@ def run_iscc(ver: str) -> str:
 COMPONENTS_GLOBAL: list = []
 
 
+def check_lock(strict: bool = False) -> int:
+    """校验依赖锁 + 打印本机构建素材是否就位（CI 用 `--check-lock`）。"""
+    ok = True
+    log("[lock] %s" % LOCK_FILE)
+    if not LOCK:
+        log("[BAD] 读不到 deps.lock.json（构建依赖未锁定）")
+        return 1
+    log("  python  %s  sha256=%s" % (
+        (LOCK.get("python") or {}).get("version"),
+        ((LOCK.get("python") or {}).get("sha256") or "")[:16] + "..."))
+    log("  node    %s  npm %s  sha256=%s" % (NODE_VER, NPM_VER or "?",
+                                                 (NODE_SHA256 or "")[:16] + "..."))
+    for k, v in sorted((LOCK.get("npm") or {}).items()):
+        log("  npm     %s@%s" % (k, v))
+    for name, specs in sorted((LOCK.get("components") or {}).items()):
+        log("  comp    %-9s %d packages" % (name, len(specs or [])))
+
+    missing = []
+    if not NODE_SRC or not os.path.isfile(os.path.join(NODE_SRC, "node.exe")):
+        missing.append("node.exe（设 COCRAFT_NODE_SRC）")
+    if not CODEX_NM or not os.path.isdir(CODEX_NM):
+        missing.append("codex node_modules（设 COCRAFT_CODEX_NM）")
+    for name, site in VENV_SITE.items():
+        if not os.path.isdir(site):
+            missing.append("组件 venv：%s（%s）" % (name, site))
+    if not any(os.path.isfile(p) for p in ISCC_CANDIDATES):
+        log("  [warn] 没找到 ISCC.exe（只影响出 exe；--no-iss 不需要）")
+    if missing:
+        log("  [warn] 本机缺这些构建素材（只影响完整打包）：")
+        for m in missing:
+            log("         - %s" % m)
+        if strict:
+            ok = False
+    log("[lock] %s" % ("OK" if ok else "MISSING（--strict）"))
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="打包 cocraft 安装包")
     ap.add_argument("--agents", default="codex,claude,opencode",
@@ -676,9 +914,18 @@ def main() -> int:
     ap.add_argument("--no-iss", action="store_true", help="只准备 payload，不编译安装包")
     ap.add_argument("--no-protect", action="store_true",
                     help="不做「档1 去源码」（调试用，保留 .py 源码）")
+    ap.add_argument("--check-lock", action="store_true",
+                    help="只校验 packaging/deps.lock.json 与本机构建素材，不打包")
+    ap.add_argument("--strict", action="store_true",
+                    help="配合 --check-lock：缺构建素材也算失败")
+    ap.add_argument("--allow-drift", action="store_true",
+                    help="允许组件/codex 依赖版本与锁文件不一致（不推荐）")
     args = ap.parse_args()
 
-    global COMPONENTS_GLOBAL, _PROTECT
+    global COMPONENTS_GLOBAL, _PROTECT, ALLOW_DRIFT
+    ALLOW_DRIFT = bool(args.allow_drift)
+    if args.check_lock:
+        return check_lock(args.strict)
     _PROTECT = not args.no_protect
     COMPONENTS_GLOBAL = [c.strip() for c in args.components.split(",") if c.strip()]
     # 兼容旧名：panel6（已弃用的 PySide6 尝试）统一回 panel（pywebview）

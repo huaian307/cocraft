@@ -34,6 +34,10 @@ jobs:
           python tools/jsbalance.py frontend/app.js
           python tools/check_ids.py
 
+      - name: Validate build dependency lock
+        shell: pwsh
+        run: python packaging/build.py --check-lock
+
       - name: Start panel server on 8787
         shell: pwsh
         run: |
