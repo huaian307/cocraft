@@ -61,12 +61,12 @@ TEST = """<script>
   async function run() {
     var out = { errs: window.__probeErr.slice() };
     try {
-      // ⚠ 2026-10-16 修正：**夜主题已在 `ui 0.1.50` 删除**（只剩「昼」`data-theme="hiru"`），
+      // ⚠ `ui 0.2.123`：夜主题（0.1.50）与「和纸白昼」都删了 → `data-theme` 恒为 `chapel`。
       //   所以这里不再有「点 夜/昼 按钮」的玩法 —— 断言改成"那个按钮确实不存在"，
       //   并且**不硬编码颜色值**（拿应用前的 `--paper` 当基准比大小），免得主题包一改就误报。
       //   ⚠ 还必须**先回内置再取基准**：探针页的 localStorage 会跨次复用，上次跑完留下的用户主题
       //     会让"基准"本身就是某个主题的颜色 → 后面的比较全错。
-      applyTheme("hiru");
+      applyTheme("chapel");
       await sleep(250);
       out.paperBefore = paper();
       out.baseBefore = document.documentElement.dataset.theme || "";
@@ -93,7 +93,7 @@ TEST = """<script>
       out.listCards = document.querySelectorAll("#th-list .wp-it").length;
 
       // 恢复路径 A：点内置卡片「套用」
-      var cardBtn = document.querySelector('#th-list [data-th-apply="hiru"]');
+      var cardBtn = document.querySelector('#th-list [data-th-apply="chapel"]');
       out.foundBuiltinCard = !!cardBtn;
       if (cardBtn) { cardBtn.click(); await sleep(500); }
       out.cardUser = themeUser();
@@ -115,7 +115,7 @@ TEST = """<script>
       out.iconOff = !document.querySelector("#btn-tools").hasAttribute("data-ico-on");
 
       // 最终：直接回内置
-      applyTheme("hiru");
+      applyTheme("chapel");
       out.afterRevertUser = document.documentElement.dataset.themeUser || "";
       out.afterRevertPaper = paper();
       out.afterRevertBase = document.documentElement.dataset.theme || "";
@@ -192,7 +192,7 @@ def main() -> int:
 
     checks = [
         ("★夜主题已删：页面上没有「夜/昼」按钮（`#btn-theme`）", d.get("hasNightBtn") is False),
-        ("底盘是「昼」`data-theme=hiru`", d.get("baseBefore") == "hiru" and d.get("techBase") == "hiru"),
+        ("定盘是 chapel（`data-theme=chapel`）", d.get("baseBefore") == "chapel" and d.get("techBase") == "chapel"),
         ("双模式：用户主题生效", d.get("techUser") == "cocraft-tech"),
         ("★双模式：用户主题**真的换了变量**（`--paper` 与内置不同）",
          bool(d.get("techPaper")) and d.get("techPaper") != d.get("paperBefore")),
@@ -212,9 +212,9 @@ def main() -> int:
         ("图标槽：清掉", d.get("iconOff") is True),
         ("恢复内置：清 data-theme-user", d.get("afterRevertUser") == ""),
         ("恢复内置：变量回内置值", d.get("afterRevertPaper") == d.get("paperBefore")),
-        ("恢复内置：底盘仍是 hiru（夜主题已删）", d.get("afterRevertBase") == "hiru"),
+        ("恢复内置：定盘仍是 chapel", d.get("afterRevertBase") == "chapel"),
         ("恢复内置：样式清空", d.get("styleCleared") is True),
-        ("★内置主题 2 个（圣烛教堂默认 + 和纸白昼）", d.get("builtinCount") == 2),
+        ("★内置主题只剩 1 个（圣烛教堂；和纸白昼已删）", d.get("builtinCount") == 1),
         ("已安装 ≥ 3 个", (d.get("installedCount") or 0) >= 3),
         ("列表渲染出卡片", (d.get("listCards") or 0) >= 4),
         ("当前主题唯一高亮", (d.get("activeCards") or 0) == 1),

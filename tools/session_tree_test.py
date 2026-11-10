@@ -164,6 +164,18 @@ var PA = "D:\\projA", PB = "D:\\projB";
          && !__treeBtn("ses_d"),
          "a=" + !!__treeBtn("ses_a") + " c=" + !!__treeBtn("ses_c") + " d=" + !!__treeBtn("ses_d"));
 
+    /* 1b. ★工作区：**收起时只显示项目名**，展开文件树 / 详情才显示完整路径 */
+    try {
+      var chip0 = document.querySelector('#session-list [data-ws]');
+      var projChip = document.querySelector('#session-list .proj:not(.ws)');
+      out.info.chip0 = projChip ? projChip.textContent.trim() : "(没有)";
+      step("★收起时只显示**项目名**（不再每行挂一条长路径）",
+           !chip0 && !!projChip && /^proj[AB]$/i.test(projChip.textContent.trim()),
+           "chip0=" + !!chip0 + " proj=" + out.info.chip0);
+      step("★没有工作目录的会话，收起时**不占位**（不刷「未指定工作区」）",
+           !document.querySelector('#session-list .proj.ws.none'), "none 存在");
+    } catch (e) { step("★工作区胶囊断言没抛异常", false, String(e)); }
+
     /* 2. 点 🗂 → 拉根目录，树出现 */
     var cur0 = state.current && state.current.id;
     __treeBtn("ses_a").click();
@@ -177,6 +189,15 @@ var PA = "D:\\projA", PB = "D:\\projB";
          __tree("ses_a") ? __tree("ses_a").textContent.slice(0, 60) : "(无树)");
     step("★展开 🗂 不会顺手把这条会话打开", (state.current && state.current.id) === cur0,
          "before=" + cur0 + " after=" + (state.current && state.current.id));
+
+    /* 2b. ★展开之后才显示完整工作区路径（点一下可复制） */
+    try {
+      var chip1 = document.querySelector('#session-list [data-ws]');
+      out.info.chip1 = chip1 ? chip1.textContent.trim() : "(没有)";
+      step("★展开文件树后，会话行显示**完整工作区路径**（可复制）",
+           !!chip1 && chip1.textContent.trim() === PA && chip1.dataset.ws === PA,
+           out.info.chip1 + " / data-ws=" + (chip1 ? chip1.dataset.ws : ""));
+    } catch (e) { step("★展开后的工作区断言没抛异常", false, String(e)); }
 
     /* 3. 点目录 → 懒加载 */
     __row("ses_a", "sdir", PA + "\\src").click();
@@ -219,7 +240,12 @@ var PA = "D:\\projA", PB = "D:\\projB";
     step("★打开的是**那棵树的项目 + 那个文件**（不依赖当前会话目录）",
          CODE.root === PA && CODE.sel === PA + "\\README.md", CODE.root + " | " + CODE.sel);
     var ed = document.getElementById("code-editor");
-    step("★编辑器里真有内容", !!ed && /probe/.test(ed.value), ed ? ed.value.slice(0, 40) : "(没有编辑器)");
+    // ⚠ README.md 现在是**渲染出来的**（`ui 0.2.91`）：正文在预览层，不在 textarea 里
+    var mdv = document.querySelector("#code-preview .cp-md");
+    var shown = mdv ? mdv.textContent : (ed ? ed.value : "");
+    step("★文件内容真有（md 走渲染 / 其它走编辑器）",
+         !!shown && /probe/.test(shown),
+         (mdv ? "md:" : "editor:") + String(shown).slice(0, 40));
     step("★左侧树里那个文件被高亮（.on）",
          !!__row("ses_a", "sfile", PA + "\\README.md")
          && __row("ses_a", "sfile", PA + "\\README.md").classList.contains("on"),

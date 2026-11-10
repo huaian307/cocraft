@@ -136,12 +136,58 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
     /* ---------- 4. 事件：session.usage.update 实时更新 ---------- */
     state.current.context = null;
     handleEvent({ type: "session.usage.update",
-                  data: { sessionID: "s1", used: 960000, size: 1000000 } });
+                  data: { sessionID: "s1", used: 960000, size: 1000000,
+                          model: "deepseek-v4-flash" } });
     await __s(80);
     step("★usage_update 事件 → 立刻变「剩 4%」+ 红",
          /剩 4%/.test(__txt(chip)) && chip.classList.contains("danger")
          && state.current.context && state.current.context.used === 960000,
          __txt(chip) + " ctx=" + JSON.stringify(state.current.context));
+
+    // 老后端的事件不带 model → 按「当前模型」记，不能被 4a 的旧模型判断误杀
+    handleEvent({ type: "session.usage.update",
+                  data: { sessionID: "s1", used: 100, size: 1000000 } });
+    await __s(80);
+    step("★事件没带 model → 按当前模型记（不会当成旧窗口）",
+         state.current.context && state.current.context.model === "deepseek-v4-flash",
+         JSON.stringify(state.current.context));
+
+    /* ---------- 4a. 切过模型：旧模型上报的窗口不能冒充新模型 ---------- */
+    state.current = { id: "s1", title: "t",
+                      model: { id: "deepseek/deepseek-flash", providerID: "acp" },
+                      context: { used: 124120, size: 262144, model: "iceman-free" } };
+    state.messages = [];
+    ctxSync();
+    step("★旧模型上报的 256K 不冒充新模型（显示「—」）",
+         /上下文 —/.test(__txt(chip)) && !/剩/.test(__txt(chip)), __txt(chip));
+    step("★tooltip 说清是「切过模型」而不是没上报",
+         /切过模型/.test(chip.title), chip.title.replace(/\n/g, " | "));
+
+    /* ---------- 4b. 同一模型（provider 前缀不同）→ 正常 ---------- */
+    state.current.context = { used: 500000, size: 1000000, model: "deepseek-flash" };
+    ctxSync();
+    step("★context.model 短名相同 → 正常算「剩 50%」",
+         /剩 50%/.test(__txt(chip)), __txt(chip));
+
+    /* ---------- 4c. 老 context 没记模型 + 会话里出现过别的模型 → 不信 ---------- */
+    state.current.context = { used: 124120, size: 262144 };
+    state.messages = [{ type: "assistant", model: { id: "iceman-free" },
+                        time: { created: 1, completed: 2 },
+                        content: [{ type: "text", text: "x" }] }];
+    ctxSync();
+    step("★老 context 没记模型 + 出现过别的模型 → 不显示旧窗口",
+         /上下文 —/.test(__txt(chip)), __txt(chip));
+
+    /* ---------- 4d. 老 context + 「已切换模型」系统提示（本地消息模型被覆盖成新模型） ---------- */
+    state.current.context = { used: 124120, size: 262144 };
+    state.messages = [{ type: "assistant", model: { id: "deepseek/deepseek-flash" },
+                        time: { created: 1, completed: 2 },
+                        content: [{ type: "text", text: "x" }] },
+                      { type: "system",
+                        text: "已切换模型：iceman-free → deepseek/deepseek-flash" }];
+    ctxSync();
+    step("★有「已切换模型」提示 + 老 context 没记模型 → 不显示旧窗口",
+         /上下文 —/.test(__txt(chip)), __txt(chip));
 
     /* ---------- 5. 只有已用、没有窗口上限 ---------- */
     state.current = { id: "s1", title: "t", model: { id: "custom-model" } };

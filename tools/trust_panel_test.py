@@ -114,9 +114,19 @@ STUB = r"""<script>
         return J({ ok: true, items: "nope", data: "nope", runs: 5, pending: {} });
       }
     }
-    // ★审计链（信任面板新增）：stats 给条数/时间，verify 逐条重算
-    if (path === "/audit/list") {
-      return J({ ok: true, count: 1, tail: "sha256:abc123", items: [
+    // ★轮快照（0.2.85）：审计页「可退回」列表 + 隔离区的「带内容」开关
+    if (path === "/snapshot/scopes") {
+      return J({ ok: true, data: { items: [
+        { scope: "cc-7-11", ts: "20261027-215500-001", taken_at: 1793109300,
+          root: "D:/ws", label: "群聊派活", count: 12, with_content: true, runs: 3 },
+        { scope: "wf-run1-m1", ts: "20261027-215000-001", taken_at: 1793109000,
+          root: "D:/ws", label: "工作流派活", count: 5, with_content: false, runs: 1 },
+      ] } });
+    }
+    if (path === "/snapshot/config") {
+      return J({ ok: true, data: { groupContent: !!window.__snapContent } });
+    }
+    if (path === "/audit/list") {      return J({ ok: true, count: 1, tail: "sha256:abc123", items: [
         { seq: 11, ts: "2026-10-24T12:40:00.000Z", source: "ccagent",
           actor: { kind: "agent", id: "11", name: "yiyi", engine: "codex-node" },
           action: { kind: "files", title: "改了 3 个文件",
@@ -355,10 +365,9 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
     step("★拒绝/超时也留痕，破坏性单独标出来",
          /拒绝/.test(pl) && /超时未批/.test(pl) && /破坏性/.test(pl), pl);
     var uu = __txt(document.getElementById("trust-undo"));
-    step("★可撤销：隔离区记录 + 当前会话快照（复用现有入口）",
-         /隔离区/.test(uu) && /Remove-Item/.test(uu) && /快照/.test(uu)
-         && !!document.querySelector('#trust-undo [data-trust-jump="quar"]')
-         && !!document.querySelector('#trust-undo [data-trust-jump="undo"]'), uu);
+    step("★忏悔室：记录 + 打开入口",
+         /(?:忏悔室|隔离区)/.test(uu) && /Remove-Item/.test(uu)
+         && !!document.querySelector('#trust-undo [data-trust-jump="quar"]'), uu);
     var ac = __txt(document.getElementById("trust-act"));
     step("★agent 活动：中文状态 + 谁 + 做了什么",
          /完成/.test(ac) && /进行中/.test(ac) && /已拒绝/.test(ac) && /npm test/.test(ac), ac);
@@ -373,14 +382,50 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
     var dec = __txt(document.getElementById("trust-dec"));
     step("★派活/仲裁结论：推荐谁 + 哪个任务 + 谁审的",
          /推荐/.test(dec) && /方案二/.test(dec) && /重构登录/.test(dec), dec);
+
+    /* ---------- 8.5b ★审计拆成独立页（0.2.85）：信任面板只留权限 ---------- */
+    step("★信任面板里**不再**有审计链 / 改了什么 / 时间线 / 活动（都搬走了）",
+         !document.querySelector("#trust #trust-audit")
+         && !document.querySelector("#trust #trust-files")
+         && !document.querySelector("#trust #trust-permlog")
+         && !document.querySelector("#trust #trust-act")
+         && !document.querySelector("#trust #trust-dec")
+         && !document.querySelector("#trust #trust-undo")
+         && !document.querySelector("#trust #aud-snaps")
+         && !document.querySelector("#trust #trust-orch"), "还残留");
+    step("★「轮快照（可退回）」在审计页里（带内容的能退回、只有清单的按钮禁用）",
+         (function () {
+           var box = document.getElementById("aud-snaps");
+           if (!box) return false;
+           var rows = box.querySelectorAll(".trust-row");
+           var can = box.querySelector('[data-snap-undo="cc-7-11"]');
+           var no = Array.prototype.some.call(box.querySelectorAll("button[disabled]"),
+                   function (b) { return /撤不了/.test(b.textContent); });
+           return rows.length === 2 && !!can && no;
+         })(), (function () {
+           var b = document.getElementById("aud-snaps");
+           return b ? b.textContent.replace(/\s+/g, " ").slice(0, 140) : "(没有)";
+         })());
+    step("★信任面板里留一行入口「打开『审计与活动』…」+ 链状态摘要",
+         !!document.getElementById("trust-open-audit")
+         && /链完整|空链|断裂/.test(__txt(document.getElementById("trust-audit-brief"))),
+         __txt(document.getElementById("trust-audit-brief")));
+    document.getElementById("trust-open-audit").click();
+    await __s(400);
+    step("★点入口 → 审计页打开、信任面板收起",
+         !document.getElementById("audit").hidden
+         && !!document.getElementById("trust").hidden);
+
     document.querySelector('#trust-undo [data-trust-jump="quar"]').click();
     await __s(400);
-    step("★点「打开」复用现有隔离区入口（信任面板收起）",
-         !!document.getElementById("trust").hidden
+    step("★审计页里点「打开」复用现有隔离区入口（审计页收起）",
+         !!document.getElementById("audit").hidden
          && !document.getElementById("quar").hidden);
     var qx = document.getElementById("quar-close");
     if (qx) qx.click();
     await __s(150);
+    auditOpen();
+    await __s(300);
 
     /* ---------- 8.55 ★审计链（哈希链）：条数 / 链完整 / 断裂 / 空链 ---------- */
     var au = __txt(document.getElementById("trust-audit"));
@@ -432,7 +477,7 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
       + " | " + __txt(document.getElementById("trust-audit"))
       + " | " + __txt(document.getElementById("trust-files"));
     step("★接口返回错形状（对象/字符串）也不崩，列表归一成空",
-         /还没有审批记录/.test(badTxt) && /隔离区是空的/.test(badTxt) && /还没有活动/.test(badTxt)
+         /还没有审批记录/.test(badTxt) && /(?:忏悔室|隔离区)是空的/.test(badTxt) && /还没有活动/.test(badTxt)
          && /空链/.test(badTxt) && /还没有文件改动记录/.test(badTxt),
          badTxt);
     window.__badShapes = false;
@@ -441,7 +486,7 @@ function __txt(el) { return el ? el.textContent.replace(/\s+/g, " ").trim() : ""
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     await __s(120);
-    step("★Esc 关闭面板", box.hidden);
+    step("★Esc 关闭面板（审计页）", document.getElementById("audit").hidden);
   } catch (err) {
     out.crash = String(err && err.stack ? err.stack : err);
   }
@@ -487,9 +532,36 @@ function __sh(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 """
 
 
-def build_probe(shot: bool = False) -> None:
+# 截图用（审计页）：同样先塞假数据，然后打开「审计与活动」
+SHOT_AUDIT_JS = r"""<style>
+  #audit, #audit * { transition: none !important; animation: none !important; }
+</style>
+<script>
+function __sh(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+(async function () {
+  for (var i = 0; i < 200; i++) { await __sh(25); if (window.CC && window.state) break; }
+  await __sh(300);
+  state.current = { id: "s1", title: "登录重构" };
+  state.sessions = [{ id: "s1", title: "登录重构" }];
+  CC.chatID = "7";
+  CC.msgs = [{ id: 501, chat_id: "7", sender_kind: "agent", sender_id: "11",
+               content: "🔐 **权限申请**：删除 build 目录\n类型：execute\n涉及：D:/ws/build\n请在 30 秒内回复。",
+               created_at: new Date().toISOString() }];
+  window.LEVEL = "edit";
+  window.ALWAYS = [
+    { id: "ar_1", agent: "codex-node", session: "s1", kind: "execute", path: "D:/ws", hits: 3, ts: Date.now() - 60000 }
+  ];
+  auditOpen();
+  await __sh(600);
+})();
+</script>
+"""
+
+
+def build_probe(shot: bool = False, audit: bool = False) -> None:
     src = io.open(os.path.join(WEB, "index.html"), encoding="utf-8").read()
-    out = src.replace('<script src="/app.js', STUB + (SHOT_JS if shot else PROBE_JS) + '<script src="/app.js')
+    extra = SHOT_AUDIT_JS if audit else (SHOT_JS if shot else PROBE_JS)
+    out = src.replace('<script src="/app.js', STUB + extra + '<script src="/app.js')
     if out == src:
         raise SystemExit("在 index.html 里找不到 app.js 的 <script> 标签")
     io.open(PROBE, "w", encoding="utf-8", newline="").write(out)
@@ -553,6 +625,18 @@ def main() -> int:
             HERE, "resources", "screenshots", "trust.png")
         shot = os.path.abspath(shot)
         build_probe(shot=True)
+        try:
+            take_shot(edge, shot)
+        finally:
+            if os.path.exists(PROBE):
+                os.remove(PROBE)
+        return 0
+    if "--shot-audit" in sys.argv:
+        i = sys.argv.index("--shot-audit")
+        shot = sys.argv[i + 1] if i + 1 < len(sys.argv) else os.path.join(
+            HERE, "resources", "screenshots", "audit.png")
+        shot = os.path.abspath(shot)
+        build_probe(audit=True)
         try:
             take_shot(edge, shot)
         finally:

@@ -2,13 +2,13 @@
 r"""★无头回归：官方主题「圣烛教堂」(chapel)
 
 覆盖：
-  1. 默认主题 = chapel（**新装 / 没存过**）
+  1. 默认主题 = chapel（**新装 / 没存过**）；老浏览器里的 `hiru` 自动归一成 chapel
   2. 变量真的生效（--paper / --ink / --hi 是暗色那套）
   3. 按钮：主按钮走烛金渐变（白字压金对比不够 → 必须是深色字）、危险按钮保持红
-  4. 静态背景槽跟着主题走（chapel ↔ hiru）
-  5. 弹窗校徽换成「尖拱窗 + 烛焰」(.mk-chapel)，世界树在 chapel 下隐藏
-  6. 设置里的两张内置主题卡：高亮当前 + 点一下切换（含 localStorage 持久化）
-  7. 老用户横幅：以前存的是 hiru → 出一次「新增主题」横幅，点它就能换
+  4. 静态背景槽跟着主题走（chapel 槽）
+  5. 弹窗校徽换成「尖拱窗 + 烛焰」(.mk-chapel)，世界树隐藏
+  6. 设置里**只剩一张**内置主题卡（`ui 0.2.123` 删了「和纸白昼」）
+  7. 「和纸白昼」的痕迹（卡片 / 提示条 / 切浅色）都不在了
 
 用法：python tools\theme_chapel_test.py [--shot 路径.png]
 """
@@ -113,18 +113,12 @@ function matchedColorRules(el) {
     await __s(120);
     var root = document.documentElement;
 
-    /* ---------- 1. 老用户现场：侧栏「新主题」提示出现（存的是 hiru） ---------- */
+    /* ---------- 1. 老浏览器存的是 hiru → 自动归一成 chapel（不再有提示条） ---------- */
     var hint = document.getElementById("theme-hint");
-    var hintTxt = hint ? hint.textContent.replace(/\s+/g, " ").trim() : "";
-    out.info.oldUser = { theme: root.dataset.theme, hint: hintTxt, hidden: hint ? hint.hidden : null };
-    step("★老用户（存着 hiru）→ 侧栏出现「新主题」提示",
-         !!hint && !hint.hidden && /圣烛教堂/.test(hintTxt), hintTxt);
-    step("★老用户不会被强行换主题（仍是 hiru）", root.dataset.theme === "hiru", root.dataset.theme);
-    var go = hint && hint.querySelector("[data-theme-hint-go]");
-    if (go) go.click();
-    await __s(400);
-    step("★点提示里的「换成圣烛教堂」→ 立刻切换", root.dataset.theme === "chapel", root.dataset.theme);
-    step("★切完提示自己收起（不再打扰）", !!hint && hint.hidden, hint ? hint.hidden : null);
+    out.info.oldUser = { theme: root.dataset.theme, hintExists: !!hint };
+    step("★老浏览器存着 hiru → 自动归一成 chapel",
+         root.dataset.theme === "chapel", root.dataset.theme);
+    step("★「换主题」提示条已随「和纸白昼」删除（DOM 里没有 #theme-hint）", !hint);
 
     /* ---------- 2. 默认主题 = chapel（新装 / 没存过） ---------- */
     try { localStorage.removeItem("cocraft.theme"); localStorage.removeItem("cocraft.themeSeen"); } catch (e) {}
@@ -234,31 +228,29 @@ function matchedColorRules(el) {
          mkT && mkC && getComputedStyle(mkT).display === "none"
          && getComputedStyle(mkC).display !== "none", JSON.stringify(out.info.mk));
 
-    /* ---------- 6. 设置卡片：高亮 + 切换 + 持久化 ---------- */
+    /* ---------- 6. 设置卡片：只剩 chapel（「和纸白昼」已删） ---------- */
     var box = document.getElementById("cfg-theme-builtin");
     var btnC = box && box.querySelector('[data-theme-pick="chapel"]');
     var btnH = box && box.querySelector('[data-theme-pick="hiru"]');
-    step("★设置里有「圣烛教堂 / 和纸白昼」两张内置主题卡",
-         !!btnC && !!btnH, box ? box.textContent.replace(/\s+/g, " ").trim() : "没有容器");
+    step("★设置里只剩一张内置主题卡（chapel）",
+         !!btnC && !btnH, box ? box.textContent.replace(/\s+/g, " ").trim() : "没有容器");
     step("★当前主题高亮在「圣烛教堂」上",
-         btnC && btnC.classList.contains("on") && !(btnH && btnH.classList.contains("on")));
-    btnH.click();
+         btnC && btnC.classList.contains("on"));
+    btnC.click();
     await __s(350);
-    var afterH = { theme: root.dataset.theme, paper: CSSV("--paper"),
+    var afterC = { theme: root.dataset.theme, paper: CSSV("--paper"),
                    stored: localStorage.getItem("cocraft.theme"),
                    onBg: Array.prototype.slice.call(document.querySelectorAll("#static-bg .sb.on"))
                          .map(function (el) { return el.dataset.bg; }),
                    primary: getComputedStyle(bn).backgroundImage };
-    out.info.hiru = afterH;
-    step("★点「和纸白昼」→ 真的切回浅色（变量 / 背景槽 / 持久化）",
-         afterH.theme === "hiru"
-         && (/faf7f2/i.test(afterH.paper) || /rgba\(128,\s*128,\s*128/.test(afterH.paper))
-         && afterH.stored === "hiru" && afterH.onBg[0] === "hiru", JSON.stringify(afterH));
-    step("★切回浅色后主按钮回到绯红实底（不是金渐变）",
-         afterH.primary === "none" || !/224,\s*162,\s*74/.test(afterH.primary), afterH.primary);
-    btnC.click();
-    await __s(350);
-    step("★再点「圣烛教堂」→ 回到 chapel", root.dataset.theme === "chapel", root.dataset.theme);
+    out.info.chapelOnly = afterC;
+    step("★点「圣烛教堂」→ 仍是暗色（变量 / 背景槽 / 持久化都对）",
+         afterC.theme === "chapel" && afterC.stored === "chapel"
+         && (/17120f/i.test(afterC.paper) || /rgba\(30,\s*24,\s*19/.test(afterC.paper))
+         && afterC.onBg[0] === "chapel", JSON.stringify(afterC));
+    step("★主按钮仍是烛金渐变（没有浅色版可回退）",
+         /linear-gradient/.test(afterC.primary) && /224,\s*162,\s*74/.test(afterC.primary),
+         afterC.primary.slice(0, 80));
 
     /* ---------- 7. 不崩：JS 无报错 ---------- */
     step("探针无 JS 报错", window.__probeErr.length === 0, JSON.stringify(window.__probeErr));

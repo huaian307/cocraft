@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-r"""把 33 套无头回归**一次跑完**（本地 / CI 都用这一个）。
+r"""把 62 套无头回归**一次跑完**（本地 / CI 都用这一个）。
 
 用法（在项目根目录）：
     python tools\run_suite.py                 :: 全部（本地开发机）
@@ -33,6 +33,11 @@ LOG_DIR = os.path.join(HERE, "runtime", "logs", "suite")
 TESTS = [
     "theme_ui_test",
     "music_bar_test",
+    "cu_test",
+    "cu_macro_test",
+    "browser_test",
+    "http_test",
+    "cu_panel_ui_test",
     "history_page_test",
     "trace_time_test",
     "msg_nav_test",
@@ -41,9 +46,22 @@ TESTS = [
     "cocraft_activity_test",
     "session_tree_test",
     "session_progress_test",
+    "live_slot_test",
+    "cfg_overlay_test",
+    "file_view_test",
+    "errkind_test",
+    "error_card_test",
     "quarantine_test",
+    "file_rank_test",
+    "command_parse_test",
+    "build_lock_test",
+    "agent_update_core_test",
+    "restore_center_test",
+    "confessional_git_test",
+    "session_manage_test",
+    "quarantine_cleanup_test",
+    "low_risk_delete_test",
     "quarantine_ui_test",
-    "undo_turn_test",
     "dispatch_test",
     "team_test",
     "trust_panel_test",
@@ -52,8 +70,11 @@ TESTS = [
     "cross_engine_model_test",
     "inbox_queue_test",
     "workflow_canvas_ui_test",
+    "planner_test",
+    "planner_session_ui_test",
     "perm_audit_test",
     "audit_chain_test",
+    "audit_brief_test",
     "theme_chapel_test",
     "acp_session_sync_test",
     "internal_sessions_test",
@@ -68,10 +89,14 @@ TESTS = [
     "permission_copy_ui_test",
     "perm_level_auto_test",
     "chatter_split_test",
+    "acp_gaps_test",
+    "project_roots_test",
+    "isolation_test",
     "acp_events_test",
     "acp_api_test",
     "watch_mode_test",
     "notify_desktop_test",
+    "tray_approval_test",
     "acp_engine_ui_test",
 ]
 
@@ -80,6 +105,11 @@ CI_SKIP = {
     "theme_ui_test": "需要本机已安装 cocraft-tech / cocraft-dark 主题包",
     "notify_desktop_test": "需要 pystray（本地 runtime/venvs/panel）",
     "agent_install_test": "需要随包 node/npm（本地 agents/）",
+    "cu_test": "需要交互式桌面（UIA / 鼠标键盘），CI 上没有",
+    "cu_macro_test": "需要交互式桌面（真窗口录制回放）",
+    "browser_test": "需要本机 Edge/Chrome（起无头 CDP 实例）",
+    "cu_panel_ui_test": "需要本机 Edge（无头渲染探针页）",
+    "http_test": "需要本机 Edge（cookie 复用那一段起无头实例）",
 }
 
 

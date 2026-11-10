@@ -147,7 +147,7 @@ function __s(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 function __act() { return document.getElementById("cc-act-card"); }
 function __rows() { var c = __act(); return c ? c.querySelectorAll(".cc-act-row") : []; }
 function __rowText(i) { var r = __rows()[i]; return r ? r.textContent : ""; }
-function __hub() { return document.getElementById("btn-hub"); }
+function __hub() { return document.getElementById("tm-chat"); }
 function __busyChip() {
   var box = document.getElementById("cc-room-meta");
   return box ? box.querySelector(".cc-chip.busy") : null;

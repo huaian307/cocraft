@@ -9,6 +9,7 @@ r"""无头回归：可逆执行底座 `backend/snapshots.py`（快照 / 隔离�
 """
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import sys
@@ -58,6 +59,7 @@ def main():
     S.QUARANTINE_DIR = os.path.join(tmp, "q")
     S.SNAPSHOT_DIR = os.path.join(tmp, "s")
     S.STORE_DIR = os.path.join(S.SNAPSHOT_DIR, "_store")
+    S.TURN_CFG_FILE = os.path.join(tmp, "_turnsnap.json")     # ★别写真实 runtime/state
     S.MAX_FILES = 20000
 
     try:
@@ -350,6 +352,43 @@ def _run(ws, tmp):
            "%r" % (S.stats(),))
     finally:
         S.MAX_STORE_BYTES, S.MIN_SNAPSHOTS = _mb, _min
+
+    # ---- ★轮快照：默认只记文件名（撤不了）；开了「带内容」才能一键退回 ----
+    section("轮快照：带内容 / 不带内容 + 配置开关 + scope 列表")
+    tc = os.path.join(ws, "turn.txt")
+    write(tc, "v1\n")
+    ok("默认配置是关（不占磁盘）", S.turn_config().get("groupContent") is not True,
+       repr(S.turn_config()))
+    S.set_turn_config(groupContent=False)
+    snap0 = S.take_turn_snapshot(ws, "turn-plain", label="t0",
+                                 with_content=S.turn_with_content(group=True))
+    write(tc, "v2 changed\n")
+    ok("不带内容的轮快照：清单能算出改动",
+       S.changes_since_latest(ws, "turn-plain").get("files", 0) >= 1)
+    try:
+        S.undo_snapshot("turn-plain", snap0["ts"])
+        ok("不带内容就撤不了（明确报错，不假装成功）", False)
+    except ValueError as exc:
+        ok("不带内容就撤不了（明确报错，不假装成功）", "没存内容" in str(exc), str(exc)[:60])
+    S.set_turn_config(groupContent=True)
+    ok("开关写进去了（groupContent=true）", S.turn_with_content(group=True) is True,
+       repr(S.turn_config()))
+    write(tc, "v3 before\n")
+    snap1 = S.take_turn_snapshot(ws, "turn-full", label="t1", with_content=True)
+    write(tc, "v4 after\n")
+    write(os.path.join(ws, "new-one.txt"), "brand new\n")
+    undo = S.undo_snapshot("turn-full", snap1["ts"])
+    ok("带内容的轮快照 → 一键退回（内容写回、新增的删掉）",
+       int(undo.get("restored") or 0) >= 1 and int(undo.get("removed") or 0) >= 1,
+       "restored=%r removed=%r" % (undo.get("restored"), undo.get("removed")))
+    ok("退回后文件内容真的是快照那一版",
+       io.open(tc, encoding="utf-8").read().strip() == "v3 before",
+       repr(io.open(tc, encoding="utf-8").read().strip()))
+    scopes = {x["scope"]: x for x in S.list_scopes(50)}
+    ok("list_scopes 列出两个 scope 且带「有没有内容」标记",
+       scopes.get("turn-plain", {}).get("with_content") is False
+       and scopes.get("turn-full", {}).get("with_content") is True,
+       repr(sorted(scopes.keys()))[:80])
 
 
 if __name__ == "__main__":

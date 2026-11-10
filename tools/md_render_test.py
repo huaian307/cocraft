@@ -29,6 +29,10 @@ from inspect_ui import find_edge  # noqa: E402  复用 Edge 定位
 
 STUB = """<script>
 (function () {
+  try {
+    localStorage.setItem("cocraft.setup.v1", "1");     // 别让首次向导挡住截图
+    localStorage.setItem("opencode-ui.setup.v1", "1");
+  } catch (e) {}
   var DEAD = ["/heartbeat", "/bye", "/form", "/permission", "/qq/", "/live/"];
   var raw = window.fetch;
   window.fetch = function (u, o) {
@@ -46,16 +50,22 @@ STUB = """<script>
 </script>
 """
 
-SAMPLE = ("# 标题一\\n\\n段落 **加粗** *斜体* `代码` ~~删~~ "
-          "[好](https://example.com) [坏](javascript:alert(1))\\n\\n"
-          "- 甲\\n- 乙\\n\\n1. 一\\n2. 二\\n\\n> 引用一行\\n\\n"
-          "| 名称 | 值 |\\n| --- | --- |\\n| a | 1 |\\n| b | 2 |\\n\\n---\\n\\n"
-          "```py\\nprint(\\\"hi\\\")\\n```\\n")
+SAMPLE = (
+    "# 标题一\n\n段落 **加粗** *斜体* `代码` ~~删~~ "
+    "[好](https://example.com) [坏](javascript:alert(1))\n\n"
+    "- 甲\n- 乙\n\n1. 一\n2. 二\n\n> 引用一行\n\n"
+    "| 名称 | 值 |\n| --- | --- |\n| a | 1 |\n| b | 2 |\n\n---\n\n"
+    "```py\nprint(\"hi\")\n```\n"
+    # ★LaTeX（`ui 0.2.87`）：`\(...\)` / `$...$` 翻成可读文本；`<` `>` 不许被吞
+    "给定数组 \\(a_1, a_2, \\dots, a_n\\)，选整数 \\(k\\)（\\(1 \\le k \\le n\\)）。\n\n"
+    "行内：$x^2 + y^2 = z^2$，比较 $a < b$ 与 $a > b$。\n\n"
+    "\\[\n\\frac{n(n-1)}{2} \\cdot \\sqrt{x+1}\n\\]\n\n"
+)
 
 SCRIPT = """<script>
 setTimeout(function () {
   var out = {};
-  try { out.html = renderText(SAMPLE_MD); }
+  try { out.html = renderText(__SAMPLE__); }
   catch (e) { out.error = String(e); }
   out.jsErrors = window.__probeErr;
   var pre = document.createElement("pre");
@@ -64,12 +74,40 @@ setTimeout(function () {
   document.body.appendChild(pre);
 }, 2500);
 </script>
-""".replace("SAMPLE_MD", '"' + SAMPLE + '"')
+""".replace("__SAMPLE__", json.dumps(SAMPLE, ensure_ascii=False))
 
 
-def build_probe():
+SHOT_JS = """<style>
+  #msg-static { padding: 18px 22px !important; }
+</style>
+<script>
+setTimeout(function () {
+  var host = document.getElementById("msg-static");
+  if (!host) { host = document.body; }
+  host.innerHTML = "";
+  var box = document.createElement("div");
+  box.className = "msg assistant";
+  box.innerHTML = '<div class="who"><strong>助手</strong></div>'
+    + '<div class="bubble">' + renderText(__SAMPLE__) + '</div>';
+  host.appendChild(box);
+  var box2 = document.createElement("div");
+  box2.className = "msg assistant";
+  box2.innerHTML = '<div class="who"><strong>助手</strong></div><div class="bubble">'
+    + renderText("出错示例：\\n\\n> ⚠ 余额不足（账户/凭据问题）：AcpError ... Insufficient Balance "
+                 + "(request_id: cefc94cc) · 去厂商后台充值，或换一个有额度的 Key（设置 → 模型凭据）；"
+                 + "换模型/重试都没用")
+    + '</div>';
+  host.appendChild(box2);
+  try { document.getElementById("messages").scrollTop = 0; window.scrollTo(0, 0); } catch (e) {}
+}, 2200);
+</script>
+""".replace("__SAMPLE__", json.dumps(SAMPLE, ensure_ascii=False))
+
+
+def build_probe(shot: bool = False):
     src = io.open(os.path.join(WEB, "index.html"), encoding="utf-8").read()
-    out = src.replace('<script src="/app.js', STUB + SCRIPT + '<script src="/app.js')
+    extra = (STUB + SHOT_JS) if shot else (STUB + SCRIPT)
+    out = src.replace('<script src="/app.js', extra + '<script src="/app.js')
     if out == src:
         raise SystemExit("在 index.html 里找不到 app.js 的 <script> 标签")
     io.open(PROBE, "w", encoding="utf-8", newline="").write(out)
@@ -97,6 +135,32 @@ def render(edge):
 
 def main() -> int:
     edge = find_edge()
+    if "--shot" in sys.argv:
+        i = sys.argv.index("--shot")
+        shot = sys.argv[i + 1] if i + 1 < len(sys.argv) else os.path.join(
+            HERE, "resources", "screenshots", "md_math.png")
+        shot = os.path.abspath(shot)
+        build_probe(shot=True)
+        try:
+            tmp = os.environ.get("TEMP", ".")
+            with open(os.path.join(tmp, "probe_md_shot_err.txt"), "wb") as fh:
+                proc = subprocess.Popen(
+                    [edge, "--headless=new", "--disable-gpu", "--no-first-run",
+                     "--no-default-browser-check",
+                     "--user-data-dir=" + os.path.join(tmp, "edge-mdshot"),
+                     "--window-size=1200,900", "--virtual-time-budget=12000",
+                     "--screenshot=" + shot, URL],
+                    stdout=subprocess.DEVNULL, stderr=fh)
+                try:
+                    proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            print("  截图:", shot, "存在=", os.path.isfile(shot))
+        finally:
+            if os.path.exists(PROBE):
+                os.remove(PROBE)
+        return 0
+
     build_probe()
     try:
         html = render(edge)
@@ -116,9 +180,16 @@ def main() -> int:
 
     must = ["<h1>", "<strong>加粗</strong>", "<em>斜体</em>", "<code>代码</code>",
             "<del>删</del>", '<a href="https://example.com"', "<ul>", "<ol>",
-            "<blockquote>", "<table>", "<th>名称</th>", "<td>1</td>", "<hr>", "<pre>"]
+            "<blockquote>", "<table>", "<th>名称</th>", "<td>1</td>", "<hr>", "<pre>",
+            # ★LaTeX → 可读文本（0.2.87）
+            '<span class="math">', '<div class="md-math">',
+            "≤", "…", "(n(n-1))/(2)", "√(x+1)", "·"]
     missing = [x for x in must if x not in got]
-    bad = [x for x in ["javascript:", "| --- |"] if x in got]
+    # 反斜杠命令不许原样漏出来；`<`/`>` 必须仍然可见（以前担心被当标签吞掉）
+    bad = [x for x in ["javascript:", "| --- |", "\\le", "\\dots", "\\frac", "\\sqrt"]
+           if x in got]
+    if "a &lt; b" not in got or "a &gt; b" not in got:
+        bad.append("比较符号 < / > 被吞了")
     err = d.get("error") or (d.get("jsErrors") or [])
 
     print("  缺失标签:", missing)

@@ -172,7 +172,7 @@ function __callsOf(kind) { return (window.__calls || []).filter(function (c) { r
          && /3 项没保住/.test(__txt(document.querySelector("#quar-list .q-warn"))),
          __txt(document.querySelector("#quar-list .q-warn")));
     step("★底部统计显示隔离区占用与目录",
-         /隔离区占用/.test(__txt(document.getElementById("quar-foot")))
+         /(?:忏悔室|隔离区)占用/.test(__txt(document.getElementById("quar-foot")))
          && /quarantine/.test(__txt(document.getElementById("quar-foot"))),
          __txt(document.getElementById("quar-foot")));
 

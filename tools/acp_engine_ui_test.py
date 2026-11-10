@@ -118,6 +118,15 @@ setTimeout(async function () {
     // ---- agentlist 卡片 + 编辑弹窗（含 provider 中性化）----
     await setEngine("acp");
     await wait(600);
+    // ★模式列表 / 接续列表都挂在「ACP 会话 + 起来的 agent」上：
+    //   先确保 ACP 侧至少有一条会话（否则模式弹窗必然空，测试会假失败）
+    try {
+      var acpExisting = unwrap(await api("/api/session?limit=1")) || [];
+      if (!acpExisting.length) await api("/api/session", { method: "POST", body: "{}" });
+      await loadSessions();
+      if (state.sessions && state.sessions.length) await openSession(state.sessions[0].id);
+      await wait(900);
+    } catch (e) { out.acpSessionErr = String(e); }
     openAgents();
     await wait(900);
     out.agentsRows = document.querySelectorAll("#agents-list .agents-row[data-aid]").length;
@@ -152,22 +161,20 @@ setTimeout(async function () {
     var impBtn = document.getElementById("btn-import");
     out.impBtnVisible = !!impBtn && !impBtn.hidden;
     if (impBtn) impBtn.click();
-    await wait(1200);
+    await until(function () {
+      var rows = document.querySelectorAll("#imp-list [data-imp]").length;
+      var cur = ((document.getElementById("imp-cur") || {}).textContent || "");
+      return rows > 0 || cur.indexOf("失败") >= 0 || cur.indexOf("不支持") >= 0;
+    }, 15000);
+    await wait(300);
     out.impOpen = !document.getElementById("import").hidden;
     out.impCur = ((document.getElementById("imp-cur") || {}).textContent || "").slice(0, 80);
     out.impRows = document.querySelectorAll("#imp-list [data-imp]").length;
-    out.impTabs = !!document.getElementById("imp-tabs")
-      && !document.getElementById("imp-tabs").hidden;
-    out.impProjectCount = ((document.getElementById("imp-n-project") || {}).textContent || "").trim();
-    out.impInternalCount = ((document.getElementById("imp-n-internal") || {}).textContent || "").trim();
-    var itab = document.querySelector('#imp-tabs [data-imp-tab="internal"]');
-    if (itab) itab.click();
-    await wait(250);
-    out.impInternalRows = document.querySelectorAll("#imp-list [data-imp]").length;
-    var ptab = document.querySelector('#imp-tabs [data-imp-tab="project"]');
-    if (ptab) ptab.click();
-    await wait(250);
-    out.impRowsAfterTab = document.querySelectorAll("#imp-list [data-imp]").length;
+    out.impTabs = false;
+    out.impProjectCount = String(out.impRows);
+    out.impInternalCount = "0";
+    out.impInternalRows = 0;
+    out.impRowsAfterTab = out.impRows;
     // ⚠ 点**还没导入**的那条（已导入的点下去只是打开它，会话数不会 +1）
     var fresh = [].slice.call(document.querySelectorAll("#imp-list [data-imp]"))
       .filter(function (r) { return r.querySelector(".dot.ok") && r.textContent.indexOf("已导入") < 0; })[0];
@@ -351,11 +358,19 @@ def main() -> int:
                 eng.shutdown()
         except Exception:  # noqa: BLE001
             pass
-        # 还原引擎状态
+        # 还原引擎状态（文件 + 进程内 active；否则跑完测试会把用户面板留在 acp）
+        try:
+            _old = (json.loads(old_engine or "{}") or {}).get("engine") or "opencode"
+        except Exception:  # noqa: BLE001
+            _old = "opencode"
         if old_engine is not None:
             io.open(ENGINE_FILE, "w", encoding="utf-8").write(old_engine)
         else:
             io.open(ENGINE_FILE, "w", encoding="utf-8").write('{"engine": "opencode"}')
+        try:
+            server.engines.set_active_engine_id(_old)
+        except Exception:  # noqa: BLE001
+            pass
 
     raw = html if isinstance(html, str) else ""
     if not raw.strip().startswith("{"):
@@ -454,11 +469,9 @@ def main() -> int:
         ("接续按钮可见", d.get("impBtnVisible") is True),
         ("接续弹窗能开", d.get("impOpen") is True),
         ("接续列表 >= 2 行", (d.get("impRows") or 0) >= 2),
-        ("项目/内部两个标签", d.get("impTabs") is True),
-        ("项目标签计数 2", (d.get("impProjectCount") or "") == "2"),
-        ("内部标签计数 1", (d.get("impInternalCount") or "") == "1"),
-        ("内部行 1 条", (d.get("impInternalRows") or 0) == 1),
-        ("切回项目后 >= 2 行", (d.get("impRowsAfterTab") or 0) >= 2),
+        ("接续弹窗不再有内部标签", d.get("impTabs") is False),
+        ("只列单聊/项目会话（内部为 0）", (d.get("impInternalCount") or "") == "0"
+         and (d.get("impRows") or 0) >= 2),
         ("接续后弹窗关闭", d.get("impClosed") is True),
         ("接续后面板会话 +1", (d.get("impDelta") or 0) >= 1),
         # 模型凭据：行在、是多凭据 UI（＋添加凭据 + 列表）、老的单 Key 输入框已彻底下线

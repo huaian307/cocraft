@@ -64,13 +64,14 @@ def main() -> int:
     real_perm = ca.PERM_LOG_FILE
     real_runs = orch.RUNS_DIR
     real_find = ca.find
-    real_level = orch.perm_level
     real_timeout = orch.ASK_TIMEOUT
     try:
         # ---------------- 1. 链本身 ----------------
         audit.set_file(os.path.join(tmp, "a.jsonl"))
         r1 = audit.append("collab", **rec())
+        time.sleep(0.003)      # ⚠ tsu 是毫秒（round(t,3)）：三条挤在同一毫秒会让 since=r2.tsu 多捞到 r1
         r2 = audit.append("collab", **rec(decision="always"))
+        time.sleep(0.003)
         r3 = audit.append("ccagent", **rec(decision="reject", result="denied",
                                           approver=None, ref={"chat": "7", "aid": "11"}))
         check("追加成功并回记录", bool(r1 and r2 and r3))
@@ -212,7 +213,8 @@ def main() -> int:
         audit.set_file(os.path.join(tmp, "orch.jsonl"))
         orch.RUNS_DIR = os.path.join(tmp, "runs")
         os.makedirs(orch.RUNS_DIR, exist_ok=True)
-        orch.perm_level = lambda: "ask"
+        orch.APPROVALS_FILE = os.path.join(tmp, "_approvals.json")
+        orch.NOTIFY_FILE = os.path.join(tmp, "_notify.json")
         orch.ASK_TIMEOUT = 0.4
         run = {"id": "run-t1", "task": "测试", "cwd": tmp, "members": [], "permissions": []}
         member = {"id": "m1", "name": "实现者", "role": "implementer", "engine": "codex-node",
@@ -513,7 +515,6 @@ def main() -> int:
         ca.PERM_LOG_FILE = real_perm
         ca.find = real_find
         orch.RUNS_DIR = real_runs
-        orch.perm_level = real_level
         orch.ASK_TIMEOUT = real_timeout
         shutil.rmtree(tmp, ignore_errors=True)
 

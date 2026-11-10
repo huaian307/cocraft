@@ -14,6 +14,7 @@ r"""无头回归：★本地协作 Runner（第一刀）—— 不依赖群聊 /
 """
 from __future__ import annotations
 
+import io
 import os
 import shutil
 import sys
@@ -30,12 +31,22 @@ TMP = tempfile.mkdtemp(prefix="orch-test-")
 svc_mod.STATE_DIR = TMP
 svc_mod._ALWAYS_FILE = os.path.join(TMP, "_acp_always.json")
 
+# ★可逆执行也要隔离（踩坑 #36 的同款）：`_turn_snapshot` / `_quarantine_before_allow`
+#   默认写 `runtime/snapshots` / `runtime/quarantine` → 不指走就会往真实目录里灌测试垃圾。
+import snapshots as _snap_iso  # noqa: E402
+_snap_iso.SNAPSHOT_DIR = os.path.join(TMP, "_snapshots")
+_snap_iso.STORE_DIR = os.path.join(TMP, "_snapshots", "_store")
+_snap_iso.QUARANTINE_DIR = os.path.join(TMP, "_quarantine")
+_snap_iso.TURN_CFG_FILE = os.path.join(TMP, "_turnsnap.json")
+
 import orchestrator as orch  # noqa: E402
 
 MOCK = os.path.join(BACKEND, "acp_mock_agent.py")
 orch.ROOT = os.path.join(TMP, "_orchestrator")
 orch.RUNS_DIR = os.path.join(orch.ROOT, "runs")
 orch.WORKFLOWS_FILE = os.path.join(TMP, "_collab_workflows.json")   # 别碰真实的
+orch.APPROVALS_FILE = os.path.join(TMP, "_approvals.json")
+orch.NOTIFY_FILE = os.path.join(TMP, "_notify.json")
 orch.ASK_TIMEOUT = 8
 orch.RUN_TIMEOUT = 20
 orch._load_ok_models = lambda: {}
@@ -134,7 +145,7 @@ def main() -> int:
             {"engine": "mock", "role": "reviewer", "name": "r", "permLevel": "nonsense"},
         ])
         ok("保存工作流时保留成员权限", wfrm[0].get("permLevel") == "trust", repr(wfrm[0]))
-        ok("不认识的权限值 → 空（跟随面板，不猜）", wfrm[1].get("permLevel") == "", repr(wfrm[1]))
+        ok("不认识的权限值 → 空（未设置，不猜）", wfrm[1].get("permLevel") == "", repr(wfrm[1]))
         orch._RUNS["run_mem"] = {"id": "run_mem", "cwd": TMP, "status": "running",
                                  "members": [{"id": "m1", "name": "t", "permLevel": "trust"}],
                                  "permissions": []}
@@ -158,9 +169,85 @@ def main() -> int:
         pid = wait_until(lambda: (perm_run.get("permissions") or [{}])[-1].get("id"), timeout=3)
         ok("信任成员：破坏性仍然排队等你确认", bool(pid), repr(pid))
         if pid:
+            try:
+                orch.reply_permission(pid, "once", via="hotkey")
+                ok("热键不能批准破坏性操作", False)
+            except ValueError:
+                ok("热键不能批准破坏性操作", True)
             orch.reply_permission(pid, "reject")
         th.join(3)
         ok("拒绝后返回 reject", box.get("d") == "reject", repr(box.get("d")))
+        ok("空权限不再回落面板：Format-Table 不是破坏性",
+           not orch._is_destructive("Get-ChildItem | Format-Table -AutoSize"))
+        ok("真正的磁盘 format 仍算破坏性", orch._is_destructive("format D: /q"))
+        ok("Format-Volume 仍算破坏性", orch._is_destructive("Format-Volume -DriveLetter D"))
+        ok("读整个环境变量算敏感", orch._is_secret("Get-ChildItem Env:"))
+        ok("普通 $env:TEMP 不算敏感", not orch._is_secret("echo $env:TEMP"))
+        # 面板等级设成 all：工作流空权限仍然要问（证明不再回落）
+        import cocraft_agents as _ca
+        old_lv = _ca.perm_level
+        _ca.perm_level = lambda: "all"
+        perm_run2 = {"id": "run_perm2", "cwd": TMP, "permissions": []}
+        box2 = {}
+        def _ask_empty():
+            box2["d"] = orch._ask_permission(
+                perm_run2, {"id": "m1", "name": "t", "permLevel": ""},
+                "execute", "Run command", [], [], {"command": "Get-ChildItem"})
+        th2 = _th.Thread(target=_ask_empty, daemon=True)
+        th2.start()
+        pid2 = wait_until(lambda: (perm_run2.get("permissions") or [{}])[-1].get("id"), timeout=3)
+        ok("空权限 = 全部询问（面板 all 也不能放行）", bool(pid2), repr(pid2))
+        ok("待批期间 _member_waiting=True", orch._member_waiting("run_perm2", "m1"))
+        def _ap_has_pid():
+            try:
+                import json as _json
+                with open(os.path.join(TMP, "_approvals.json"), "r", encoding="utf-8") as fh:
+                    _ap = _json.load(fh)
+                return any(str(x.get("id")) == str(pid2) for x in (_ap.get("items") or []))
+            except Exception:  # noqa: BLE001
+                return False
+        ok("待批快照写到 _approvals.json", wait_until(_ap_has_pid, timeout=3))
+        if pid2:
+            orch.reply_permission(pid2, "reject", via="hotkey")
+        th2.join(3)
+        ok("空权限被拒后返回 reject", box2.get("d") == "reject", repr(box2.get("d")))
+        ok("结算后 _member_waiting=False", not orch._member_waiting("run_perm2", "m1"))
+        _ca.perm_level = old_lv
+        # ★敏感读取：trust 也不自动放行
+        perm_run3 = {"id": "run_perm3", "cwd": TMP, "permissions": []}
+        box3 = {}
+        def _ask_secret():
+            box3["d"] = orch._ask_permission(
+                perm_run3, {"id": "m1", "name": "t", "permLevel": "trust"},
+                "execute", "Run command", [], [], {"command": "Get-ChildItem Env:"})
+        th3 = _th.Thread(target=_ask_secret, daemon=True)
+        th3.start()
+        pid3 = wait_until(lambda: (perm_run3.get("permissions") or [{}])[-1].get("id"), timeout=3)
+        ok("敏感读取（trust）仍然排队", bool(pid3), repr(pid3))
+        ok("待批记录带 secret 标记",
+           bool(pid3) and bool((perm_run3.get("permissions") or [{}])[-1].get("secret")))
+        if pid3:
+            try:
+                orch.reply_permission(pid3, "once", via="hotkey")
+                ok("热键不能批准敏感读取", False)
+            except ValueError:
+                ok("热键不能批准敏感读取", True)
+            orch.reply_permission(pid3, "reject")
+        th3.join(3)
+        ok("敏感读取被拒后返回 reject", box3.get("d") == "reject", repr(box3.get("d")))
+        # ★运行上下文：把结点名/大脑名直接告诉 agent
+        _ctx = orch._run_context(
+            {"id": "r1", "workflowName": "演示流", "workflowId": "wf_demo", "cwd": TMP,
+             "stages": [{"id": "s1", "name": "实现"}],
+             "members": [{"id": "m1", "name": "impl", "role": "implementer",
+                          "engine": "mock", "permLevel": "trust"},
+                         {"id": "m2", "name": "rev", "role": "reviewer",
+                          "engine": "codex-node"}]},
+            {"id": "m1", "name": "impl", "role": "implementer", "engine": "mock",
+             "permLevel": "trust", "stage": "s1"}, "deepseek-flash")
+        ok("运行上下文带工作流/成员/大脑/其他成员",
+           "演示流" in _ctx and "impl" in _ctx and "codex-node" in _ctx
+           and "deepseek-flash" in _ctx and "信任" in _ctx, _ctx[:120])
         orch._RUNS.pop("run_mem", None)
 
         print("\n== 0b. 工作流：可复用配置（成员 / 默认任务 / 画布布局） ==")
@@ -187,6 +274,25 @@ def main() -> int:
            (upd.get("layout") or {}).get("nodes", {}).get("m1", {}).get("x") == 500
            and abs(float((upd.get("layout") or {}).get("zoom") or 0) - 1.1) < 1e-6,
            repr(upd.get("layout")))
+        # ★项目级画布：同一 cwd 的工作流共享坐标；新工作流不另起空画布
+        wf3 = orch.save_workflow({
+            "name": "探索分支", "cwd": TMP,
+            "members": [{"id": "m1", "role": "reviewer", "name": "rev", "engine": "mock"}],
+            "layout": {"zoom": 1, "nodes": {}},
+        })
+        all_w = orch.list_workflows()
+        one = next((w for w in all_w if str(w.get("id")) == wid), {})
+        two = next((w for w in all_w if str(w.get("id")) == wf3.get("id")), {})
+        ok("★同一项目的工作流共享 projectCanvas",
+           (one.get("projectCanvas") or {}).get("nodes", {}).get("m1", {}).get("x") == 500
+           and (two.get("projectCanvas") or {}).get("nodes", {}).get("m1", {}).get("x") == 500,
+           repr((one.get("projectCanvas"), two.get("projectCanvas"))))
+        ok("★新工作流复用项目画布（不是空节点）",
+           (wf3.get("projectCanvas") or {}).get("nodes", {}).get("m1", {}).get("x") == 500,
+           repr(wf3.get("projectCanvas")))
+        ok("★项目画布仍保留两个工作流的节点",
+           set(((one.get("projectCanvas") or {}).get("nodes") or {}).keys())
+           >= {"task", "m1"}, repr(one.get("projectCanvas")))
         try:
             orch.save_workflow({"name": "空", "members": []})
             ok("空成员 → 拒绝", False)
@@ -215,6 +321,24 @@ def main() -> int:
         ok("工作流记下 lastRunId / runCount",
            wf2.get("lastRunId") == wr["id"] and int(wf2.get("runCount") or 0) >= 1,
            repr((wf2.get("lastRunId"), wf2.get("runCount"))))
+        # ★继续上次探索：复制成员会话，不污染旧 run
+        prev_session = str(((orch.get_run(wr["id"]).get("members") or [{}])[0]).get("sessionID") or "")
+        cont = orch.start_run("继续探索：重点看登录边界", workflow_id=wid,
+                              from_run_id=wr["id"])
+        ok("★继续探索记录 continuedFrom",
+           cont.get("continuedFrom") == wr["id"], repr(cont.get("continuedFrom")))
+        ok("★继续探索复用上一轮成员会话",
+           int(cont.get("resumedMembers") or 0) >= 1, repr(cont.get("resumedMembers")))
+        got_cont = wait_until(lambda: (orch.get_run(cont["id"]).get("status") in ("done", "partial", "failed")
+                                      and orch.get_run(cont["id"])) or None, 20)
+        ok("继续探索能正常跑完",
+           bool(got_cont and str(got_cont.get("status")) in ("done", "partial")),
+           repr(got_cont and got_cont.get("status")))
+        cr = got_cont or orch.get_run(cont["id"])
+        cm = (cr.get("members") or [{}])[0]
+        ok("★继续探索的成员仍指向原会话",
+           bool(prev_session) and cm.get("sessionID") == prev_session,
+           repr((prev_session, cm.get("sessionID"), cm.get("resumed"), cm.get("error"))))
         cp = orch.duplicate_workflow(wid)
         ok("复制工作流：新 id、成员一样",
            cp.get("id") != wid and len(cp.get("members") or []) == 2, cp.get("id"))
@@ -425,6 +549,50 @@ def main() -> int:
         ok("run 状态 cancelled", (tgot or {}).get("status") == "cancelled",
            repr((tgot or {}).get("status")))
 
+        print("\n== 3c. 面板重启后残留的 running（不能再永远转圈） ==")
+        stale = {"id": "run_stale", "task": "残留", "status": "running",
+                 "created": orch._now() - 60000, "updated": orch._now() - 60000,
+                 "members": [{"id": "m1", "name": "旧成员", "engine": "mock",
+                              "status": "running", "started": orch._now() - 60000}],
+                 "stages": [{"id": "s1", "name": "实现", "status": "running",
+                             "started": orch._now() - 60000}],
+                 "permissions": [], "forms": []}
+        orch._RUNS["run_stale"] = stale
+        changed = orch._reconcile_stale_run(stale)
+        ok("重启后残留 running → 自动收尾为 failed",
+           changed and stale["status"] == "failed"
+           and stale["members"][0]["status"] == "failed"
+           and "重启" in stale["members"][0]["error"],
+           repr((stale["status"], stale["members"][0].get("status"))))
+        stale2 = {"id": "run_stale_cancel", "task": "取消残留", "status": "cancelled",
+                  "created": orch._now() - 60000, "updated": orch._now() - 60000,
+                  "members": [{"id": "m1", "name": "旧成员", "engine": "mock",
+                               "status": "running", "started": orch._now() - 60000}],
+                  "stages": [{"id": "s1", "name": "实现", "status": "running"}],
+                  "permissions": [], "forms": []}
+        orch._RUNS["run_stale_cancel"] = stale2
+        orch._reconcile_stale_run(stale2)
+        ok("cancelled 的 run 里残留成员 → cancelled",
+           stale2["members"][0]["status"] == "cancelled"
+           and stale2["stages"][0]["status"] == "cancelled",
+           repr((stale2["members"][0]["status"], stale2["stages"][0]["status"])))
+        # 没有执行线程时点「取消全部」也要立刻收尾
+        stale3 = {"id": "run_stale_cancel2", "task": "再取消", "status": "running",
+                  "created": orch._now() - 1000, "updated": orch._now() - 1000,
+                  "members": [{"id": "m1", "name": "旧成员", "engine": "mock",
+                               "status": "running"}],
+                  "stages": [{"id": "s1", "name": "实现", "status": "running"}],
+                  "permissions": [], "forms": []}
+        orch._RUNS["run_stale_cancel2"] = stale3
+        cr = orch.cancel_run("run_stale_cancel2")
+        ok("无执行线程时「取消全部」→ 成员立刻 cancelled",
+           cr.get("status") == "cancelled"
+           and (cr.get("members") or [{}])[0].get("status") == "cancelled"
+           and (cr.get("stages") or [{}])[0].get("status") == "cancelled",
+           repr((cr.get("status"), [(m.get("status")) for m in cr.get("members") or []])))
+        for _rid in ("run_stale", "run_stale_cancel", "run_stale_cancel2"):
+            orch._RUNS.pop(_rid, None)
+
         print("\n== 1. 并发派活（两个成员各自独立会话） ==")
         run = orch.start_run("各写一句", members=[
             {"engine": "mock", "name": "甲", "role": "implementer"},
@@ -447,7 +615,9 @@ def main() -> int:
         print("\n== 1b. 并发：两个任务同时跑（不是一次只能一个） ==")
         ra = orch.start_run("并发 A", members=[{"engine": "mock-slow", "name": "A"}])
         rb = orch.start_run("并发 B", members=[{"engine": "mock-slow", "name": "B"}])
-        time.sleep(0.8)
+        # ★慢机器上 create_session 可能要几秒：等两个 _ACTIVE 都注册，别用固定 0.8s 赌
+        wait_until(lambda: len([k for k in orch._ACTIVE
+                                if str(k[0]) in (ra["id"], rb["id"])]) == 2, 15)
         ga, gb = orch.get_run(ra["id"]), orch.get_run(rb["id"])
         ok("两个任务同时 running",
            ga.get("status") == "running" and gb.get("status") == "running",
@@ -496,6 +666,28 @@ def main() -> int:
         ok("待批列表已清空", not orch.pending_permissions(rid3))
         ok("历史里留下 denied", any(p.get("status") == "denied" for p in (got3 or {}).get("permissions") or []),
            repr((got3 or {}).get("permissions")))
+
+        print("\n== 3b. 工作流里的 agent 追问（表单） ==")
+        run3b = orch.start_run("要回答", members=[
+            {"engine": "mock-perm", "name": "回答甲", "permLevel": "trust"}])
+        rid3b = run3b["id"]
+        forms = wait_until(lambda: orch.pending_forms(rid3b) or None, 10)
+        ok("出现待回答表单", bool(forms), repr(forms))
+        f0 = (forms or [{}])[0]
+        ok("表单带标题 / 字段（strategy）",
+           "策略" in str(f0.get("title")) and "strategy" in str(f0.get("fields")),
+           repr(f0))
+        ok("回答后返回 True", bool(f0.get("id")) and orch.reply_form(f0.get("id"), {"strategy": "balanced"}) is True)
+        got3b = wait_until(lambda: (orch.get_run(rid3b).get("status") in ("done", "partial", "failed")
+                                    and orch.get_run(rid3b)) or None, 20)
+        m3b = ((got3b or {}).get("members") or [{}])[0]
+        ok("回答后 agent 继续并完成",
+           m3b.get("status") == "done" and "完成" in (m3b.get("output") or ""),
+           repr((m3b.get("status"), m3b.get("output"))))
+        ok("待回答问题已清空", not orch.pending_forms(rid3b))
+        ok("历史里留下 answered",
+           any(f.get("status") == "answered" for f in (got3b or {}).get("forms") or []),
+           repr((got3b or {}).get("forms")))
 
         print("\n== 4. 取消 ==")
         run4 = orch.start_run("慢任务", members=[{"engine": "mock-slow", "name": "慢"}])
@@ -574,9 +766,101 @@ def main() -> int:
             ok("非法 decision → ValueError", False)
         except ValueError:
             ok("非法 decision → ValueError", True)
+
+        print("\n== 9. ★上游账户问题（余额不足）不能标成「完成」 ==")
+        REG["agents"].append({
+            "id": "mock-balance", "label": "Mock 余额不足",
+            "command": [sys.executable, MOCK], "cwd": TMP,
+            "env": {"ACP_MOCK_SIMPLE": "1",
+                    "ACP_MOCK_TEXT": ("AcpError ACP 错误 -32603: Internal error: turn failed: "
+                                      "Insufficient Balance (request_id: cefc94cc-290c-4c8d-926b)")},
+            "provider": "mock"})
+        try:
+            br = orch.start_run("余额测试", cwd=TMP, members=[
+                {"engine": "mock-balance", "role": "implementer", "name": "b1",
+                 "permLevel": "trust"}])
+            wait_until(lambda: (orch.get_run(br["id"]).get("status") or "") in
+                       ("done", "partial", "failed", "cancelled"), timeout=25)
+            r2 = orch.get_run(br["id"]) or {}
+            m0 = (r2.get("members") or [{}])[0]
+            ok("余额不足 → 成员 failed（以前会被标成 done）",
+               m0.get("status") == "failed", repr(m0.get("status")))
+            ok("余额不足 → 整个 run=failed", r2.get("status") == "failed", repr(r2.get("status")))
+            ok("run 带 failReason（前端红字用）",
+               "上游账户问题" in str(r2.get("failReason") or ""), repr(r2.get("failReason"))[:110])
+            ok("成员错误里有「充值 / 换 Key」指引",
+               "充值" in str(m0.get("error") or ""), repr(m0.get("error"))[:140])
+        finally:
+            REG["agents"].pop()
+
+        print("\n== 9b. ★正常回答里提到「Insufficient Balance」不该被误判 ==")
+        REG["agents"].append({
+            "id": "mock-explain", "label": "Mock 解释报错",
+            "command": [sys.executable, MOCK], "cwd": TMP,
+            "env": {"ACP_MOCK_SIMPLE": "1",
+                    "ACP_MOCK_TEXT": "这次报错是 Insufficient Balance（余额不足）导致的，建议充值后再重试。"},
+            "provider": "mock"})
+        try:
+            er = orch.start_run("解释报错", cwd=TMP, members=[
+                {"engine": "mock-explain", "role": "implementer", "name": "e1",
+                 "permLevel": "trust"}])
+            wait_until(lambda: (orch.get_run(er["id"]).get("status") or "") in
+                       ("done", "partial", "failed", "cancelled"), timeout=25)
+            r3 = orch.get_run(er["id"]) or {}
+            ok("只是解释报错 → 成员 done（判据要窄）",
+               ((r3.get("members") or [{}])[0].get("status")) == "done",
+               repr(((r3.get("members") or [{}])[0]).get("status")))
+            ok("解释报错 → run 不算失败", r3.get("status") == "done", repr(r3.get("status")))
+        finally:
+            REG["agents"].pop()
+
+        print("\n== 10. ★可逆执行：工作流也有「先隔离再放行」+「每轮改了哪些文件」==")
+        import snapshots as _snap  # noqa: E402
+        _snap.QUARANTINE_DIR = os.path.join(TMP, "_quarantine")
+        _snap.SNAPSHOT_DIR = os.path.join(TMP, "_snapshots")
+        _snap.STORE_DIR = os.path.join(TMP, "_store")
+        ws = os.path.join(TMP, "ws")
+        os.makedirs(ws, exist_ok=True)
+        old = os.path.join(ws, "old.txt")
+        io.open(old, "w", encoding="utf-8").write("hi")
+        fake_run = {"id": "wf-test-1", "cwd": ws, "task": "t"}
+        fake_member = {"id": "m1", "name": "m1", "role": "implementer", "engine": "mock"}
+        qid = orch._quarantine_before_allow(fake_run, fake_member, "", "删除 old.txt", [old])
+        ok("破坏性批准后先隔离 → 拿到隔离记录 id", bool(qid), repr(qid))
+        ok("隔离记录里真有那份原件（能一键恢复）",
+           bool(qid) and any("old.txt" in fn
+                             for r, _d, fs in os.walk(os.path.join(_snap.QUARANTINE_DIR,
+                                                                   qid.replace("/", os.sep)))
+                             for fn in fs), "quarantine=" + str(qid))
+        ok("隔离动作进了成员活动（界面上看得见）",
+           any(a.get("name") in ("先隔离再放行", "忏悔室留存旧版")
+               for a in (fake_member.get("activities") or [])))
+        # 轮快照 → 改一个文件 → 改动清单
+        snap = orch._turn_snapshot(fake_run, fake_member)
+        ok("轮快照拿到 scope/ts（只记路径+哈希，不占磁盘）",
+           bool(snap.get("scope")) and bool(snap.get("ts")), repr(snap))
+        io.open(os.path.join(ws, "new.txt"), "w", encoding="utf-8").write("new")
+        io.open(old, "w", encoding="utf-8").write("hi changed")
+        ch = orch._turn_changes(fake_run, fake_member, snap)
+        ok("「这一轮改了哪些文件」：新增 + 修改都算到",
+           int(ch.get("files") or 0) >= 2 and int(ch.get("added") or 0) >= 1
+           and int(ch.get("changed") or 0) >= 1,
+           "files=%r added=%r changed=%r" % (ch.get("files"), ch.get("added"), ch.get("changed")))
+        ok("改动清单带文件名（不是只有计数）",
+           any("new.txt" in p for p in (ch.get("paths") or [])), repr((ch.get("paths") or [])[:3]))
+        ok("改动也进了审计链（kind=files）",
+           any((r.get("action") or {}).get("kind") == "files"
+               for r in (__import__("audit").records(limit=50) or [])))
+        # 真实跑一轮：成员结果里必须带 changes 字段（前端能直接显示）
+        mr = orch.start_run("改动字段", cwd=ws, members=[
+            {"engine": "mock", "role": "implementer", "name": "c1", "permLevel": "trust"}])
+        wait_until(lambda: (orch.get_run(mr["id"]).get("status") or "") in
+                   ("done", "partial", "failed", "cancelled"), timeout=25)
+        m1 = ((orch.get_run(mr["id"]) or {}).get("members") or [{}])[0]
+        ok("真实跑完一轮 → member.changes 是个字典（public 字段没漏）",
+           isinstance(m1.get("changes"), dict), repr(m1.get("changes"))[:120])
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
-
     print("\n%s  PASS=%d  FAIL=%d" % ("[FAIL]" if FAIL else "[PASS]", PASS, FAIL))
     for b in BAD:
         print("  - %s" % b)

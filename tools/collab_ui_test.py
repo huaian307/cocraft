@@ -48,6 +48,25 @@ STUB = r"""<script>
   window.__confirmOk = true;
   window.__confirms = [];
   window.confirm = function (msg) { window.__confirms.push(String(msg || "")); return window.__confirmOk; };
+  // 无头里 execCommand("copy") 不一定可用 → 直接当成功，并把被复制的文本记下来
+  window.__copied = [];
+  try {
+    document.execCommand = function (cmd) {
+      if (cmd === "copy") {
+        var txt = "";
+        try { txt = String(window.getSelection() || ""); } catch (e) { txt = ""; }
+        if (!txt) {
+          var el = document.activeElement;
+          if (el && el.tagName === "TEXTAREA") txt = String(el.value || "");
+        }
+        window.__copied.push(txt);
+      }
+      return true;
+    };
+  } catch (e) {}
+  try {
+    navigator.clipboard = { writeText: function (t) { window.__copied.push(String(t)); return Promise.resolve(); } };
+  } catch (e) {}
 
   var now = Date.now();
   window.CATALOG = {
@@ -79,7 +98,9 @@ STUB = r"""<script>
 
   var RUN1 = {
     id: "run_1", task: "把登录拆成独立模块", title: "把登录拆成独立模块",
-    cwd: "D:/ws", status: "done", created: now - 120000, updated: now - 10000,
+    cwd: "D:/ws", status: "failed", created: now - 120000, updated: now - 10000,
+    // ★上游账户问题（用户实测：余额不足被标成"完成"） — 任务头要有一行红字
+    failReason: "上游账户问题：余额不足（402） —— 换模型 / 重试没用；请充值或换 Key（设置 → 模型凭据），涉及成员：实现者",
     members: [
       M("m1", "实现者", "implementer", "实现者", "mock-a", "done",
         "## 方案 A\n\n- 拆出 `auth/login.py`\n- 保持旧接口\n\n```py\nprint('hi')\n```"),
@@ -139,6 +160,13 @@ STUB = r"""<script>
       var wf = Object.assign({ id: "wf_test" }, body);
       window.WORKFLOWS = [wf];
       return J({ ok: true, workflow: wf });
+    }
+    if (path === "/orchestrate/workflows/delete" && method === "POST") {
+      window.__calls.push(["wf-del", body.id]);
+      window.WORKFLOWS = (window.WORKFLOWS || []).filter(function (w) {
+        return String(w.id) !== String(body.id);
+      });
+      return J({ ok: true, deleted: body.id });
     }
     if (path === "/orchestrate/runs") return J({ ok: true, runs: window.RUNS });
     if (path === "/orchestrate/run") {
@@ -210,6 +238,18 @@ STUB = r"""<script>
         (window.RUNMAP[k].permissions || []).forEach(function (p) {
           if (p.id === body.id) { p.status = body.decision === "reject" ? "denied" : "allowed";
                                   p.decision = body.decision; p.decidedAt = Date.now(); }
+        });
+      });
+      return J({ ok: true });
+    }
+    if (path === "/orchestrate/form" && method === "POST") {
+      window.__calls.push(["form", body]);
+      Object.keys(window.RUNMAP).forEach(function (k) {
+        (window.RUNMAP[k].forms || []).forEach(function (f) {
+          if (f.id === body.id) {
+            f.status = body.decline ? "declined" : "answered";
+            f.decidedAt = Date.now();
+          }
         });
       });
       return J({ ok: true });
@@ -314,6 +354,51 @@ function __vis(el) { return !!el && !el.hidden && getComputedStyle(el).display !
     step("★「打开」按钮真的可见（有宽度，不是 0px）",
          !!openBtn && openBtn.getBoundingClientRect().width > 10,
          openBtn ? ("w=" + Math.round(openBtn.getBoundingClientRect().width)) : "missing");
+
+    /* ---------- 1a2. 任务正文可复制（★用户报过：选不中 / 复制不下来） ---------- */
+    var lineEl = document.getElementById("collab-task-line");
+    var vEl = lineEl && lineEl.querySelector(".collab-task-v");
+    step("★任务正文单独一行、文本完整（不再挤在元信息里）",
+         !!vEl && /把登录拆成独立模块/.test(__txt(vEl)), vEl ? __txt(vEl) : "missing");
+    step("★任务正文可选中（user-select:text）",
+         !!vEl && getComputedStyle(vEl).userSelect === "text",
+         vEl ? getComputedStyle(vEl).userSelect : "missing");
+    step("★有「复制」按钮", !!document.querySelector("[data-collab-copy-task]"));
+    var node0 = lineEl, html0 = lineEl ? lineEl.innerHTML : "";
+    collabRenderRun();                      // 模拟一次轮询重画
+    await __s(80);
+    step("★轮询重画后任务节点没被替换（选区与 Ctrl+C 不被打断）",
+         document.getElementById("collab-task-line") === node0
+         && document.getElementById("collab-task-line").innerHTML === html0,
+         "node same=" + (document.getElementById("collab-task-line") === node0));
+    // 元信息里的「更新」时间也不该把整块重画掉（拆成 span 用 textContent 更新）
+    var meta0 = document.getElementById("collab-task-meta");
+    var metaHtml0 = meta0.innerHTML;
+    if (window.COLLAB && COLLAB.run) COLLAB.run.updated = Date.now() + 60000;
+    collabRenderRun();
+    await __s(60);
+    step("★「更新」时间变了也不会重画元信息（项目路径仍可选中复制）",
+         document.getElementById("collab-task-meta").innerHTML === metaHtml0
+         && /更新/.test(__txt(document.getElementById("collab-task-meta"))),
+         "same=" + (document.getElementById("collab-task-meta").innerHTML === metaHtml0));
+    document.querySelector("[data-collab-copy-task]").click();
+    await __s(250);
+    step("★点「复制」→ 横幅回报已复制",
+         /已复制任务全文/.test(__txt(document.getElementById("banner"))),
+         __txt(document.getElementById("banner")));
+    step("★复制的是完整任务（含邮箱这种长文本）",
+         (window.__copied || []).some(function (t) { return /把登录拆成独立模块/.test(t); }),
+         JSON.stringify(window.__copied || []));
+
+    // ★上游账户问题（余额不足）：任务头一行红字 + 可选中
+    var failEl = document.getElementById("collab-fail");
+    step("★上游账户问题：任务头有一行红字原因（不是只显示「完成」）",
+         !!failEl && !failEl.hidden && /上游账户问题/.test(__txt(failEl))
+         && /余额不足/.test(__txt(failEl)),
+         failEl ? ("hidden=" + failEl.hidden + " " + __txt(failEl)) : "missing");
+    step("★那行红字也可选中（能复制去改配置）",
+         !!failEl && getComputedStyle(failEl).userSelect === "text",
+         failEl ? getComputedStyle(failEl).userSelect : "missing");
 
     /* ---------- 1b. 跑着的任务不能删（先取消） ---------- */
     window.__calls.length = 0;
@@ -440,6 +525,38 @@ function __vis(el) { return !!el && !el.hidden && getComputedStyle(el).display !
     if (closeP) closeP.click();
     await __s(180);
 
+    /* ---------- 4b. 工作流 agent 追问（表单）---------- */
+    window.RUNMAP.run_1.forms = [{
+      id: "oform_test", run: "run_1", member: "m1", memberName: "实现者",
+      title: "选择重构策略", created: Date.now(), status: "pending",
+      fields: [{ key: "strategy", title: "策略", type: "string", required: true,
+                 options: [{ value: "conservative", label: "保守" },
+                           { value: "balanced", label: "平衡" },
+                           { value: "aggressive", label: "激进" }] }]
+    }];
+    COLLAB.run.forms = window.RUNMAP.run_1.forms;
+    collabPermToggle(true);
+    await __s(250);
+    var wfCard = document.querySelector('[data-wf-card="oform_test"]');
+    step("★待回答表单渲染出来（agent 追问）",
+         !!wfCard && /选择重构策略/.test(__txt(wfCard)), wfCard ? __txt(wfCard).slice(0, 80) : "missing");
+    var wfOpt = wfCard && wfCard.querySelector('[data-wf-opt][data-value="balanced"]');
+    if (wfOpt) wfOpt.click();
+    step("★表单选项可选中（不会再被 1.5s 轮询冲掉）",
+         !!(wfCard && wfCard.querySelector('.ask-opt.sel[data-value="balanced"]')), "");
+    window.__calls.length = 0;
+    var wfSubmit = wfCard && wfCard.querySelector('[data-wf-submit]');
+    if (wfSubmit) wfSubmit.click();
+    await __s(500);
+    var fc = (window.__calls || []).filter(function (c) { return c[0] === "form"; })[0] || [];
+    step("★「提交回答」→ POST /orchestrate/form（带 strategy=balanced）",
+         fc[1] && fc[1].id === "oform_test" && fc[1].answer
+         && fc[1].answer.strategy === "balanced", JSON.stringify(fc));
+    window.RUNMAP.run_1.forms = [];
+    COLLAB.run.forms = [];
+    collabPermToggle(false);
+    await __s(150);
+
     /* ---------- 5. 逐行差异（正好 2 人） ---------- */
     window.RUNMAP.run_1.permissions = [];
     window.RUNMAP.run_1.members[2].status = "cancelled";
@@ -531,6 +648,67 @@ function __vis(el) { return !!el && !el.hidden && getComputedStyle(el).display !
     await __s(280);
     step("★回工作流画布时抽屉自动收起（不会盖在画布上）",
          !drw.classList.contains("open") && drw.hidden);
+
+    /* ---------- 7d. 删除工作流：要切到剩下的那条，不能留残影 ----------
+       （用户报过：删掉一个工作流后，画布还显示被删那条，另存的那条像是"也没了"） */
+    window.WORKFLOWS = [
+      { id: "wf_a", name: "甲流程", cwd: "D:/ws", archived: false, runCount: 0,
+        members: [
+          { id: "a1", name: "实现甲", role: "implementer", engine: "mock-a", stage: "s1", permLevel: "trust" },
+          { id: "a2", name: "审查甲", role: "reviewer", engine: "mock-b", stage: "s2", permLevel: "trust" }
+        ],
+        stages: [
+          { id: "s1", name: "实现", when: "always", onFail: "stop", retries: 0 },
+          { id: "s2", name: "审查", when: "always", onFail: "stop", retries: 0 }
+        ],
+        layout: { zoom: 1, nodes: {} } },
+      { id: "wf_b", name: "乙流程", cwd: "D:/ws", archived: false, runCount: 5,
+        members: [
+          { id: "b1", name: "只有乙", role: "implementer", engine: "mock-b", stage: "s1", permLevel: "trust" }
+        ],
+        stages: [{ id: "s1", name: "实现", when: "always", onFail: "stop", retries: 0 }],
+        layout: { zoom: 1, nodes: {} } }
+    ];
+    await collabLoadWorkflows(true);
+    await __s(200);
+    collabSelectWf("wf_b");
+    await __s(220);
+    step("★先选中最右那条（乙流程 · 1 成员 · 跑过 5）",
+         /乙流程/.test(__txt(document.getElementById("collab-wf-name")))
+         && /1 成员/.test(__txt(document.getElementById("collab-wf-meta")))
+         && /跑过 5/.test(__txt(document.getElementById("collab-wf-meta"))),
+         __txt(document.getElementById("collab-wf-name")) + " | " + __txt(document.getElementById("collab-wf-meta")));
+
+    window.__confirmOk = true;
+    await collabDeleteWf();
+    await __s(320);
+    step("★删掉乙之后，画布**切到剩下的甲**（不是残留乙的节点）",
+         /甲流程/.test(__txt(document.getElementById("collab-wf-name")))
+         && /2 成员/.test(__txt(document.getElementById("collab-wf-meta")))
+         && /跑过 0/.test(__txt(document.getElementById("collab-wf-meta")))
+         && !/只有乙/.test(__txt(document.getElementById("collab-cv-nodes"))),
+         __txt(document.getElementById("collab-wf-name")) + " | "
+         + __txt(document.getElementById("collab-wf-meta")) + " | nodes="
+         + __txt(document.getElementById("collab-cv-nodes")).slice(0, 60));
+    step("★删除后左栏只剩 1 条（甲）",
+         document.querySelectorAll("#collab-wf-list .collab-wf-row").length === 1,
+         document.querySelectorAll("#collab-wf-list .collab-wf-row").length);
+    step("★横幅说明切到了哪条（不是一句干巴巴的「已删除」）",
+         /已切到/.test(__txt(document.getElementById("banner"))),
+         __txt(document.getElementById("banner")));
+
+    await collabDeleteWf();
+    await __s(320);
+    step("★删掉最后一条 → 回到三步引导、画布不留残影",
+         !document.getElementById("collab-empty").hidden
+         && document.getElementById("collab-wf").hidden
+         && !/甲流程|实现甲|审查甲/.test(__txt(document.getElementById("collab-cv-nodes"))),
+         "empty=" + document.getElementById("collab-empty").hidden
+         + " wf=" + document.getElementById("collab-wf").hidden
+         + " nodes=" + __txt(document.getElementById("collab-cv-nodes")).slice(0, 40));
+    step("★横幅说明「现在没有工作流了」",
+         /没有工作流了/.test(__txt(document.getElementById("banner"))),
+         __txt(document.getElementById("banner")));
 
     /* ---------- 8. Esc：新建弹窗已移除 → 一次就关工作台 ---------- */
     step("★没有两级 Esc 了（没有那个一次性新建弹窗）",
@@ -690,7 +868,7 @@ def main() -> int:
     print("\n=== 本地协作工作台 · 无头回归 ===")
     fails = 0
     for name, okv, extra in d.get("steps", []):
-        print(("  OK   " if okv else "  BAD  ") + name + (("   [" + extra[:200] + "]") if extra else ""))
+        print(("  OK   " if okv else "  BAD  ") + name + (("   [" + str(extra)[:200] + "]") if extra else ""))
         if not okv:
             fails += 1
     if d.get("crash"):

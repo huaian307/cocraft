@@ -118,6 +118,10 @@ STUB = r"""<script>
   window.RUN_ORPHAN.workflowId = "";
   window.RUN_ORPHAN.workflowName = "";
 
+  // ★工作流主控（策划）会话：同项目已有会话
+  window.PLANNERS = [{ id: "pls_1", cwd: "D:/ws", title: "登录重构 · 主控",
+                       status: "draft", updatedAt: Math.floor(now() / 1000) }];
+
   window.fetch = function (u, o) {
     var s = String(u), qi = s.indexOf("?"), path = qi >= 0 ? s.slice(0, qi) : s;
     var qs = qi >= 0 ? s.slice(qi + 1) : "";
@@ -126,6 +130,31 @@ STUB = r"""<script>
     try { body = JSON.parse((o && o.body) || "{}"); } catch (e) {}
 
     if (path === "/orchestrate/catalog") return J(window.CATALOG);
+    if (path === "/planner/sessions" && method === "GET") {
+      return J({ ok: true, sessions: window.PLANNERS });
+    }
+    if (path === "/planner/session" && method === "GET") {
+      return J({ ok: true, session: { id: "pls_1", title: "登录重构 · 主控", cwd: "D:/ws",
+                                      status: "draft", chatSessionId: "" } });
+    }
+    if (path === "/planner/status" && method === "GET") {
+      return J({ ok: true, session: { id: "pls_1", title: "登录重构 · 主控", cwd: "D:/ws",
+                                      status: "draft", chatSessionId: "chat_1" },
+                 plan: window.PLAN || { id: "plan_1", version: 1, status: "draft", goal: "把登录拆开", stages: [] },
+                 validation: { ok: true, errors: [], warnings: [] }, run: {} });
+    }
+    if (path === "/planner/plan" && method === "GET") {
+      return J({ ok: true, plan: window.PLAN || { id: "plan_1", version: 1, status: "draft", goal: "把登录拆开", stages: [] },
+                 validation: { ok: true, errors: [], warnings: [] } });
+    }
+    if (path === "/planner/report" && method === "GET") return J({ ok: true, report: { markdown: "# 报告" } });
+    if (path === "/planner/approvals" && method === "GET") return J({ ok: true, approvals: [] });
+    if (path === "/planner/session" && method === "POST") {
+      call("planner", body);
+      var np = { id: "pls_new", cwd: body.cwd || "", title: body.title || "", status: "draft" };
+      window.PLANNERS.unshift(np);
+      return J({ ok: true, session: np });
+    }
     if (path === "/orchestrate/runs") return J({ ok: true, runs: window.RUNS });
     if (path === "/orchestrate/workflows" && method === "GET") {
       return J({ ok: true, workflows: window.WFS });
@@ -199,7 +228,20 @@ STUB = r"""<script>
       else if (id === "run_2") runOut = window.RUN_ORPHAN;
       return J({ ok: true, run: runOut });
     }
-    if (/^\/api\/session\/[^/]+\/message$/.test(path)) return J({ data: [], cursor: null });
+    if (/^\/api\/session\/[^/]+\/message$/.test(path)) {
+      if (path === "/api/session/chat_1/message") {
+        return J({ data: [
+          { id: "a1", type: "assistant", content: [{ type: "text", text: "收到" }],
+            time: { created: now() - 1000, completed: now() - 900 } },
+          { id: "u1", type: "user", text: "你好", time: { created: now() - 2000 } },
+        ], cursor: null });
+      }
+      return J({ data: [], cursor: null });
+    }
+    if (path === "/api/session/chat_1/prompt" && method === "POST") {
+      window.__cppPrompt = body.text || "";
+      return J({ ok: true });
+    }
     if (/^\/api\/session\/[^/]+$/.test(path)) {
       return J({ data: { id: "s1", title: "t", location: { directory: "D:/ws" },
                          model: { id: "m", providerID: "p" } } });
@@ -261,6 +303,74 @@ function __node(id) { return document.querySelector('#collab-cv-nodes [data-node
          && !document.querySelector("#collab-wf .collab-quick")
          && /这次要做什么/.test(__t(document.querySelector("#composer .composer-label"))),
          __t(document.querySelector("#composer .composer-label")));
+
+    /* 1c. ★工作流头「主控会话」：在**工作流画面右侧**打开（不跳会话、不盖住画布） */
+    var plBtn = document.getElementById("collab-wf-planner");
+    step("★工作流头有「主控会话」按钮", !!plBtn && __vis(plBtn), plBtn ? __t(plBtn) : "missing");
+    if (plBtn) plBtn.click();
+    await __s(900);
+    var plPanel = document.getElementById("collab-planner-panel");
+    var cv = document.getElementById("collab-canvas");
+    step("★主控会话在右侧打开（和工作流画布同时可见）",
+         !!plPanel && !plPanel.hidden && !!cv && __vis(cv),
+         "panel=" + (plPanel ? !plPanel.hidden : "null") + " canvas=" + (cv ? __vis(cv) : "null"));
+    step("★主控面板不展示 Plan JSON",
+         !document.querySelector("#collab-planner-panel #planner-plan-json")
+         && !/Plan JSON/.test(__t(plPanel)), __t(plPanel).slice(0, 100));
+    var helpBody = document.getElementById("cpp-help-body");
+    step("★说明用 ? 收起（默认不占地方）", !!helpBody && helpBody.hidden);
+    document.getElementById("cpp-help").click();
+    await __s(120);
+    step("★点 ? 展开说明", !!helpBody && !helpBody.hidden);
+    document.getElementById("cpp-help").click();
+    await __s(120);
+    step("★再点 ? 收起", !!helpBody && helpBody.hidden);
+    step("★常用操作只有 3 个按钮 + 更多",
+         document.querySelectorAll("#cpp-actions > button").length === 3
+         && !!document.querySelector("#cpp-actions .cpp-more"),
+         "n=" + document.querySelectorAll("#cpp-actions > button").length);
+    var cci = document.getElementById("cpp-chat-input");
+    step("★面板里有对话输入 + 历史消息", !!cci && /你好/.test(__t(document.getElementById("cpp-chat-list"))),
+         __t(document.getElementById("cpp-chat-list")).slice(0, 80));
+    if (cci) {
+      cci.value = "面板里说";
+      document.getElementById("cpp-chat-send").click();
+      await __s(900);
+      step("★面板里发送到绑定聊天（面板不关、画布还在）",
+           /面板里说/.test(String(window.__cppPrompt || "")) && !!plPanel && !plPanel.hidden && __vis(cv),
+           "prompt=" + String(window.__cppPrompt || "").slice(0, 40));
+    }
+    document.getElementById("cpp-close").click();
+    await __s(250);
+    step("★收起主控面板后画布恢复", !!plPanel && plPanel.hidden && !!cv && __vis(cv),
+         "panel=" + (plPanel ? plPanel.hidden : "null"));
+
+    /* 1d. ★左栏「主控会话」记录（不只是头按钮；用户要求记录在工作流面板里） */
+    await __s(300);
+    var plCard = document.getElementById("collab-planner-card");
+    var plRow = document.getElementById("collab-planner-open");
+    step("★左栏有「主控会话」记录", !!plCard && !plCard.hidden && !!plRow
+         && /主控会话/.test(__t(plCard)) && /登录重构/.test(__t(plRow)), __t(plCard));
+    if (plRow) plRow.click();
+    await __s(700);
+    step("★点左栏主控记录 → 右侧面板打开",
+         !!plPanel && !plPanel.hidden, "panel=" + (plPanel ? !plPanel.hidden : "null"));
+    try { collabPlannerHide(); } catch (e) { /* ignore */ }
+    await __s(200);
+
+    /* 1e. ★运行历史默认收起（把位置让给主控会话记录） */
+    var runsBox = document.getElementById("collab-runs");
+    var runsToggle = document.getElementById("collab-runs-toggle");
+    step("★运行历史默认收起", !!runsToggle && !!runsBox && runsBox.hidden,
+         "toggle=" + !!runsToggle + " hidden=" + (runsBox ? runsBox.hidden : "null"));
+    if (runsToggle) runsToggle.click();
+    await __s(150);
+    step("★点 ▸ 展开运行历史", !!runsBox && !runsBox.hidden,
+         "hidden=" + (runsBox ? runsBox.hidden : "null"));
+    if (runsToggle) runsToggle.click();
+    await __s(150);
+    step("★再点 ▾ 收起", !!runsBox && runsBox.hidden,
+         "hidden=" + (runsBox ? runsBox.hidden : "null"));
 
     /* 2. 画布节点 / 连线 */
     var nodes = document.querySelectorAll("#collab-cv-nodes [data-node]");
@@ -644,6 +754,9 @@ function __sh(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   var lay = document.getElementById("collab-wf-layout");
   if (lay) lay.click();           // 截图用「排布」后的推荐布局（阶段在左、成员在右）
   await __sh(800);
+  var plb = document.getElementById("collab-wf-planner");
+  if (plb) plb.click();           // 截图带上右侧主控面板（和画布同时可见）
+  await __sh(1200);
 })();
 </script>
 """

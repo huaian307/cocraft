@@ -139,7 +139,7 @@ window.addEventListener("error", function (e) { window.__probeErr.push(String(e.
 window.addEventListener("unhandledrejection", function (e) { window.__probeErr.push("rej: " + String(e.reason)); });
 
 function __s(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-function __hub() { return document.getElementById("btn-hub"); }
+function __hub() { return document.getElementById("tm-chat"); }
 function __frame(id, chat, sid, kind) {
   return { type: "message", id: id, chat_id: chat, sender_kind: kind || "user",
            sender_id: sid, content: "msg " + id, created_at: "2026-10-15T00:00:00Z" };

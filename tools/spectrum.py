@@ -98,6 +98,7 @@ def main() -> int:
     peak = 0.0
     t0 = time.time()
     silent_since = time.time()
+    last_write = 0.0
     rate = RATES[0]
 
     while True:
@@ -112,19 +113,25 @@ def main() -> int:
                     if rms > 1e-4:
                         silent_since = time.time()
 
-                    spec = np.abs(np.fft.rfft(mono * win))
-                    freqs = np.fft.rfftfreq(len(mono), 1.0 / rate)
-                    vals = np.empty(BANDS)
-                    for i in range(BANDS):
-                        m = (freqs >= edges[i]) & (freqs < edges[i + 1])
-                        # 取频段内峰值：不受频段宽窄影响（用均值的话，段越窄读得越高，容易顶到 1.0）
-                        vals[i] = spec[m].max() if m.any() else 0.0
-                    db = 20.0 * np.log10(vals / REF + 1e-9)
-                    norm = np.clip((db + DB_FLOOR) / DB_FLOOR, 0.0, 1.0)
-                    up = norm > bars
-                    bars = np.where(up, bars + (norm - bars) * ATTACK,
-                                    bars + (norm - bars) * RELEASE)
-                    frames += 1
+                    # ★静音时不跑 FFT / 48 段（那是主要 CPU）：只让柱子缓慢落回，
+                    #   每 0.5s 写一次零值；有声音再恢复完整计算。
+                    idle = (not args.test) and rms <= 1e-4
+                    if idle:
+                        bars = bars * (1.0 - RELEASE)
+                    else:
+                        spec = np.abs(np.fft.rfft(mono * win))
+                        freqs = np.fft.rfftfreq(len(mono), 1.0 / rate)
+                        vals = np.empty(BANDS)
+                        for i in range(BANDS):
+                            m = (freqs >= edges[i]) & (freqs < edges[i + 1])
+                            # 取频段内峰值：不受频段宽窄影响（用均值的话，段越窄读得越高，容易顶到 1.0）
+                            vals[i] = spec[m].max() if m.any() else 0.0
+                        db = 20.0 * np.log10(vals / REF + 1e-9)
+                        norm = np.clip((db + DB_FLOOR) / DB_FLOOR, 0.0, 1.0)
+                        up = norm > bars
+                        bars = np.where(up, bars + (norm - bars) * ATTACK,
+                                        bars + (norm - bars) * RELEASE)
+                        frames += 1
 
                     if args.test:
                         if frames % 15 == 0:
@@ -134,15 +141,18 @@ def main() -> int:
                             return 0
                         continue
 
-                    write(args.out, {
-                        "ts": int(time.time() * 1000),
-                        "device": name,
-                        "rate": rate,
-                        "rms": round(rms, 5),
-                        "bars": [round(float(b), 3) for b in bars],
-                    })
-
                     now = time.time()
+                    if not idle or (now - last_write >= 0.5):
+                        write(args.out, {
+                            "ts": int(now * 1000),
+                            "device": name,
+                            "rate": rate,
+                            "rms": round(rms, 5),
+                            "idle": bool(idle),
+                            "bars": [round(float(b), 3) for b in bars],
+                        })
+                        last_write = now
+
                     if now - last_check < CHECK_DEVICE_EVERY:
                         continue
                     last_check = now
