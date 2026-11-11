@@ -187,7 +187,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             check("解释器能跑", False, repr(exc))
 
-    print("\n[3] 组件（安装包随包必带；2026-10-12 起不再带 music / audio）")
+    print("\n[3] 组件（安装包随包必带；`ui 0.2.123` 起不再带 music / audio）")
     term = os.path.join(app, "runtime", "site-packages", "terminal")
     panel = os.path.join(app, "runtime", "site-packages", "panel")
     check("面板内终端 site-packages（terminal）", os.path.isdir(term), warn_only=True,

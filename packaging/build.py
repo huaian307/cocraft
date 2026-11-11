@@ -16,11 +16,14 @@ r"""把 cocraft 打包成安装包（Inno Setup）要用的 payload。
 用法：
     python packaging\build.py                  # 默认：核心 + codex/claude/opencode 三个随包 agent + terminal/panel
     python packaging\build.py --agents none     # 只出核心包（不带任何 agent）
-    python packaging\build.py --components music,audio   # 只有显式指定才会带音乐/频谱（默认不带）
+    python packaging\build.py --with-music       # ★只有显式要音乐才会带（默认不带，且会自动跑 strip_music.py）
     python packaging\build.py --no-iss          # 只准备 payload，不调 ISCC
 
-⚠ 组件策略（2026-10-12 起）：安装包**不再随包音乐服务 / 音频频谱**；agent（node/codex/claude/opencode）
-   与 terminal/panel 在 cocraft.iss 里全部是**必选（fixed）**，用户没有可勾选项。
+⚠ 组件策略（`ui 0.2.123` 起）：安装包**默认不带音乐 / 音频条 / QQ音乐 / 网易云**。
+   默认组件只有 `terminal` + `panel`；就算写了 `--components music,...` 也会被摘掉
+   （要保留音乐必须用 `--with-music`），并且在 ISS 编译前自动执行
+   `packaging/strip_music.py`（把音乐相关的文件 / DOM / JS 桩一并处理）。
+   agent（node/codex/claude/opencode）与 terminal/panel 在 cocraft.iss 里全部是**必选（fixed）**。
 
 ⚠ 绝不随包带任何密钥：`codex-home` 只放**干净模板**（env_key 指向环境变量），
    用户的 API Key 由首次设置向导写进 runtime/state/_acp_agents.json 的 baseline.env。
@@ -837,6 +840,32 @@ def clean_payload() -> None:
                 drop_tree(os.path.join(root, d), tries=1)
 
 
+def strip_music_payload() -> bool:
+    r"""★精简包（`ui 0.2.123` 起**默认**）：把音乐 / 音频条 / QQ音乐(SMTC) / 网易云从 payload 摘干净。
+
+    复用 `packaging/strip_music.py`（幂等）：删文件 + 删 DOM + `40-music.js` 换成同名空实现桩
+    + 设置里那几行绑定改空安全。失败**不静默**——宁可打不出包，也别出一个"一启动就报错"的包。
+    """
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    try:
+        import strip_music  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        log("[BAD] 加载 packaging/strip_music.py 失败：%r" % (exc,))
+        return False
+    app = os.path.join(PAYLOAD, "app")
+    if not os.path.isdir(os.path.join(app, "frontend")):
+        log("[BAD] payload 里没有 frontend/，没法做精简包")
+        return False
+    log("[4b] 精简包：摘掉音乐 / 音频条 / QQ音乐 / 网易云 ...")
+    try:
+        rc = strip_music.main(["strip_music", app])
+    except Exception as exc:  # noqa: BLE001
+        log("[BAD] 精简包失败：%r" % (exc,))
+        return False
+    return rc == 0
+
+
 def _v4(ver: str) -> str:
     """把 SemVer（可能带 -rc1）折成 Inno 要求的 **4 段数字**文件版本：`0.1.0` → `0.1.0.0`。"""
     base = str(ver or "").split("-")[0].split("+")[0]
@@ -891,8 +920,12 @@ def check_lock(strict: bool = False) -> int:
     if not CODEX_NM or not os.path.isdir(CODEX_NM):
         missing.append("codex node_modules（设 COCRAFT_CODEX_NM）")
     for name, site in VENV_SITE.items():
+        if name == "music":
+            continue          # ★默认不带音乐（`ui 0.2.123`）→ 缺这个 venv 不算问题
         if not os.path.isdir(site):
             missing.append("组件 venv：%s（%s）" % (name, site))
+    if not os.path.isdir(VENV_SITE.get("music", "")):
+        log("  [i] music 组件 venv 不存在 —— 默认打包不需要它（要带音乐用 --with-music）")
     if not any(os.path.isfile(p) for p in ISCC_CANDIDATES):
         log("  [warn] 没找到 ISCC.exe（只影响出 exe；--no-iss 不需要）")
     if missing:
@@ -909,8 +942,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="打包 cocraft 安装包")
     ap.add_argument("--agents", default="codex,claude,opencode",
                     help="随包 agent：codex / claude / opencode（逗号分隔也行）/ all / none")
-    ap.add_argument("--components", default="music,terminal,panel",
-                    help="准备哪些组件：music,terminal,panel（默认都带；music = 网易云/QQ 搜歌放歌，必选；audio 需显式指定）")
+    ap.add_argument("--components", default="terminal,panel",
+                    help="准备哪些组件：terminal,panel（默认；music 已默认不带，要带请用 --with-music）")
+    ap.add_argument("--with-music", action="store_true",
+                    help="★显式带上音乐（music 组件 + 不执行 strip_music）；默认不带")
     ap.add_argument("--no-iss", action="store_true", help="只准备 payload，不编译安装包")
     ap.add_argument("--no-protect", action="store_true",
                     help="不做「档1 去源码」（调试用，保留 .py 源码）")
@@ -930,6 +965,14 @@ def main() -> int:
     COMPONENTS_GLOBAL = [c.strip() for c in args.components.split(",") if c.strip()]
     # 兼容旧名：panel6（已弃用的 PySide6 尝试）统一回 panel（pywebview）
     COMPONENTS_GLOBAL = ["panel" if c == "panel6" else c for c in COMPONENTS_GLOBAL]
+    # ★音乐默认不带（`ui 0.2.123`）：写了也不给，只有 --with-music 才算数
+    with_music = bool(args.with_music)
+    if "music" in COMPONENTS_GLOBAL and not with_music:
+        log("[i] 已忽略 --components 里的 music（要带请显式加 --with-music）")
+    if not with_music:
+        COMPONENTS_GLOBAL = [c for c in COMPONENTS_GLOBAL if c != "music"]
+    elif "music" not in COMPONENTS_GLOBAL:
+        COMPONENTS_GLOBAL.append("music")
 
     os.makedirs(PAYLOAD, exist_ok=True)
     kill_stale_build_helpers()                 # 清掉会占住 payload 的残留（ISCC / 辅助进程）
@@ -940,9 +983,14 @@ def main() -> int:
     stage_components(COMPONENTS_GLOBAL)
     stage_agent(args.agents)
     clean_payload()
+    # ★精简包：摘掉音乐 / 音频条 / QQ音乐(SMTC) / 网易云（文件 + DOM + JS 桩）
+    if not with_music:
+        if not strip_music_payload():
+            return 1
     ver = write_version()
-    log("[6/6] payload 就绪：%s（版本 %s，可选组件 %s，agent %s）"
-        % (PAYLOAD, ver, ",".join(COMPONENTS_GLOBAL) or "无", args.agents))
+    log("[6/6] payload 就绪：%s（版本 %s，可选组件 %s，agent %s%s）"
+        % (PAYLOAD, ver, ",".join(COMPONENTS_GLOBAL) or "无", args.agents,
+           "" if with_music else "，已去音乐"))
     tot = 0
     for root, _d, files in os.walk(PAYLOAD):
         for f in files:

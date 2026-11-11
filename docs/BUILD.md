@@ -174,22 +174,35 @@ python packaging\build.py --components terminal,panel
 
 ---
 
-## 9. 「不带音乐」的精简包（lite）
+## 9. 「不带音乐」的精简包（lite）—— **`ui 0.2.123` 起是默认行为**
 
-需要出"没有音乐 / 没有音频条 / 没有 QQ音乐与网易云"的包时（`ui 0.2.122` 起）：
+> **默认就打精简包**：`python packaging\build.py` 不再带音乐，
+> 并且会在 ISS 编译前**自动**执行 `packaging/strip_music.py`。
+> 想恢复带音乐的旧行为：`python packaging\build.py --with-music`（会带上 `music` 组件且跳过 strip）。
+
+日常只要一条命令：
 
 ```bat
-:: ① 只备 terminal / panel 两个组件（music 不备 → components\music 根本不会生成）
+python packaging\build.py --agents codex,claude,opencode
+:: 输出里应该能看到：
+::   [i] 已忽略 --components 里的 music（要带请显式加 --with-music）   ← 只有手写 music 时才有
+::   [4b] 精简包：摘掉音乐 / 音频条 / QQ音乐 / 网易云 ...
+::   [6/6] payload 就绪：...可选组件 terminal,panel，agent ...，已去音乐
+```
+
+只想到 payload（不编译 exe）就加 `--no-iss`；完整手动流程（等价于默认行为）：
+
+```bat
 python packaging\build.py --components terminal,panel --agents codex,claude,opencode --no-iss --no-protect
-
-:: ② 把音乐相关的文件 / DOM / 入口从 payload 里摘掉（幂等，可重复跑）
-python packaging\strip_music.py
-
-:: ③ 再编译安装包（⚠ 不要设短超时：lzma2/max 压 ~830 MB 要几分钟）
+python packaging\strip_music.py          :: 幂等；build.py 已经自动跑过，手动再跑也一样
+python tools\lite_build_check.py --shot dist\lite.png   :: 构建产物自检
 ISCC.exe /Qp /DAppVersion=<ver> /DVersionInfoVersion=<x.y.z.0> ^
   /DPayloadDir=D:\opencode-ui\dist\payload /DOutputDir=D:\opencode-ui\dist ^
   /Fcocraft-setup-<ver>-noaudio-noqq packaging\cocraft.iss
 ```
+
+> ⚠ ISCC 别设短超时：lzma2/max 压 ~830 MB 要几分钟，被中途杀掉会产出**半截 exe**
+> （安装时报 `The setup files are corrupted`）。正常精简包约 **200 MB**。
 
 `strip_music.py` 做的事（**只删文件是不够的**，这两条都踩过）：
 
@@ -205,5 +218,5 @@ ISCC.exe /Qp /DAppVersion=<ver> /DVersionInfoVersion=<x.y.z.0> ^
 > 重复声明会让 `41-visual.js` 整份 `SyntaxError`（表现：`initWallpaperPicker is not defined`）。
 > 自查手法：把 index.html 里所有 script 按顺序拼成一个文件，用随包 node 跑 `node --check`。
 >
-> 验收：`dist\payload\app\frontend` 起个静态服务 → 无头 Edge 打开 → 断言 `__appLoaded === true`、
-> `window.__errs` 为空、`#player` / `#vis-bar` / `#mus-home` / `#tm-music` 都不存在。
+> 验收：`python tools\lite_build_check.py`（起临时静态服务 + 无头 Edge）→ 断言 `__appLoaded === true`、
+> `window.__errs` 为空、`#player` / `#vis-bar` / `#mus-home` / `#tm-music` 都不存在、无横向溢出。
